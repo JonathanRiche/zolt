@@ -481,9 +481,6 @@ fn buildOpenAiLegacyCompletionsPayload(allocator: std.mem.Allocator, request: St
 }
 
 fn buildOpenAiResponsesPayload(allocator: std.mem.Allocator, request: StreamRequest) ![]u8 {
-    const prompt = try buildLegacyPromptFromMessages(allocator, request.messages);
-    defer allocator.free(prompt);
-
     var payload_writer: std.Io.Writer.Allocating = .init(allocator);
     defer payload_writer.deinit();
 
@@ -497,10 +494,40 @@ fn buildOpenAiResponsesPayload(allocator: std.mem.Allocator, request: StreamRequ
     try jw.objectField("stream");
     try jw.write(true);
     try jw.objectField("input");
-    try jw.write(prompt);
+    try jw.beginArray();
+
+    for (request.messages) |message| {
+        if (message.content.len == 0) continue;
+        const content_type = responsesContentTypeForRole(message.role);
+
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write("message");
+        try jw.objectField("role");
+        try jw.write(openAiRole(message.role));
+        try jw.objectField("content");
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(content_type);
+        try jw.objectField("text");
+        try jw.write(message.content);
+        try jw.endObject();
+        try jw.endArray();
+        try jw.endObject();
+    }
+
+    try jw.endArray();
     try jw.endObject();
 
     return payload_writer.toOwnedSlice();
+}
+
+fn responsesContentTypeForRole(role: Role) []const u8 {
+    return switch (role) {
+        .assistant => "output_text",
+        .user, .system => "input_text",
+    };
 }
 
 fn buildLegacyPromptFromMessages(allocator: std.mem.Allocator, messages: []const StreamMessage) ![]u8 {
@@ -890,6 +917,7 @@ test "buildOpenAiResponsesPayload includes input transcript" {
     const messages = [_]StreamMessage{
         .{ .role = .system, .content = "be concise" },
         .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = "hello" },
     };
 
     const request: StreamRequest = .{
@@ -904,6 +932,10 @@ test "buildOpenAiResponsesPayload includes input transcript" {
     defer allocator.free(payload);
 
     try std.testing.expect(containsAsciiIgnoreCase(payload, "\"input\""));
-    try std.testing.expect(containsAsciiIgnoreCase(payload, "system: be concise"));
-    try std.testing.expect(containsAsciiIgnoreCase(payload, "user: hi"));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"type\":\"message\""));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"type\":\"input_text\""));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"type\":\"output_text\""));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"text\":\"be concise\""));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"text\":\"hi\""));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"text\":\"hello\""));
 }

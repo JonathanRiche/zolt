@@ -27,6 +27,16 @@ const TerminalMetrics = struct {
 };
 
 const MODEL_PICKER_MAX_ROWS: usize = 8;
+const READ_TOOL_MAX_STEPS: usize = 4;
+const READ_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
+const READ_TOOL_SYSTEM_PROMPT =
+    "You can use one local read-only tool.\n" ++
+    "When you need to inspect files, reply with ONLY:\n" ++
+    "<READ>\n" ++
+    "<command>\n" ++
+    "</READ>\n" ++
+    "Allowed commands: rg, grep, ls, cat, find, head, tail, sed, wc, stat, pwd.\n" ++
+    "After a system message that starts with [read-result], continue the answer normally.";
 
 const RawMode = struct {
     original_termios: std.posix.termios,
@@ -259,13 +269,50 @@ const App = struct {
         self.is_streaming = true;
         defer self.is_streaming = false;
 
+        var step: usize = 0;
+        while (step < READ_TOOL_MAX_STEPS) : (step += 1) {
+            const success = try self.streamAssistantOnce(provider_id, model_id, api_key.?);
+            if (!success) break;
+
+            const assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
+            const read_command = parseReadToolCommand(assistant_message.content) orelse break;
+            const read_command_owned = try self.allocator.dupe(u8, read_command);
+            defer self.allocator.free(read_command_owned);
+
+            const tool_note = try std.fmt.allocPrint(self.allocator, "[tool] READ {s}", .{read_command_owned});
+            defer self.allocator.free(tool_note);
+            try self.setLastAssistantMessage(tool_note);
+
+            const tool_result = try self.runReadToolCommand(read_command_owned);
+            defer self.allocator.free(tool_result);
+            try self.app_state.appendMessage(self.allocator, .system, tool_result);
+            try self.app_state.appendMessage(self.allocator, .assistant, "");
+            try self.setNoticeFmt("Ran READ command: {s}", .{read_command_owned});
+            try self.render();
+        }
+
+        if (step == READ_TOOL_MAX_STEPS) {
+            const conversation = self.app_state.currentConversationConst();
+            const last_message = conversation.messages.items[conversation.messages.items.len - 1];
+            if (parseReadToolCommand(last_message.content) != null) {
+                try self.app_state.appendMessage(self.allocator, .system, "[read-result]\nREAD step limit reached. Continue without additional READ calls.");
+            }
+        }
+
+        if (provider_client.lastProviderErrorDetail() == null) {
+            try self.setNoticeFmt("Completed response from {s}/{s}", .{ provider_id, model_id });
+        }
+        try self.app_state.saveToPath(self.allocator, self.paths.state_path);
+    }
+
+    fn streamAssistantOnce(self: *App, provider_id: []const u8, model_id: []const u8, api_key: []const u8) !bool {
         const provider_info = self.catalog.findProviderConst(provider_id);
         const request: provider_client.StreamRequest = .{
             .provider_id = provider_id,
             .model_id = model_id,
-            .api_key = api_key.?,
+            .api_key = api_key,
             .base_url = if (provider_info) |info| info.api_base else null,
-            .messages = try self.buildStreamMessages(),
+            .messages = try self.buildStreamMessages(true),
         };
         defer self.allocator.free(request.messages);
 
@@ -296,25 +343,111 @@ const App = struct {
                 try self.appendToLastAssistantMessage(if (needs_paragraph_break) "\n\n[local] Request failed." else "[local] Request failed.");
             }
             try self.app_state.saveToPath(self.allocator, self.paths.state_path);
-            return;
+            return false;
         };
-
-        try self.setNoticeFmt("Completed response from {s}/{s}", .{ provider_id, model_id });
-        try self.app_state.saveToPath(self.allocator, self.paths.state_path);
+        return true;
     }
 
-    fn buildStreamMessages(self: *App) ![]provider_client.StreamMessage {
+    fn buildStreamMessages(self: *App, include_read_tool_prompt: bool) ![]provider_client.StreamMessage {
         const conversation = self.app_state.currentConversationConst();
-        const messages = try self.allocator.alloc(provider_client.StreamMessage, conversation.messages.items.len);
+        const conversation_len = conversation.messages.items.len;
+        const skip_last_empty_assistant = conversation_len > 0 and
+            conversation.messages.items[conversation_len - 1].role == .assistant and
+            conversation.messages.items[conversation_len - 1].content.len == 0;
 
-        for (conversation.messages.items, 0..) |message, index| {
+        const visible_count = if (skip_last_empty_assistant) conversation_len - 1 else conversation_len;
+        const prompt_count: usize = if (include_read_tool_prompt) 1 else 0;
+        const messages = try self.allocator.alloc(provider_client.StreamMessage, visible_count + prompt_count);
+
+        var index: usize = 0;
+        if (include_read_tool_prompt) {
+            messages[index] = .{
+                .role = .system,
+                .content = READ_TOOL_SYSTEM_PROMPT,
+            };
+            index += 1;
+        }
+
+        for (conversation.messages.items[0..visible_count]) |message| {
             messages[index] = .{
                 .role = message.role,
                 .content = message.content,
             };
+            index += 1;
         }
 
         return messages;
+    }
+
+    fn runReadToolCommand(self: *App, command_text: []const u8) ![]u8 {
+        var parsed_args = try std.process.ArgIteratorGeneral(.{ .single_quotes = true }).init(self.allocator, command_text);
+        defer parsed_args.deinit();
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(self.allocator);
+
+        while (parsed_args.next()) |token| {
+            try argv.append(self.allocator, token);
+            if (argv.items.len > 64) {
+                return std.fmt.allocPrint(self.allocator, "[read-result]\ncommand: {s}\nerror: too many arguments", .{command_text});
+            }
+        }
+
+        if (argv.items.len == 0) {
+            return std.fmt.allocPrint(self.allocator, "[read-result]\ncommand: {s}\nerror: empty command", .{command_text});
+        }
+
+        if (!isAllowedReadCommand(argv.items[0])) {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[read-result]\ncommand: {s}\nerror: command not allowed ({s})",
+                .{ command_text, argv.items[0] },
+            );
+        }
+
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = argv.items,
+            .cwd = ".",
+            .max_output_bytes = READ_TOOL_MAX_OUTPUT_BYTES,
+        }) catch |err| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[read-result]\ncommand: {s}\nerror: {s}",
+                .{ command_text, @errorName(err) },
+            );
+        };
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+
+        try output.writer.print("[read-result]\ncommand: {s}\nterm: ", .{command_text});
+        switch (result.term) {
+            .Exited => |code| try output.writer.print("exited:{d}\n", .{code}),
+            .Signal => |sig| try output.writer.print("signal:{d}\n", .{sig}),
+            .Stopped => |sig| try output.writer.print("stopped:{d}\n", .{sig}),
+            .Unknown => |code| try output.writer.print("unknown:{d}\n", .{code}),
+        }
+
+        if (result.stdout.len > 0) {
+            try output.writer.writeAll("stdout:\n");
+            try output.writer.writeAll(result.stdout);
+            if (result.stdout[result.stdout.len - 1] != '\n') try output.writer.writeByte('\n');
+        }
+
+        if (result.stderr.len > 0) {
+            try output.writer.writeAll("stderr:\n");
+            try output.writer.writeAll(result.stderr);
+            if (result.stderr[result.stderr.len - 1] != '\n') try output.writer.writeByte('\n');
+        }
+
+        if (result.stdout.len == 0 and result.stderr.len == 0) {
+            try output.writer.writeAll("stdout:\n(no output)\n");
+        }
+
+        return output.toOwnedSlice();
     }
 
     fn onStreamToken(context: ?*anyopaque, token: []const u8) anyerror!void {
@@ -358,7 +491,7 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  keys: H/L conv tabs, /model picker: Ctrl-N/P + Enter");
+            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  keys: H/L conv tabs, /model picker: Ctrl-N/P + Enter, assistant tool: <READ>rg --files</READ>");
             return;
         }
 
@@ -1157,6 +1290,58 @@ fn buildInputView(allocator: std.mem.Allocator, before: []const u8, after: []con
     return out;
 }
 
+fn parseReadToolCommand(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<READ>")) {
+        const rest = trimmed["<READ>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</READ>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "READ:")) {
+        return std.mem.trimLeft(u8, trimmed["READ:".len..], " \t");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "READ ")) {
+        return std.mem.trimLeft(u8, trimmed["READ".len..], " \t");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```read")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    return null;
+}
+
+fn isAllowedReadCommand(command: []const u8) bool {
+    if (command.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, command, '/')) |_| return false;
+
+    const allowlist = [_][]const u8{
+        "rg",
+        "grep",
+        "ls",
+        "cat",
+        "find",
+        "head",
+        "tail",
+        "sed",
+        "wc",
+        "stat",
+        "pwd",
+    };
+
+    for (allowlist) |allowed| {
+        if (std.mem.eql(u8, command, allowed)) return true;
+    }
+    return false;
+}
+
 fn modelMatchesQuery(model: models.ModelInfo, query: []const u8) bool {
     if (query.len == 0) return true;
     return containsAsciiIgnoreCase(model.id, query) or containsAsciiIgnoreCase(model.name, query);
@@ -1199,4 +1384,19 @@ fn firstEnvVarForProvider(app: *App, provider_id: []const u8) ?[]const u8 {
     const fallback = fallbackEnvVars(provider_id);
     if (fallback.len > 0) return fallback[0];
     return null;
+}
+
+test "parseReadToolCommand extracts command formats" {
+    try std.testing.expectEqualStrings("rg --files src", parseReadToolCommand("<READ>\nrg --files src\n</READ>").?);
+    try std.testing.expectEqualStrings("ls -la", parseReadToolCommand("READ: ls -la").?);
+    try std.testing.expectEqualStrings("cat src/main.zig", parseReadToolCommand("READ cat src/main.zig").?);
+    try std.testing.expectEqualStrings("grep -n foo src/tui.zig", parseReadToolCommand("```read\ngrep -n foo src/tui.zig\n```").?);
+    try std.testing.expect(parseReadToolCommand("normal assistant text") == null);
+}
+
+test "isAllowedReadCommand allowlist and slash rejection" {
+    try std.testing.expect(isAllowedReadCommand("rg"));
+    try std.testing.expect(isAllowedReadCommand("ls"));
+    try std.testing.expect(!isAllowedReadCommand("bash"));
+    try std.testing.expect(!isAllowedReadCommand("/usr/bin/rg"));
 }
