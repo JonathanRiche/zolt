@@ -29,6 +29,7 @@ const TerminalMetrics = struct {
 
 const MODEL_PICKER_MAX_ROWS: usize = 8;
 const FILE_PICKER_MAX_ROWS: usize = 8;
+const COMMAND_PICKER_MAX_ROWS: usize = 8;
 const READ_TOOL_MAX_STEPS: usize = 4;
 const READ_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
 const FILE_INJECT_MAX_FILES: usize = 8;
@@ -160,6 +161,9 @@ const App = struct {
     model_picker_open: bool = false,
     model_picker_index: usize = 0,
     model_picker_scroll: usize = 0,
+    command_picker_open: bool = false,
+    command_picker_index: usize = 0,
+    command_picker_scroll: usize = 0,
     file_picker_open: bool = false,
     file_picker_index: usize = 0,
     file_picker_scroll: usize = 0,
@@ -241,6 +245,10 @@ const App = struct {
                     self.model_picker_open = false;
                     return;
                 }
+                if (self.command_picker_open) {
+                    self.command_picker_open = false;
+                    return;
+                }
                 if (self.file_picker_open) {
                     self.file_picker_open = false;
                     return;
@@ -259,6 +267,10 @@ const App = struct {
                     try self.acceptModelPickerSelection();
                     return;
                 }
+                if (self.command_picker_open) {
+                    try self.acceptCommandPickerSelection();
+                    return;
+                }
                 if (self.file_picker_open) {
                     try self.acceptFilePickerSelection();
                     return;
@@ -270,6 +282,10 @@ const App = struct {
                     try self.acceptModelPickerSelection();
                     return;
                 }
+                if (self.command_picker_open) {
+                    try self.acceptCommandPickerSelection();
+                    return;
+                }
                 if (self.file_picker_open) {
                     try self.acceptFilePickerSelection();
                     return;
@@ -278,6 +294,8 @@ const App = struct {
             14 => {
                 if (self.model_picker_open) {
                     self.moveModelPickerSelection(1);
+                } else if (self.command_picker_open) {
+                    self.moveCommandPickerSelection(1);
                 } else if (self.file_picker_open) {
                     self.moveFilePickerSelection(1);
                 }
@@ -285,6 +303,8 @@ const App = struct {
             16 => {
                 if (self.model_picker_open) {
                     self.moveModelPickerSelection(-1);
+                } else if (self.command_picker_open) {
+                    self.moveCommandPickerSelection(-1);
                 } else if (self.file_picker_open) {
                     self.moveFilePickerSelection(-1);
                 }
@@ -307,6 +327,7 @@ const App = struct {
         self.input_buffer.clearRetainingCapacity();
         self.input_cursor = 0;
         self.model_picker_open = false;
+        self.command_picker_open = false;
         self.file_picker_open = false;
 
         if (line.len == 0) return;
@@ -944,6 +965,8 @@ const App = struct {
 
         const key_hint = if (self.model_picker_open)
             "ctrl-n/p or up/down, enter/tab select, esc close"
+        else if (self.command_picker_open)
+            "ctrl-n/p or up/down, enter/tab insert, esc close"
         else if (self.file_picker_open)
             "ctrl-n/p or up/down, enter/tab insert, esc close"
         else if (self.mode == .insert)
@@ -971,6 +994,8 @@ const App = struct {
 
         if (self.model_picker_open) {
             try self.renderModelPicker(&screen_writer.writer, width, lines, palette);
+        } else if (self.command_picker_open) {
+            try self.renderCommandPicker(&screen_writer.writer, width, lines, palette);
         } else if (self.file_picker_open) {
             try self.renderFilePicker(&screen_writer.writer, width, lines, palette);
         }
@@ -1100,11 +1125,23 @@ const App = struct {
     fn syncPickersFromInput(self: *App) void {
         self.syncModelPickerFromInput();
         if (self.model_picker_open) {
+            self.command_picker_open = false;
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
             self.file_picker_open = false;
             self.file_picker_index = 0;
             self.file_picker_scroll = 0;
             return;
         }
+
+        self.syncCommandPickerFromInput();
+        if (self.command_picker_open) {
+            self.file_picker_open = false;
+            self.file_picker_index = 0;
+            self.file_picker_scroll = 0;
+            return;
+        }
+
         self.syncFilePickerFromInput();
     }
 
@@ -1130,6 +1167,29 @@ const App = struct {
             return;
         }
         if (self.model_picker_index >= total) self.model_picker_index = total - 1;
+    }
+
+    fn syncCommandPickerFromInput(self: *App) void {
+        const query = parseCommandPickerQuery(self.input_buffer.items, self.input_cursor) orelse {
+            self.command_picker_open = false;
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
+            return;
+        };
+
+        if (!self.command_picker_open) {
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
+        }
+        self.command_picker_open = true;
+
+        const total = self.commandPickerMatchCount(query);
+        if (total == 0) {
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
+            return;
+        }
+        if (self.command_picker_index >= total) self.command_picker_index = total - 1;
     }
 
     fn syncFilePickerFromInput(self: *App) void {
@@ -1262,8 +1322,19 @@ const App = struct {
         return 1 + shown_rows;
     }
 
+    fn commandPickerLineCount(self: *App, terminal_lines: usize) usize {
+        if (!self.command_picker_open) return 0;
+
+        const query = parseCommandPickerQuery(self.input_buffer.items, self.input_cursor) orelse return 0;
+        const total = self.commandPickerMatchCount(query);
+        const max_rows = self.commandPickerMaxRows(terminal_lines);
+        const shown_rows = if (total == 0) @as(usize, 1) else @min(total, max_rows);
+        return 1 + shown_rows;
+    }
+
     fn pickerLineCount(self: *App, terminal_lines: usize) usize {
         if (self.model_picker_open) return self.modelPickerLineCount(terminal_lines);
+        if (self.command_picker_open) return self.commandPickerLineCount(terminal_lines);
         if (self.file_picker_open) return self.filePickerLineCount(terminal_lines);
         return 0;
     }
@@ -1276,6 +1347,11 @@ const App = struct {
     fn filePickerMaxRows(_: *App, terminal_lines: usize) usize {
         const budget = @max(@as(usize, 3), terminal_lines / 5);
         return @min(FILE_PICKER_MAX_ROWS, budget);
+    }
+
+    fn commandPickerMaxRows(_: *App, terminal_lines: usize) usize {
+        const budget = @max(@as(usize, 3), terminal_lines / 5);
+        return @min(COMMAND_PICKER_MAX_ROWS, budget);
     }
 
     fn renderModelPicker(self: *App, writer: *std.Io.Writer, width: usize, terminal_lines: usize, palette: Palette) !void {
@@ -1343,11 +1419,29 @@ const App = struct {
         return count;
     }
 
+    fn commandPickerMatchCount(_: *App, query: []const u8) usize {
+        var count: usize = 0;
+        for (BUILTIN_COMMANDS) |entry| {
+            if (commandMatchesQuery(entry, query)) count += 1;
+        }
+        return count;
+    }
+
     fn filePickerNthMatch(self: *App, query: []const u8, target_index: usize) ?[]const u8 {
         var seen: usize = 0;
         for (self.file_index.items) |path| {
             if (!filePathMatchesQuery(path, query)) continue;
             if (seen == target_index) return path;
+            seen += 1;
+        }
+        return null;
+    }
+
+    fn commandPickerNthMatch(_: *App, query: []const u8, target_index: usize) ?BuiltinCommandEntry {
+        var seen: usize = 0;
+        for (BUILTIN_COMMANDS) |entry| {
+            if (!commandMatchesQuery(entry, query)) continue;
+            if (seen == target_index) return entry;
             seen += 1;
         }
         return null;
@@ -1369,6 +1463,22 @@ const App = struct {
         }
     }
 
+    fn moveCommandPickerSelection(self: *App, delta: i32) void {
+        const query = parseCommandPickerQuery(self.input_buffer.items, self.input_cursor) orelse return;
+        const total = self.commandPickerMatchCount(query);
+        if (total == 0) {
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
+            return;
+        }
+
+        if (delta < 0) {
+            if (self.command_picker_index > 0) self.command_picker_index -= 1;
+        } else if (delta > 0) {
+            if (self.command_picker_index + 1 < total) self.command_picker_index += 1;
+        }
+    }
+
     fn acceptFilePickerSelection(self: *App) !void {
         const query = currentAtTokenQuery(self.input_buffer.items, self.input_cursor) orelse return;
         const total = self.filePickerMatchCount(query);
@@ -1385,6 +1495,32 @@ const App = struct {
         self.file_picker_index = 0;
         self.file_picker_scroll = 0;
         try self.setNoticeFmt("Inserted @{s}", .{selected});
+    }
+
+    fn acceptCommandPickerSelection(self: *App) !void {
+        const query = parseCommandPickerQuery(self.input_buffer.items, self.input_cursor) orelse return;
+        const total = self.commandPickerMatchCount(query);
+        if (total == 0) {
+            try self.setNotice("No slash command matches current query");
+            return;
+        }
+
+        if (self.command_picker_index >= total) self.command_picker_index = total - 1;
+        const selected = self.commandPickerNthMatch(query, self.command_picker_index) orelse return;
+
+        self.input_buffer.clearRetainingCapacity();
+        try self.input_buffer.appendSlice(self.allocator, "/");
+        try self.input_buffer.appendSlice(self.allocator, selected.name);
+        if (selected.insert_trailing_space) {
+            try self.input_buffer.append(self.allocator, ' ');
+        }
+        self.input_cursor = self.input_buffer.items.len;
+        self.command_picker_open = false;
+        self.command_picker_index = 0;
+        self.command_picker_scroll = 0;
+
+        try self.setNoticeFmt("Inserted /{s}", .{selected.name});
+        self.syncPickersFromInput();
     }
 
     fn insertSelectedFilePathAtCursor(self: *App, path: []const u8) !void {
@@ -1442,6 +1578,63 @@ const App = struct {
             const row_color = if (selected) palette.accent else palette.dim;
 
             const row_text = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ marker, selected_path });
+            defer self.allocator.free(row_text);
+            const row_line = try truncateLineAlloc(self.allocator, row_text, width);
+            defer self.allocator.free(row_line);
+            try writer.print("{s}{s}{s}\n", .{ row_color, row_line, palette.reset });
+        }
+    }
+
+    fn renderCommandPicker(self: *App, writer: *std.Io.Writer, width: usize, terminal_lines: usize, palette: Palette) !void {
+        const query = parseCommandPickerQuery(self.input_buffer.items, self.input_cursor) orelse return;
+        const total = self.commandPickerMatchCount(query);
+        const max_rows = self.commandPickerMaxRows(terminal_lines);
+        const shown_rows = if (total == 0) @as(usize, 1) else @min(total, max_rows);
+
+        if (total > 0) {
+            if (self.command_picker_index >= total) self.command_picker_index = total - 1;
+            if (self.command_picker_index < self.command_picker_scroll) {
+                self.command_picker_scroll = self.command_picker_index;
+            } else if (self.command_picker_index >= self.command_picker_scroll + shown_rows) {
+                self.command_picker_scroll = self.command_picker_index - shown_rows + 1;
+            }
+            const max_scroll = total - shown_rows;
+            if (self.command_picker_scroll > max_scroll) self.command_picker_scroll = max_scroll;
+        } else {
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
+        }
+
+        const header_text = try std.fmt.allocPrint(
+            self.allocator,
+            "command picker ({d}) query:{s}",
+            .{ total, if (query.len == 0) "*" else query },
+        );
+        defer self.allocator.free(header_text);
+        const header_line = try truncateLineAlloc(self.allocator, header_text, width);
+        defer self.allocator.free(header_line);
+        try writer.print("{s}{s}{s}\n", .{ palette.accent, header_line, palette.reset });
+
+        if (total == 0) {
+            const empty_line = try truncateLineAlloc(self.allocator, "  no matches", width);
+            defer self.allocator.free(empty_line);
+            try writer.print("{s}{s}{s}\n", .{ palette.dim, empty_line, palette.reset });
+            return;
+        }
+
+        const end_index = @min(self.command_picker_scroll + shown_rows, total);
+        var index = self.command_picker_scroll;
+        while (index < end_index) : (index += 1) {
+            const selected_entry = self.commandPickerNthMatch(query, index) orelse continue;
+            const is_selected = index == self.command_picker_index;
+            const marker = if (is_selected) ">" else " ";
+            const row_color = if (is_selected) palette.accent else palette.dim;
+
+            const row_text = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} /{s}  {s}",
+                .{ marker, selected_entry.name, selected_entry.description },
+            );
             defer self.allocator.free(row_text);
             const row_line = try truncateLineAlloc(self.allocator, row_text, width);
             defer self.allocator.free(row_line);
@@ -1672,6 +1865,45 @@ fn buildInputView(allocator: std.mem.Allocator, before: []const u8, after: []con
     out[2] = '.';
     @memcpy(out[3..], full[full.len - tail_len ..]);
     return out;
+}
+
+const BuiltinCommandEntry = struct {
+    name: []const u8,
+    description: []const u8,
+    insert_trailing_space: bool = true,
+};
+
+const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
+    .{ .name = "help", .description = "show command help", .insert_trailing_space = false },
+    .{ .name = "provider", .description = "set/show provider id" },
+    .{ .name = "model", .description = "pick or set model id" },
+    .{ .name = "models", .description = "list models cache / refresh" },
+    .{ .name = "files", .description = "show file index / refresh" },
+    .{ .name = "new", .description = "create conversation" },
+    .{ .name = "list", .description = "list conversations", .insert_trailing_space = false },
+    .{ .name = "switch", .description = "switch conversation id" },
+    .{ .name = "title", .description = "rename conversation" },
+    .{ .name = "theme", .description = "set theme (codex/plain/forest)" },
+    .{ .name = "ui", .description = "set ui mode (compact/comfy)" },
+    .{ .name = "quit", .description = "exit app", .insert_trailing_space = false },
+    .{ .name = "q", .description = "exit app", .insert_trailing_space = false },
+};
+
+fn parseCommandPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
+    if (input.len == 0 or input[0] != '/') return null;
+
+    const first_space = std.mem.indexOfAny(u8, input, " \t\r\n");
+    if (first_space) |space_index| {
+        if (cursor > space_index) return null;
+        return input[1..space_index];
+    }
+
+    return input[1..];
+}
+
+fn commandMatchesQuery(entry: BuiltinCommandEntry, query: []const u8) bool {
+    if (query.len == 0) return true;
+    return containsAsciiIgnoreCase(entry.name, query) or containsAsciiIgnoreCase(entry.description, query);
 }
 
 fn parseReadToolCommand(text: []const u8) ?[]const u8 {
@@ -2035,6 +2267,24 @@ test "parseReadToolCommand extracts command formats" {
     try std.testing.expectEqualStrings("cat src/main.zig", parseReadToolCommand("READ cat src/main.zig").?);
     try std.testing.expectEqualStrings("grep -n foo src/tui.zig", parseReadToolCommand("```read\ngrep -n foo src/tui.zig\n```").?);
     try std.testing.expect(parseReadToolCommand("normal assistant text") == null);
+}
+
+test "parseCommandPickerQuery handles slash token editing only" {
+    try std.testing.expectEqualStrings("mo", parseCommandPickerQuery("/mo", 3).?);
+    try std.testing.expectEqualStrings("", parseCommandPickerQuery("/", 1).?);
+    try std.testing.expectEqualStrings("model", parseCommandPickerQuery("/model test", 6).?);
+    try std.testing.expect(parseCommandPickerQuery("/model test", 8) == null);
+    try std.testing.expect(parseCommandPickerQuery("hello", 2) == null);
+}
+
+test "commandMatchesQuery matches name and description" {
+    const entry: BuiltinCommandEntry = .{
+        .name = "provider",
+        .description = "set/show provider id",
+    };
+    try std.testing.expect(commandMatchesQuery(entry, "prov"));
+    try std.testing.expect(commandMatchesQuery(entry, "show"));
+    try std.testing.expect(!commandMatchesQuery(entry, "xyz"));
 }
 
 test "isAllowedReadCommand allowlist and slash rejection" {
