@@ -2581,7 +2581,7 @@ const App = struct {
                 index == last_index and
                 message.role == .assistant and
                 message.content.len == 0)
-                try buildWorkingPlaceholder(self.allocator, content_width, streamTaskTitle(self.stream_task), self.stream_started_ms, now_ms)
+                try buildWorkingPlaceholder(self.allocator, streamTaskTitle(self.stream_task), self.stream_started_ms, now_ms)
             else
                 null;
             defer if (loading_placeholder) |text| self.allocator.free(text);
@@ -3575,6 +3575,13 @@ fn streamElapsedMs(started_ms: i64, now_ms: i64) i64 {
     return @max(@as(i64, 0), now_ms - started_ms);
 }
 
+fn streamStatusHeader(task_title: []const u8) []const u8 {
+    if (std.mem.eql(u8, task_title, "Idle")) return "Working";
+    if (std.mem.eql(u8, task_title, "Thinking")) return "Working";
+    if (std.mem.eql(u8, task_title, "Responding")) return "Working";
+    return task_title;
+}
+
 fn buildStreamingNotice(
     allocator: std.mem.Allocator,
     task_title: []const u8,
@@ -3582,64 +3589,30 @@ fn buildStreamingNotice(
     now_ms: i64,
 ) ![]u8 {
     const elapsed_ms = streamElapsedMs(started_ms, now_ms);
-    const elapsed_tenths = @divFloor(elapsed_ms, 100);
-    const elapsed_whole = @divFloor(elapsed_tenths, 10);
-    const elapsed_frac = @mod(elapsed_tenths, 10);
-    const pulse_on = @mod(@divFloor(elapsed_ms, 320), 2) == 0;
-    const pulse = if (pulse_on) "*" else " ";
+    const elapsed_seconds = @divFloor(elapsed_ms, 1000);
+    const header = streamStatusHeader(task_title);
 
     return std.fmt.allocPrint(
         allocator,
-        "Working {d}.{d}s | task:{s}{s}{s} | Esc Esc to interrupt",
-        .{ elapsed_whole, elapsed_frac, pulse, task_title, pulse },
+        "{s} ({d}s • esc to interrupt)",
+        .{ header, elapsed_seconds },
     );
 }
 
 fn buildWorkingPlaceholder(
     allocator: std.mem.Allocator,
-    width: usize,
     task_title: []const u8,
     started_ms: i64,
     now_ms: i64,
 ) ![]u8 {
     const elapsed_ms = streamElapsedMs(started_ms, now_ms);
-    const elapsed_tenths = @divFloor(elapsed_ms, 100);
-    const elapsed_whole = @divFloor(elapsed_tenths, 10);
-    const elapsed_frac = @mod(elapsed_tenths, 10);
-    const pulse_on = @mod(@divFloor(elapsed_ms, 320), 2) == 0;
-    const pulse = if (pulse_on) "*" else " ";
-
-    const max_bar = @max(@as(usize, 16), @min(@as(usize, 30), width / 3));
-    const segment_len = @max(@as(usize, 3), @min(@as(usize, 7), max_bar / 4));
-    const travel = if (max_bar > segment_len) max_bar - segment_len else 0;
-    const period_i64: i64 = if (travel == 0) 1 else @as(i64, @intCast(travel)) * 2;
-    const frame = @divFloor(elapsed_ms, 55);
-    const phase = @as(usize, @intCast(@mod(frame, period_i64)));
-    const forward = phase <= travel;
-    const offset = if (travel == 0) 0 else if (forward) phase else @as(usize, @intCast(period_i64 - @as(i64, @intCast(phase))));
-
-    var bar_buf: [36]u8 = undefined;
-    std.debug.assert(max_bar <= bar_buf.len);
-    for (0..max_bar) |index| {
-        bar_buf[index] = ' ';
-    }
-
-    var seg_index: usize = 0;
-    while (seg_index < segment_len and offset + seg_index < max_bar) : (seg_index += 1) {
-        bar_buf[offset + seg_index] = '#';
-    }
-
-    if (forward and segment_len > 0) {
-        const head = offset + segment_len - 1;
-        if (head < max_bar) bar_buf[head] = '>';
-    } else if (segment_len > 0) {
-        if (offset < max_bar) bar_buf[offset] = '<';
-    }
+    const elapsed_seconds = @divFloor(elapsed_ms, 1000);
+    const header = streamStatusHeader(task_title);
 
     return std.fmt.allocPrint(
         allocator,
-        "Working {d}.{d}s [{s}] task:{s}{s}{s}  Esc Esc to interrupt",
-        .{ elapsed_whole, elapsed_frac, bar_buf[0..max_bar], pulse, task_title, pulse },
+        "{s} ({d}s • esc to interrupt)",
+        .{ header, elapsed_seconds },
     );
 }
 
@@ -6490,18 +6463,11 @@ test "formatTokenCount trims trailing .0 for compact context display" {
 test "buildWorkingPlaceholder includes task timer and interrupt hint" {
     const allocator = std.testing.allocator;
 
-    const placeholder = try buildWorkingPlaceholder(allocator, 120, "Thinking", 1_000, 6_500);
+    const placeholder = try buildWorkingPlaceholder(allocator, "Thinking", 1_000, 6_500);
     defer allocator.free(placeholder);
 
-    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Working 5.5s") != null);
-    try std.testing.expect(std.mem.indexOf(u8, placeholder, "task:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Thinking") != null);
-    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Esc Esc to interrupt") != null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, placeholder, '[') != null);
-    try std.testing.expect(
-        std.mem.indexOfScalar(u8, placeholder, '>') != null or
-            std.mem.indexOfScalar(u8, placeholder, '<') != null,
-    );
+    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Working (5s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, placeholder, "esc to interrupt") != null);
 }
 
 test "buildStreamingNotice includes task and elapsed timer" {
@@ -6510,7 +6476,6 @@ test "buildStreamingNotice includes task and elapsed timer" {
     const notice = try buildStreamingNotice(allocator, "Running READ", 2_000, 7_100);
     defer allocator.free(notice);
 
-    try std.testing.expect(std.mem.indexOf(u8, notice, "Working 5.1s") != null);
-    try std.testing.expect(std.mem.indexOf(u8, notice, "Running READ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, notice, "Esc Esc to interrupt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice, "Running READ (5s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice, "esc to interrupt") != null);
 }

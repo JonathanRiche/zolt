@@ -1,4 +1,11 @@
 //! models.dev cache and provider/model catalog extraction.
+//!
+//! Usage:
+//!   - Call `loadOrRefresh(allocator, cache_path)` to read the cached catalog or
+//!     fetch from models.dev if missing.
+//!   - Use `catalog.findProviderConst("openai")` to access providers.
+//!   - Use `catalog.hasModel("openai", "gpt-4.1")` to check availability.
+//!   - Remember to `catalog.deinit(allocator)` when done.
 
 const std = @import("std");
 
