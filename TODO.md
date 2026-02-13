@@ -16,17 +16,22 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 ## Planning and UX Control (High Priority)
 - [ ] `update_plan` equivalent
 - [ ] `request_user_input` equivalent
+  - [ ] define blocking vs non-blocking behavior
+  - [ ] specify UI surface (modal, inline prompt, status bar, etc.)
 
 ## External Context (Next)
 - [ ] `list_mcp_resources`
 - [ ] `list_mcp_resource_templates`
 - [ ] `read_mcp_resource`
+- [ ] define MCP auth/permissions/scoping (per-workspace?)
 - [x] `web_search` (optional mode)
 - [x] `view_image` (local screenshots/assets)
 
 ## Runtime / Advanced (Later)
 - [ ] `js_repl` + `js_repl_reset` (optional)
 - [ ] multi-agent controls (`spawn_agent`, `send_input`, `resume_agent`, `wait`, `close_agent`)
+  - [ ] internal API support
+  - [ ] UI exposure (if needed)
 
 ## UX / Rendering (Later)
 - [x] syntax highlighting for patch diff preview/code blocks (beyond +/- colors)
@@ -38,6 +43,7 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 
 ## Repo / Product Polish
 - [ ] add config file or env overrides for defaults (theme, UI density, provider, model)
+- [ ] versioned config schema + migration strategy
 - [ ] add README section for testing providers without keys / mock mode
 - [ ] consider allocator choice for release builds (e.g., GPA vs DebugAllocator)
 - [ ] add optional verbose logging or crash report log file path
