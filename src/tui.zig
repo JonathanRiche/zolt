@@ -23,6 +23,21 @@ const Theme = enum {
     forest,
 };
 
+const StreamTask = enum {
+    idle,
+    thinking,
+    responding,
+    running_read,
+    running_list_dir,
+    running_read_file,
+    running_grep_files,
+    running_project_search,
+    running_apply_patch,
+    running_exec_command,
+    running_write_stdin,
+    running_web_search,
+};
+
 const TerminalMetrics = struct {
     width: usize,
     lines: usize,
@@ -357,6 +372,7 @@ const App = struct {
     stream_was_interrupted: bool = false,
     stream_stop_for_suspend: bool = false,
     stream_started_ms: i64 = 0,
+    stream_task: StreamTask = .idle,
     suspend_requested: bool = false,
 
     notice: []u8,
@@ -566,10 +582,12 @@ const App = struct {
         self.stream_was_interrupted = false;
         self.stream_stop_for_suspend = false;
         self.stream_started_ms = std.time.milliTimestamp();
+        self.stream_task = .thinking;
         self.resetStreamInterruptState();
         defer {
             self.is_streaming = false;
             self.stream_started_ms = 0;
+            self.stream_task = .idle;
             self.resetStreamInterruptState();
         }
 
@@ -593,6 +611,8 @@ const App = struct {
             const tool_call = parseAssistantToolCall(assistant_message.content) orelse break;
             switch (tool_call) {
                 .read => |read_command| {
+                    self.stream_task = .running_read;
+                    try self.render();
                     const read_command_owned = try self.allocator.dupe(u8, read_command);
                     defer self.allocator.free(read_command_owned);
 
@@ -607,6 +627,8 @@ const App = struct {
                     try self.setNoticeFmt("Ran READ command: {s}", .{read_command_owned});
                 },
                 .list_dir => |list_dir_payload| {
+                    self.stream_task = .running_list_dir;
+                    try self.render();
                     const payload_owned = try self.allocator.dupe(u8, list_dir_payload);
                     defer self.allocator.free(payload_owned);
 
@@ -619,6 +641,8 @@ const App = struct {
                     try self.setNotice("Ran LIST_DIR tool");
                 },
                 .read_file => |read_file_payload| {
+                    self.stream_task = .running_read_file;
+                    try self.render();
                     const payload_owned = try self.allocator.dupe(u8, read_file_payload);
                     defer self.allocator.free(payload_owned);
 
@@ -631,6 +655,8 @@ const App = struct {
                     try self.setNotice("Ran READ_FILE tool");
                 },
                 .grep_files => |grep_payload| {
+                    self.stream_task = .running_grep_files;
+                    try self.render();
                     const payload_owned = try self.allocator.dupe(u8, grep_payload);
                     defer self.allocator.free(payload_owned);
 
@@ -643,6 +669,8 @@ const App = struct {
                     try self.setNotice("Ran GREP_FILES tool");
                 },
                 .project_search => |project_search_payload| {
+                    self.stream_task = .running_project_search;
+                    try self.render();
                     const payload_owned = try self.allocator.dupe(u8, project_search_payload);
                     defer self.allocator.free(payload_owned);
 
@@ -655,6 +683,8 @@ const App = struct {
                     try self.setNotice("Ran PROJECT_SEARCH tool");
                 },
                 .apply_patch => |patch_text| {
+                    self.stream_task = .running_apply_patch;
+                    try self.render();
                     const patch_text_owned = try self.allocator.dupe(u8, patch_text);
                     defer self.allocator.free(patch_text_owned);
 
@@ -667,6 +697,8 @@ const App = struct {
                     try self.setNotice("Ran APPLY_PATCH tool");
                 },
                 .exec_command => |exec_payload| {
+                    self.stream_task = .running_exec_command;
+                    try self.render();
                     const exec_payload_owned = try self.allocator.dupe(u8, exec_payload);
                     defer self.allocator.free(exec_payload_owned);
 
@@ -679,6 +711,8 @@ const App = struct {
                     try self.setNotice("Ran EXEC_COMMAND tool");
                 },
                 .write_stdin => |write_payload| {
+                    self.stream_task = .running_write_stdin;
+                    try self.render();
                     const write_payload_owned = try self.allocator.dupe(u8, write_payload);
                     defer self.allocator.free(write_payload_owned);
 
@@ -691,6 +725,8 @@ const App = struct {
                     try self.setNotice("Ran WRITE_STDIN tool");
                 },
                 .web_search => |web_search_payload| {
+                    self.stream_task = .running_web_search;
+                    try self.render();
                     const web_search_payload_owned = try self.allocator.dupe(u8, web_search_payload);
                     defer self.allocator.free(web_search_payload_owned);
 
@@ -703,6 +739,7 @@ const App = struct {
                     try self.setNotice("Ran WEB_SEARCH tool");
                 },
             }
+            self.stream_task = .thinking;
             try self.render();
         }
 
@@ -731,6 +768,7 @@ const App = struct {
         };
         defer self.allocator.free(request.messages);
 
+        self.stream_task = .thinking;
         try self.setNoticeFmt("Streaming from {s}/{s}...", .{ provider_id, model_id });
         try self.render();
 
@@ -1773,6 +1811,7 @@ const App = struct {
             try self.render();
             return;
         }
+        self.stream_task = .responding;
         try self.appendToLastAssistantMessage(token);
         try self.render();
     }
@@ -2120,13 +2159,19 @@ const App = struct {
         var body_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer body_writer.deinit();
         const now_ms = std.time.milliTimestamp();
+        const stream_notice = if (self.is_streaming)
+            try buildStreamingNotice(self.allocator, streamTaskTitle(self.stream_task), self.stream_started_ms, now_ms)
+        else
+            null;
+        defer if (stream_notice) |text| self.allocator.free(text);
+        const active_notice = stream_notice orelse self.notice;
         const last_index = if (conversation.messages.items.len == 0) @as(usize, 0) else conversation.messages.items.len - 1;
         for (conversation.messages.items, 0..) |message, index| {
             const loading_placeholder = if (self.is_streaming and
                 index == last_index and
                 message.role == .assistant and
                 message.content.len == 0)
-                try buildWorkingPlaceholder(self.allocator, content_width, self.stream_started_ms, now_ms)
+                try buildWorkingPlaceholder(self.allocator, content_width, streamTaskTitle(self.stream_task), self.stream_started_ms, now_ms)
             else
                 null;
             defer if (loading_placeholder) |text| self.allocator.free(text);
@@ -2202,7 +2247,7 @@ const App = struct {
             try screen_writer.writer.writeAll(model_trimmed);
             try screen_writer.writer.writeByte('\n');
 
-            const note_text = try std.fmt.allocPrint(self.allocator, "note: {s}", .{self.notice});
+            const note_text = try std.fmt.allocPrint(self.allocator, "note: {s}", .{active_notice});
             defer self.allocator.free(note_text);
             const note_line = try truncateLineAlloc(self.allocator, note_text, width);
             defer self.allocator.free(note_line);
@@ -2241,13 +2286,13 @@ const App = struct {
             try std.fmt.allocPrint(
                 self.allocator,
                 "{s} | {s} | keys:{s} | scroll:{d}/{d}",
-                .{ self.notice, summary, key_hint, self.scroll_lines, max_scroll },
+                .{ active_notice, summary, key_hint, self.scroll_lines, max_scroll },
             )
         else
             try std.fmt.allocPrint(
                 self.allocator,
                 "{s} | keys:{s} | scroll:{d}/{d}",
-                .{ self.notice, key_hint, self.scroll_lines, max_scroll },
+                .{ active_notice, key_hint, self.scroll_lines, max_scroll },
             );
         defer self.allocator.free(status_text);
         const status_line = try truncateLineAlloc(self.allocator, status_text, width);
@@ -3097,46 +3142,93 @@ fn messageDisplayContent(message: anytype) []const u8 {
     return message.content;
 }
 
-fn buildWorkingPlaceholder(
+fn streamTaskTitle(task: StreamTask) []const u8 {
+    return switch (task) {
+        .idle => "Idle",
+        .thinking => "Thinking",
+        .responding => "Responding",
+        .running_read => "Running READ",
+        .running_list_dir => "Running LIST_DIR",
+        .running_read_file => "Running READ_FILE",
+        .running_grep_files => "Running GREP_FILES",
+        .running_project_search => "Running PROJECT_SEARCH",
+        .running_apply_patch => "Running APPLY_PATCH",
+        .running_exec_command => "Running EXEC_COMMAND",
+        .running_write_stdin => "Running WRITE_STDIN",
+        .running_web_search => "Running WEB_SEARCH",
+    };
+}
+
+fn streamElapsedMs(started_ms: i64, now_ms: i64) i64 {
+    if (started_ms <= 0) return 0;
+    return @max(@as(i64, 0), now_ms - started_ms);
+}
+
+fn buildStreamingNotice(
     allocator: std.mem.Allocator,
-    width: usize,
+    task_title: []const u8,
     started_ms: i64,
     now_ms: i64,
 ) ![]u8 {
-    const elapsed_ms = @max(@as(i64, 0), now_ms - started_ms);
-    const elapsed_s = @divFloor(elapsed_ms, 1000);
+    const elapsed_ms = streamElapsedMs(started_ms, now_ms);
+    const elapsed_tenths = @divFloor(elapsed_ms, 100);
+    const elapsed_whole = @divFloor(elapsed_tenths, 10);
+    const elapsed_frac = @mod(elapsed_tenths, 10);
+    const pulse_on = @mod(@divFloor(elapsed_ms, 320), 2) == 0;
+    const pulse = if (pulse_on) "*" else " ";
 
-    const max_bar = @max(@as(usize, 12), @min(@as(usize, 28), width / 3));
-    const segment_len = @max(@as(usize, 4), @min(@as(usize, 8), max_bar / 4));
-    const travel = if (max_bar > segment_len) max_bar - segment_len else 1;
-    const period_i64: i64 = @as(i64, @intCast(travel)) * 2;
-    const frame = @divFloor(elapsed_ms, 70);
+    return std.fmt.allocPrint(
+        allocator,
+        "Working {d}.{d}s | task:{s}{s}{s} | Esc Esc to interrupt",
+        .{ elapsed_whole, elapsed_frac, pulse, task_title, pulse },
+    );
+}
+
+fn buildWorkingPlaceholder(
+    allocator: std.mem.Allocator,
+    width: usize,
+    task_title: []const u8,
+    started_ms: i64,
+    now_ms: i64,
+) ![]u8 {
+    const elapsed_ms = streamElapsedMs(started_ms, now_ms);
+    const elapsed_tenths = @divFloor(elapsed_ms, 100);
+    const elapsed_whole = @divFloor(elapsed_tenths, 10);
+    const elapsed_frac = @mod(elapsed_tenths, 10);
+    const pulse_on = @mod(@divFloor(elapsed_ms, 320), 2) == 0;
+    const pulse = if (pulse_on) "*" else " ";
+
+    const max_bar = @max(@as(usize, 16), @min(@as(usize, 30), width / 3));
+    const segment_len = @max(@as(usize, 3), @min(@as(usize, 7), max_bar / 4));
+    const travel = if (max_bar > segment_len) max_bar - segment_len else 0;
+    const period_i64: i64 = if (travel == 0) 1 else @as(i64, @intCast(travel)) * 2;
+    const frame = @divFloor(elapsed_ms, 55);
     const phase = @as(usize, @intCast(@mod(frame, period_i64)));
     const forward = phase <= travel;
-    const offset = if (forward) phase else @as(usize, @intCast(period_i64 - @as(i64, @intCast(phase))));
+    const offset = if (travel == 0) 0 else if (forward) phase else @as(usize, @intCast(period_i64 - @as(i64, @intCast(phase))));
 
-    var bar_buf: [32]u8 = undefined;
+    var bar_buf: [36]u8 = undefined;
     std.debug.assert(max_bar <= bar_buf.len);
     for (0..max_bar) |index| {
-        bar_buf[index] = '-';
+        bar_buf[index] = ' ';
     }
 
     var seg_index: usize = 0;
     while (seg_index < segment_len and offset + seg_index < max_bar) : (seg_index += 1) {
-        bar_buf[offset + seg_index] = '=';
+        bar_buf[offset + seg_index] = '#';
     }
 
-    if (forward) {
+    if (forward and segment_len > 0) {
         const head = offset + segment_len - 1;
         if (head < max_bar) bar_buf[head] = '>';
-    } else {
+    } else if (segment_len > 0) {
         if (offset < max_bar) bar_buf[offset] = '<';
     }
 
     return std.fmt.allocPrint(
         allocator,
-        "Working {d}s [{s}]  Esc Esc to interrupt",
-        .{ elapsed_s, bar_buf[0..max_bar] },
+        "Working {d}.{d}s [{s}] task:{s}{s}{s}  Esc Esc to interrupt",
+        .{ elapsed_whole, elapsed_frac, bar_buf[0..max_bar], pulse, task_title, pulse },
     );
 }
 
@@ -5091,17 +5183,30 @@ test "formatTokenCount trims trailing .0 for compact context display" {
     try std.testing.expectEqualStrings("123.5k", c);
 }
 
-test "buildWorkingPlaceholder includes timer and interrupt hint" {
+test "buildWorkingPlaceholder includes task timer and interrupt hint" {
     const allocator = std.testing.allocator;
 
-    const placeholder = try buildWorkingPlaceholder(allocator, 120, 1_000, 6_500);
+    const placeholder = try buildWorkingPlaceholder(allocator, 120, "Thinking", 1_000, 6_500);
     defer allocator.free(placeholder);
 
-    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Working 5s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Working 5.5s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, placeholder, "task:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Thinking") != null);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "Esc Esc to interrupt") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, placeholder, '[') != null);
     try std.testing.expect(
         std.mem.indexOfScalar(u8, placeholder, '>') != null or
             std.mem.indexOfScalar(u8, placeholder, '<') != null,
     );
+}
+
+test "buildStreamingNotice includes task and elapsed timer" {
+    const allocator = std.testing.allocator;
+
+    const notice = try buildStreamingNotice(allocator, "Running READ", 2_000, 7_100);
+    defer allocator.free(notice);
+
+    try std.testing.expect(std.mem.indexOf(u8, notice, "Working 5.1s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice, "Running READ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice, "Esc Esc to interrupt") != null);
 }

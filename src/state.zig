@@ -32,8 +32,6 @@ pub const Message = struct {
     }
 };
 
-const BASELINE_TOKENS: i64 = 12_000;
-
 pub const TokenUsage = struct {
     input_tokens: i64 = 0,
     cached_input_tokens: i64 = 0,
@@ -62,17 +60,15 @@ pub const TokenUsage = struct {
     }
 
     pub fn tokensInContextWindow(self: TokenUsage) i64 {
-        return self.total_tokens;
+        return @max(@as(i64, 0), self.total_tokens);
     }
 
     pub fn percentOfContextWindowRemaining(self: TokenUsage, context_window: i64) i64 {
-        if (context_window <= BASELINE_TOKENS) return 0;
+        if (context_window <= 0) return 0;
 
-        const effective_window = context_window - BASELINE_TOKENS;
-        const used = @max(@as(i64, 0), self.tokensInContextWindow() - BASELINE_TOKENS);
-        const remaining = @max(@as(i64, 0), effective_window - used);
-        const percent = (@as(f64, @floatFromInt(remaining)) / @as(f64, @floatFromInt(effective_window))) * 100.0;
-        return @as(i64, @intFromFloat(@round(std.math.clamp(percent, 0.0, 100.0))));
+        const used = std.math.clamp(self.tokensInContextWindow(), @as(i64, 0), context_window);
+        const remaining = context_window - used;
+        return @divFloor(remaining * 100, context_window);
     }
 
     pub fn addAssign(self: *TokenUsage, other: TokenUsage) void {
@@ -450,6 +446,22 @@ test "switchConversation returns false for unknown id" {
     defer state.deinit(allocator);
 
     try std.testing.expect(!state.switchConversation("does-not-exist"));
+}
+
+test "percentOfContextWindowRemaining reflects usage without fixed baseline" {
+    const usage: TokenUsage = .{ .total_tokens = 6_500 };
+    try std.testing.expectEqual(@as(i64, 98), usage.percentOfContextWindowRemaining(400_000));
+}
+
+test "percentOfContextWindowRemaining clamps and floors" {
+    const zero_usage: TokenUsage = .{ .total_tokens = 0 };
+    try std.testing.expectEqual(@as(i64, 100), zero_usage.percentOfContextWindowRemaining(200_000));
+
+    const over_usage: TokenUsage = .{ .total_tokens = 500_000 };
+    try std.testing.expectEqual(@as(i64, 0), over_usage.percentOfContextWindowRemaining(200_000));
+
+    const invalid_window_usage: TokenUsage = .{ .total_tokens = 123 };
+    try std.testing.expectEqual(@as(i64, 0), invalid_window_usage.percentOfContextWindowRemaining(0));
 }
 
 comptime {

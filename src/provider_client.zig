@@ -361,12 +361,24 @@ fn streamSseResponse(
 
         const raw_line = maybe_line.?;
         const line = std.mem.trim(u8, raw_line, "\r");
-        if (line.len == 0) continue;
-        if (line[0] == ':') continue;
-        if (!std.mem.startsWith(u8, line, "data:")) continue;
+        if (line.len == 0) {
+            try callbacks.on_token(callbacks.context, "");
+            continue;
+        }
+        if (line[0] == ':') {
+            try callbacks.on_token(callbacks.context, "");
+            continue;
+        }
+        if (!std.mem.startsWith(u8, line, "data:")) {
+            try callbacks.on_token(callbacks.context, "");
+            continue;
+        }
 
         const data_text = std.mem.trimLeft(u8, line["data:".len..], " ");
-        if (data_text.len == 0) continue;
+        if (data_text.len == 0) {
+            try callbacks.on_token(callbacks.context, "");
+            continue;
+        }
         if (std.mem.eql(u8, data_text, "[DONE]")) break;
 
         const maybe_token = try extract_token(allocator, data_text);
