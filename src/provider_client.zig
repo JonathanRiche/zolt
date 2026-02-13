@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const Role = @import("state.zig").Role;
+const TokenUsage = @import("state.zig").TokenUsage;
 const DECOMPRESS_BUFFER_SIZE = 64 * 1024;
 
 pub const StreamMessage = struct {
@@ -20,6 +21,7 @@ pub const StreamRequest = struct {
 
 pub const StreamCallbacks = struct {
     on_token: *const fn (context: ?*anyopaque, token: []const u8) anyerror!void,
+    on_usage: ?*const fn (context: ?*anyopaque, usage: TokenUsage) anyerror!void = null,
     context: ?*anyopaque = null,
 };
 
@@ -117,7 +119,7 @@ fn streamOpenAiCompatible(
         return error.ProviderRequestFailed;
     }
 
-    try streamSseResponse(allocator, &response, callbacks, extractOpenAiTokenAlloc);
+    try streamSseResponse(allocator, &response, callbacks, extractOpenAiTokenAlloc, extractOpenAiUsageAlloc);
 }
 
 fn streamOpenAiLegacyCompletions(
@@ -179,7 +181,7 @@ fn streamOpenAiLegacyCompletions(
         return error.ProviderRequestFailed;
     }
 
-    try streamSseResponse(allocator, &response, callbacks, extractOpenAiTokenAlloc);
+    try streamSseResponse(allocator, &response, callbacks, extractOpenAiTokenAlloc, extractOpenAiUsageAlloc);
 }
 
 fn streamOpenAiResponses(
@@ -236,7 +238,7 @@ fn streamOpenAiResponses(
         return error.ProviderRequestFailed;
     }
 
-    try streamSseResponse(allocator, &response, callbacks, extractOpenAiResponsesTokenAlloc);
+    try streamSseResponse(allocator, &response, callbacks, extractOpenAiResponsesTokenAlloc, extractOpenAiResponsesUsageAlloc);
 }
 
 fn streamAnthropic(
@@ -288,7 +290,7 @@ fn streamAnthropic(
         return error.ProviderRequestFailed;
     }
 
-    try streamSseResponse(allocator, &response, callbacks, extractAnthropicTokenAlloc);
+    try streamSseResponse(allocator, &response, callbacks, extractAnthropicTokenAlloc, extractAnthropicUsageAlloc);
 }
 
 fn streamGoogle(
@@ -338,7 +340,7 @@ fn streamGoogle(
         return error.ProviderRequestFailed;
     }
 
-    try streamSseResponse(allocator, &response, callbacks, extractGoogleTokenAlloc);
+    try streamSseResponse(allocator, &response, callbacks, extractGoogleTokenAlloc, extractGoogleUsageAlloc);
 }
 
 fn streamSseResponse(
@@ -346,6 +348,7 @@ fn streamSseResponse(
     response: *std.http.Client.Response,
     callbacks: StreamCallbacks,
     comptime extract_token: fn (std.mem.Allocator, []const u8) anyerror!?[]u8,
+    comptime extract_usage: fn (std.mem.Allocator, []const u8) anyerror!?TokenUsage,
 ) !void {
     var transfer_buffer: [256 * 1024]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
@@ -371,6 +374,13 @@ fn streamSseResponse(
             defer allocator.free(token);
             if (token.len > 0) {
                 try callbacks.on_token(callbacks.context, token);
+            }
+        }
+
+        if (callbacks.on_usage) |on_usage| {
+            const maybe_usage = try extract_usage(allocator, data_text);
+            if (maybe_usage) |usage| {
+                try on_usage(callbacks.context, usage);
             }
         }
     }
@@ -439,6 +449,11 @@ fn buildOpenAiPayload(allocator: std.mem.Allocator, request: StreamRequest) ![]u
     try jw.write(request.model_id);
     try jw.objectField("stream");
     try jw.write(true);
+    try jw.objectField("stream_options");
+    try jw.beginObject();
+    try jw.objectField("include_usage");
+    try jw.write(true);
+    try jw.endObject();
     try jw.objectField("messages");
     try jw.beginArray();
 
@@ -675,6 +690,14 @@ fn extractOpenAiTokenAlloc(allocator: std.mem.Allocator, data_text: []const u8) 
     return null;
 }
 
+fn extractOpenAiUsageAlloc(allocator: std.mem.Allocator, data_text: []const u8) !?TokenUsage {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data_text, .{});
+    defer parsed.deinit();
+
+    const usage = objectField(parsed.value, "usage") orelse return null;
+    return tokenUsageFromValue(usage);
+}
+
 fn extractAnthropicTokenAlloc(allocator: std.mem.Allocator, data_text: []const u8) !?[]u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data_text, .{});
     defer parsed.deinit();
@@ -687,6 +710,23 @@ fn extractAnthropicTokenAlloc(allocator: std.mem.Allocator, data_text: []const u
     const text_value = objectField(delta, "text") orelse return null;
     const text = asString(text_value) orelse return null;
     return @as(?[]u8, try allocator.dupe(u8, text));
+}
+
+fn extractAnthropicUsageAlloc(allocator: std.mem.Allocator, data_text: []const u8) !?TokenUsage {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data_text, .{});
+    defer parsed.deinit();
+
+    if (objectField(parsed.value, "usage")) |usage| {
+        return tokenUsageFromValue(usage);
+    }
+
+    if (objectField(parsed.value, "message")) |message| {
+        if (objectField(message, "usage")) |usage| {
+            return tokenUsageFromValue(usage);
+        }
+    }
+
+    return null;
 }
 
 fn extractGoogleTokenAlloc(allocator: std.mem.Allocator, data_text: []const u8) !?[]u8 {
@@ -704,6 +744,14 @@ fn extractGoogleTokenAlloc(allocator: std.mem.Allocator, data_text: []const u8) 
     return @as(?[]u8, try allocator.dupe(u8, text));
 }
 
+fn extractGoogleUsageAlloc(allocator: std.mem.Allocator, data_text: []const u8) !?TokenUsage {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data_text, .{});
+    defer parsed.deinit();
+
+    const usage = objectField(parsed.value, "usageMetadata") orelse return null;
+    return tokenUsageFromValue(usage);
+}
+
 fn extractOpenAiResponsesTokenAlloc(allocator: std.mem.Allocator, data_text: []const u8) !?[]u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data_text, .{});
     defer parsed.deinit();
@@ -715,6 +763,64 @@ fn extractOpenAiResponsesTokenAlloc(allocator: std.mem.Allocator, data_text: []c
     const delta_value = objectField(parsed.value, "delta") orelse return null;
     const delta = asString(delta_value) orelse return null;
     return @as(?[]u8, try allocator.dupe(u8, delta));
+}
+
+fn extractOpenAiResponsesUsageAlloc(allocator: std.mem.Allocator, data_text: []const u8) !?TokenUsage {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data_text, .{});
+    defer parsed.deinit();
+
+    const event_type_value = objectField(parsed.value, "type") orelse return null;
+    const event_type = asString(event_type_value) orelse return null;
+    if (!std.mem.eql(u8, event_type, "response.completed") and !std.mem.eql(u8, event_type, "response.done")) {
+        return null;
+    }
+
+    const response = objectField(parsed.value, "response") orelse return null;
+    const usage = objectField(response, "usage") orelse return null;
+    return tokenUsageFromValue(usage);
+}
+
+fn tokenUsageFromValue(value: std.json.Value) ?TokenUsage {
+    const object = switch (value) {
+        .object => |obj| obj,
+        else => return null,
+    };
+
+    const input_tokens = jsonFieldI64(object, "input_tokens") orelse jsonFieldI64(object, "prompt_tokens") orelse jsonFieldI64(object, "promptTokenCount") orelse 0;
+    const output_tokens = jsonFieldI64(object, "output_tokens") orelse jsonFieldI64(object, "completion_tokens") orelse jsonFieldI64(object, "candidatesTokenCount") orelse 0;
+    const total_tokens = jsonFieldI64(object, "total_tokens") orelse jsonFieldI64(object, "totalTokenCount") orelse (input_tokens + output_tokens);
+    const cached_input_tokens = jsonNestedFieldI64(object, "input_tokens_details", "cached_tokens") orelse 0;
+    const reasoning_output_tokens = jsonNestedFieldI64(object, "output_tokens_details", "reasoning_tokens") orelse 0;
+
+    const usage: TokenUsage = .{
+        .input_tokens = input_tokens,
+        .cached_input_tokens = cached_input_tokens,
+        .output_tokens = output_tokens,
+        .reasoning_output_tokens = reasoning_output_tokens,
+        .total_tokens = total_tokens,
+    };
+
+    if (usage.isZero()) return null;
+    return usage;
+}
+
+fn jsonFieldI64(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |number| number,
+        .float => |number| @as(i64, @intFromFloat(number)),
+        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
+        else => null,
+    };
+}
+
+fn jsonNestedFieldI64(object: std.json.ObjectMap, object_key: []const u8, field_key: []const u8) ?i64 {
+    const nested_value = object.get(object_key) orelse return null;
+    const nested_object = switch (nested_value) {
+        .object => |obj| obj,
+        else => return null,
+    };
+    return jsonFieldI64(nested_object, field_key);
 }
 
 fn objectField(value: std.json.Value, key: []const u8) ?std.json.Value {
@@ -865,6 +971,47 @@ test "extractOpenAiResponsesTokenAlloc parses output_text delta" {
 
     try std.testing.expect(token != null);
     try std.testing.expect(std.mem.eql(u8, token.?, "Hello"));
+}
+
+test "extractOpenAiResponsesUsageAlloc parses response.completed usage" {
+    const allocator = std.testing.allocator;
+
+    const line =
+        "{\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":42,\"input_tokens_details\":{\"cached_tokens\":12},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":47}}}";
+
+    const usage = try extractOpenAiResponsesUsageAlloc(allocator, line);
+    try std.testing.expect(usage != null);
+    try std.testing.expectEqual(@as(i64, 42), usage.?.input_tokens);
+    try std.testing.expectEqual(@as(i64, 12), usage.?.cached_input_tokens);
+    try std.testing.expectEqual(@as(i64, 5), usage.?.output_tokens);
+    try std.testing.expectEqual(@as(i64, 2), usage.?.reasoning_output_tokens);
+    try std.testing.expectEqual(@as(i64, 47), usage.?.total_tokens);
+}
+
+test "extractOpenAiUsageAlloc parses chat completion stream usage" {
+    const allocator = std.testing.allocator;
+
+    const line =
+        "{\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}";
+
+    const usage = try extractOpenAiUsageAlloc(allocator, line);
+    try std.testing.expect(usage != null);
+    try std.testing.expectEqual(@as(i64, 100), usage.?.input_tokens);
+    try std.testing.expectEqual(@as(i64, 20), usage.?.output_tokens);
+    try std.testing.expectEqual(@as(i64, 120), usage.?.total_tokens);
+}
+
+test "extractGoogleUsageAlloc parses usageMetadata totals" {
+    const allocator = std.testing.allocator;
+
+    const line =
+        "{\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":7,\"totalTokenCount\":18}}";
+
+    const usage = try extractGoogleUsageAlloc(allocator, line);
+    try std.testing.expect(usage != null);
+    try std.testing.expectEqual(@as(i64, 11), usage.?.input_tokens);
+    try std.testing.expectEqual(@as(i64, 7), usage.?.output_tokens);
+    try std.testing.expectEqual(@as(i64, 18), usage.?.total_tokens);
 }
 
 test "shouldRetryWithLegacyCompletions detects non-chat model errors" {

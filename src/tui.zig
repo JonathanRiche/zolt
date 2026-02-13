@@ -9,6 +9,7 @@ const Paths = @import("paths.zig").Paths;
 const AppState = @import("state.zig").AppState;
 const Conversation = @import("state.zig").Conversation;
 const Role = @import("state.zig").Role;
+const TokenUsage = @import("state.zig").TokenUsage;
 
 const Mode = enum {
     normal,
@@ -253,6 +254,9 @@ const App = struct {
 
         const provider_id = self.app_state.selected_provider_id;
         const model_id = self.app_state.selected_model_id;
+        if (self.selectedModelContextWindow()) |window| {
+            self.app_state.currentConversation().model_context_window = window;
+        }
 
         const api_key = try self.resolveApiKey(provider_id);
         if (api_key == null) {
@@ -321,6 +325,7 @@ const App = struct {
 
         provider_client.streamChat(self.allocator, request, .{
             .on_token = onStreamToken,
+            .on_usage = onStreamUsage,
             .context = self,
         }) catch |err| {
             const provider_detail = provider_client.lastProviderErrorDetail();
@@ -454,6 +459,11 @@ const App = struct {
         const self: *App = @ptrCast(@alignCast(context.?));
         try self.appendToLastAssistantMessage(token);
         try self.render();
+    }
+
+    fn onStreamUsage(context: ?*anyopaque, usage: TokenUsage) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context.?));
+        self.app_state.appendTokenUsage(usage, self.selectedModelContextWindow());
     }
 
     fn appendToLastAssistantMessage(self: *App, token: []const u8) !void {
@@ -834,11 +844,20 @@ const App = struct {
             "enter esc /"
         else
             "i j/k H/L / q";
-        const status_text = try std.fmt.allocPrint(
-            self.allocator,
-            "{s} | keys:{s} | scroll:{d}/{d}",
-            .{ self.notice, key_hint, self.scroll_lines, max_scroll },
-        );
+        const context_summary = try self.contextUsageSummary(conversation);
+        defer if (context_summary) |summary| self.allocator.free(summary);
+        const status_text = if (context_summary) |summary|
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{s} | {s} | keys:{s} | scroll:{d}/{d}",
+                .{ self.notice, summary, key_hint, self.scroll_lines, max_scroll },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{s} | keys:{s} | scroll:{d}/{d}",
+                .{ self.notice, key_hint, self.scroll_lines, max_scroll },
+            );
         defer self.allocator.free(status_text);
         const status_line = try truncateLineAlloc(self.allocator, status_text, width);
         defer self.allocator.free(status_line);
@@ -1001,6 +1020,35 @@ const App = struct {
             if (modelMatchesQuery(model, query)) count += 1;
         }
         return count;
+    }
+
+    fn selectedModelContextWindow(self: *App) ?i64 {
+        const provider = self.catalog.findProviderConst(self.app_state.selected_provider_id) orelse return null;
+        for (provider.models.items) |model| {
+            if (std.mem.eql(u8, model.id, self.app_state.selected_model_id)) {
+                return model.context_window;
+            }
+        }
+        return null;
+    }
+
+    fn contextUsageSummary(self: *App, conversation: *const Conversation) !?[]u8 {
+        const usage = conversation.last_token_usage;
+        const window = conversation.model_context_window orelse self.selectedModelContextWindow();
+        if (usage.isZero() and window == null) return null;
+
+        const used = usage.tokensInContextWindow();
+        const used_text = try formatTokenCount(self.allocator, used);
+        defer self.allocator.free(used_text);
+
+        if (window) |context_window| {
+            const full_text = try formatTokenCount(self.allocator, context_window);
+            defer self.allocator.free(full_text);
+            const left_percent = usage.percentOfContextWindowRemaining(context_window);
+            return @as(?[]u8, try std.fmt.allocPrint(self.allocator, "ctx:{s}/{s} {d}% left", .{ used_text, full_text, left_percent }));
+        }
+
+        return @as(?[]u8, try std.fmt.allocPrint(self.allocator, "ctx:{s} used", .{used_text}));
     }
 
     fn modelPickerNthMatch(self: *App, query: []const u8, target_index: usize) ?*const models.ModelInfo {
@@ -1256,6 +1304,27 @@ fn writeWrappedPrefixed(
     return line_count;
 }
 
+fn formatTokenCount(allocator: std.mem.Allocator, raw_count: i64) ![]u8 {
+    const count = @max(@as(i64, 0), raw_count);
+    if (count >= 1_000_000) {
+        const scaled = @as(f64, @floatFromInt(count)) / 1_000_000.0;
+        const rounded = @round(scaled);
+        if (@abs(scaled - rounded) < 0.05) {
+            return std.fmt.allocPrint(allocator, "{d}M", .{@as(i64, @intFromFloat(rounded))});
+        }
+        return std.fmt.allocPrint(allocator, "{d:.1}M", .{scaled});
+    }
+    if (count >= 1_000) {
+        const scaled = @as(f64, @floatFromInt(count)) / 1_000.0;
+        const rounded = @round(scaled);
+        if (@abs(scaled - rounded) < 0.05) {
+            return std.fmt.allocPrint(allocator, "{d}k", .{@as(i64, @intFromFloat(rounded))});
+        }
+        return std.fmt.allocPrint(allocator, "{d:.1}k", .{scaled});
+    }
+    return std.fmt.allocPrint(allocator, "{d}", .{count});
+}
+
 fn truncateLineAlloc(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
     if (text.len <= max_width) return allocator.dupe(u8, text);
     if (max_width <= 3) return allocator.dupe(u8, text[0..max_width]);
@@ -1399,4 +1468,20 @@ test "isAllowedReadCommand allowlist and slash rejection" {
     try std.testing.expect(isAllowedReadCommand("ls"));
     try std.testing.expect(!isAllowedReadCommand("bash"));
     try std.testing.expect(!isAllowedReadCommand("/usr/bin/rg"));
+}
+
+test "formatTokenCount trims trailing .0 for compact context display" {
+    const allocator = std.testing.allocator;
+
+    const a = try formatTokenCount(allocator, 105_000);
+    defer allocator.free(a);
+    try std.testing.expectEqualStrings("105k", a);
+
+    const b = try formatTokenCount(allocator, 225_000);
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings("225k", b);
+
+    const c = try formatTokenCount(allocator, 123_456);
+    defer allocator.free(c);
+    try std.testing.expectEqualStrings("123.5k", c);
 }

@@ -32,11 +32,66 @@ pub const Message = struct {
     }
 };
 
+const BASELINE_TOKENS: i64 = 12_000;
+
+pub const TokenUsage = struct {
+    input_tokens: i64 = 0,
+    cached_input_tokens: i64 = 0,
+    output_tokens: i64 = 0,
+    reasoning_output_tokens: i64 = 0,
+    total_tokens: i64 = 0,
+
+    pub fn isZero(self: TokenUsage) bool {
+        return self.total_tokens == 0 and
+            self.input_tokens == 0 and
+            self.cached_input_tokens == 0 and
+            self.output_tokens == 0 and
+            self.reasoning_output_tokens == 0;
+    }
+
+    pub fn cachedInput(self: TokenUsage) i64 {
+        return @max(@as(i64, 0), self.cached_input_tokens);
+    }
+
+    pub fn nonCachedInput(self: TokenUsage) i64 {
+        return @max(@as(i64, 0), self.input_tokens - self.cachedInput());
+    }
+
+    pub fn blendedTotal(self: TokenUsage) i64 {
+        return @max(@as(i64, 0), self.nonCachedInput() + @max(@as(i64, 0), self.output_tokens));
+    }
+
+    pub fn tokensInContextWindow(self: TokenUsage) i64 {
+        return self.total_tokens;
+    }
+
+    pub fn percentOfContextWindowRemaining(self: TokenUsage, context_window: i64) i64 {
+        if (context_window <= BASELINE_TOKENS) return 0;
+
+        const effective_window = context_window - BASELINE_TOKENS;
+        const used = @max(@as(i64, 0), self.tokensInContextWindow() - BASELINE_TOKENS);
+        const remaining = @max(@as(i64, 0), effective_window - used);
+        const percent = (@as(f64, @floatFromInt(remaining)) / @as(f64, @floatFromInt(effective_window))) * 100.0;
+        return @as(i64, @intFromFloat(@round(std.math.clamp(percent, 0.0, 100.0))));
+    }
+
+    pub fn addAssign(self: *TokenUsage, other: TokenUsage) void {
+        self.input_tokens += other.input_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_output_tokens += other.reasoning_output_tokens;
+        self.total_tokens += other.total_tokens;
+    }
+};
+
 pub const Conversation = struct {
     id: []u8,
     title: []u8,
     created_ms: i64,
     updated_ms: i64,
+    total_token_usage: TokenUsage = .{},
+    last_token_usage: TokenUsage = .{},
+    model_context_window: ?i64 = null,
     messages: std.ArrayList(Message) = .empty,
 
     pub fn deinit(self: *Conversation, allocator: std.mem.Allocator) void {
@@ -58,6 +113,12 @@ pub const Conversation = struct {
         try jw.write(self.created_ms);
         try jw.objectField("updated_ms");
         try jw.write(self.updated_ms);
+        try jw.objectField("total_token_usage");
+        try jw.write(self.total_token_usage);
+        try jw.objectField("last_token_usage");
+        try jw.write(self.last_token_usage);
+        try jw.objectField("model_context_window");
+        try jw.write(self.model_context_window);
         try jw.objectField("messages");
         try jw.write(self.messages.items);
         try jw.endObject();
@@ -136,6 +197,16 @@ pub const AppState = struct {
         };
         try conversation.messages.append(allocator, message);
         conversation.updated_ms = message.timestamp_ms;
+    }
+
+    pub fn appendTokenUsage(self: *AppState, usage: TokenUsage, model_context_window: ?i64) void {
+        const conversation = self.currentConversation();
+        conversation.total_token_usage.addAssign(usage);
+        conversation.last_token_usage = usage;
+        if (model_context_window) |window| {
+            conversation.model_context_window = window;
+        }
+        conversation.updated_ms = std.time.milliTimestamp();
     }
 
     pub fn switchConversation(self: *AppState, conversation_id: []const u8) bool {
@@ -251,6 +322,9 @@ pub const AppState = struct {
                 .title = try allocator.dupe(u8, persisted_conversation.title),
                 .created_ms = persisted_conversation.created_ms,
                 .updated_ms = persisted_conversation.updated_ms,
+                .total_token_usage = persisted_conversation.total_token_usage orelse .{},
+                .last_token_usage = persisted_conversation.last_token_usage orelse .{},
+                .model_context_window = persisted_conversation.model_context_window,
             };
             errdefer conversation.deinit(allocator);
 
@@ -316,6 +390,9 @@ const PersistedConversation = struct {
     title: []const u8,
     created_ms: i64,
     updated_ms: i64,
+    total_token_usage: ?TokenUsage = null,
+    last_token_usage: ?TokenUsage = null,
+    model_context_window: ?i64 = null,
     messages: []PersistedMessage,
 };
 

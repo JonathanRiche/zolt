@@ -7,6 +7,7 @@ pub const MODELS_DEV_API_URL = "https://models.dev/api.json";
 pub const ModelInfo = struct {
     id: []u8,
     name: []u8,
+    context_window: ?i64 = null,
 
     pub fn deinit(self: *ModelInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -213,10 +214,12 @@ pub fn parseCatalogFromJson(allocator: std.mem.Allocator, json_text: []const u8)
 
                         const model_id = jsonFieldString(model_object, "id") orelse model_entry.key_ptr.*;
                         const model_name = jsonFieldString(model_object, "name") orelse model_id;
+                        const context_window = jsonModelContextWindow(model_object);
 
                         const model: ModelInfo = .{
                             .id = try allocator.dupe(u8, model_id),
                             .name = try allocator.dupe(u8, model_name),
+                            .context_window = context_window,
                         };
                         try provider.models.append(allocator, model);
                     }
@@ -239,6 +242,25 @@ fn jsonFieldString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
         .string => |text| text,
         else => null,
     };
+}
+
+fn jsonFieldI64(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |number| number,
+        .float => |number| @as(i64, @intFromFloat(number)),
+        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
+        else => null,
+    };
+}
+
+fn jsonModelContextWindow(object: std.json.ObjectMap) ?i64 {
+    const limit_value = object.get("limit") orelse return null;
+    const limit_object = switch (limit_value) {
+        .object => |obj| obj,
+        else => return null,
+    };
+    return jsonFieldI64(limit_object, "context");
 }
 
 fn providerLessThan(_: void, left: ProviderInfo, right: ProviderInfo) bool {
@@ -420,6 +442,7 @@ test "parseCatalogFromJson extracts providers and models" {
     const openai = catalog.findProviderConst("openai") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.eql(u8, openai.env_vars.items[0], "OPENAI_API_KEY"));
     try std.testing.expect(catalog.hasModel("openai", "gpt-4.1"));
+    try std.testing.expectEqual(@as(?i64, null), openai.models.items[0].context_window);
 }
 
 test "loadFromPath reads catalog file" {
@@ -472,4 +495,19 @@ test "model ordering prioritizes latest and codex first" {
     try std.testing.expectEqualStrings("gpt-5-chat-latest", provider.models.items[0].id);
     try std.testing.expectEqualStrings("gpt-5-codex-2025-02-01", provider.models.items[1].id);
     try std.testing.expectEqualStrings("gpt-5-codex-2024-11-10", provider.models.items[2].id);
+}
+
+test "parseCatalogFromJson extracts model context window" {
+    const allocator = std.testing.allocator;
+
+    const sample_json =
+        "{\"openai\":{\"id\":\"openai\",\"name\":\"OpenAI\",\"models\":{" ++
+        "\"gpt-5.2-codex\":{\"id\":\"gpt-5.2-codex\",\"name\":\"GPT-5.2 Codex\",\"limit\":{\"context\":225000}}" ++
+        "}}}";
+
+    var catalog = try parseCatalogFromJson(allocator, sample_json);
+    defer catalog.deinit(allocator);
+
+    const provider = catalog.findProviderConst("openai") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 225000), provider.models.items[0].context_window.?);
 }
