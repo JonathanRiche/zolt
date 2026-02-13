@@ -22,14 +22,19 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [ ] `list_mcp_resource_templates`
 - [ ] `read_mcp_resource`
 - [x] `web_search` (optional mode)
-- [ ] `view_image` (local screenshots/assets)
+- [x] `view_image` (local screenshots/assets)
 
 ## Runtime / Advanced (Later)
 - [ ] `js_repl` + `js_repl_reset` (optional)
 - [ ] multi-agent controls (`spawn_agent`, `send_input`, `resume_agent`, `wait`, `close_agent`)
 
 ## UX / Rendering (Later)
-- [ ] syntax highlighting for patch diff preview/code blocks (beyond +/- colors)
+- [x] syntax highlighting for patch diff preview/code blocks (beyond +/- colors)
+- [ ] customizable keybindings/hotkeys (configurable shortcuts)
+- [ ] command palette / quick actions (e.g., “New chat”, “Toggle plan”, “Open logs”)
+- [ ] status bar indicators (model/provider, token usage, tool mode)
+- [ ] copy buttons for code blocks / tool outputs
+- [ ] streaming UX tweaks (partial tool output display, spinner states)
 
 ## Repo / Product Polish
 - [ ] add config file or env overrides for defaults (theme, UI density, provider, model)
@@ -37,3 +42,5 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [ ] consider allocator choice for release builds (e.g., GPA vs DebugAllocator)
 - [ ] add optional verbose logging or crash report log file path
 - [ ] document state file schema/location for users who want to inspect/backup
+- [ ] add deterministic test harness for tool invocations / golden outputs
+- [ ] document keybindings and customization in README

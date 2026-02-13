@@ -3646,6 +3646,7 @@ fn buildWorkingPlaceholder(
 fn shouldRenderDiffMode(message: anytype, text: []const u8) bool {
     if (text.len == 0) return false;
     if (std.mem.indexOf(u8, text, "*** Begin Patch") != null) return true;
+    if (std.mem.indexOf(u8, text, "```") != null) return true;
 
     if (message.role == .system and std.mem.startsWith(u8, text, "[apply-patch-result]")) {
         return std.mem.indexOf(u8, text, "diff_preview:") != null;
@@ -3660,6 +3661,58 @@ fn diffLineColor(line: []const u8, palette: Palette) []const u8 {
     if (std.mem.startsWith(u8, line, "-") and !std.mem.startsWith(u8, line, "---")) return palette.diff_remove;
     if (std.mem.startsWith(u8, line, "@@") or std.mem.startsWith(u8, line, "*** ")) return palette.diff_meta;
     return "";
+}
+
+const DiffRenderState = struct {
+    in_fenced_block: bool = false,
+    fenced_block_is_diff: bool = false,
+};
+
+fn diffRenderColorForLine(state: *DiffRenderState, line: []const u8, palette: Palette) []const u8 {
+    const trimmed_leading = std.mem.trimLeft(u8, line, " \t");
+    if (isCodeFenceLine(trimmed_leading)) {
+        if (state.in_fenced_block) {
+            state.in_fenced_block = false;
+            state.fenced_block_is_diff = false;
+        } else {
+            state.in_fenced_block = true;
+            state.fenced_block_is_diff = isDiffFenceLanguage(codeFenceLanguageToken(trimmed_leading));
+        }
+        return palette.diff_meta;
+    }
+
+    if (state.in_fenced_block) {
+        if (state.fenced_block_is_diff) {
+            const diff_color = diffLineColor(trimmed_leading, palette);
+            if (diff_color.len > 0) return diff_color;
+            return palette.dim;
+        }
+        return palette.accent;
+    }
+
+    return diffLineColor(trimmed_leading, palette);
+}
+
+fn isCodeFenceLine(trimmed_line: []const u8) bool {
+    return std.mem.startsWith(u8, trimmed_line, "```");
+}
+
+fn codeFenceLanguageToken(trimmed_line: []const u8) []const u8 {
+    if (!isCodeFenceLine(trimmed_line)) return "";
+    const after_ticks = std.mem.trimLeft(u8, trimmed_line["```".len..], " \t");
+    if (after_ticks.len == 0) return "";
+
+    var end: usize = 0;
+    while (end < after_ticks.len and !std.ascii.isWhitespace(after_ticks[end])) : (end += 1) {}
+    return after_ticks[0..end];
+}
+
+fn isDiffFenceLanguage(language: []const u8) bool {
+    if (language.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(language, "diff") or
+        std.ascii.eqlIgnoreCase(language, "patch") or
+        std.ascii.eqlIgnoreCase(language, "udiff") or
+        std.ascii.eqlIgnoreCase(language, "gitdiff");
 }
 
 fn writeWrappedPrefixed(
@@ -3726,11 +3779,12 @@ fn writeWrappedPrefixedDiff(
 ) !usize {
     var line_count: usize = 0;
     var first_line = true;
+    var diff_state: DiffRenderState = .{};
 
     var paragraphs = std.mem.splitScalar(u8, text, '\n');
     while (paragraphs.next()) |paragraph| {
         const para = std.mem.trimRight(u8, paragraph, " ");
-        const content_color = diffLineColor(para, palette);
+        const content_color = diffRenderColorForLine(&diff_state, para, palette);
 
         if (para.len == 0) {
             const prefix = if (first_line) first_prefix else next_prefix;
@@ -6077,6 +6131,40 @@ test "diffLineColor classifies add/remove/meta lines" {
     try std.testing.expectEqualStrings(palette.diff_remove, diffLineColor("-removed", palette));
     try std.testing.expectEqualStrings(palette.diff_meta, diffLineColor("@@ hunk", palette));
     try std.testing.expectEqualStrings("", diffLineColor("normal line", palette));
+}
+
+test "isDiffFenceLanguage recognizes diff-like fences" {
+    try std.testing.expect(isDiffFenceLanguage("diff"));
+    try std.testing.expect(isDiffFenceLanguage("PATCH"));
+    try std.testing.expect(isDiffFenceLanguage("gitdiff"));
+    try std.testing.expect(!isDiffFenceLanguage("zig"));
+    try std.testing.expect(!isDiffFenceLanguage(""));
+}
+
+test "codeFenceLanguageToken extracts language from fence line" {
+    try std.testing.expectEqualStrings("diff", codeFenceLanguageToken("```diff"));
+    try std.testing.expectEqualStrings("zig", codeFenceLanguageToken("```  zig"));
+    try std.testing.expectEqualStrings("", codeFenceLanguageToken("```"));
+    try std.testing.expectEqualStrings("", codeFenceLanguageToken("plain text"));
+}
+
+test "diffRenderColorForLine tracks fenced diff and code blocks" {
+    const palette = paletteForTheme(.codex);
+    var state: DiffRenderState = .{};
+
+    try std.testing.expectEqualStrings(palette.diff_meta, diffRenderColorForLine(&state, "```diff", palette));
+    try std.testing.expect(state.in_fenced_block);
+    try std.testing.expect(state.fenced_block_is_diff);
+    try std.testing.expectEqualStrings(palette.diff_add, diffRenderColorForLine(&state, "+added", palette));
+    try std.testing.expectEqualStrings(palette.dim, diffRenderColorForLine(&state, " context", palette));
+    try std.testing.expectEqualStrings(palette.diff_meta, diffRenderColorForLine(&state, "```", palette));
+    try std.testing.expect(!state.in_fenced_block);
+
+    try std.testing.expectEqualStrings(palette.diff_meta, diffRenderColorForLine(&state, "```zig", palette));
+    try std.testing.expect(state.in_fenced_block);
+    try std.testing.expect(!state.fenced_block_is_diff);
+    try std.testing.expectEqualStrings(palette.accent, diffRenderColorForLine(&state, "const x = 1;", palette));
+    _ = diffRenderColorForLine(&state, "```", palette);
 }
 
 test "parseAssistantToolCall detects discovery/edit/exec/web/image tools" {
