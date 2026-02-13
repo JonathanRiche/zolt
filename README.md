@@ -103,20 +103,38 @@ Commands:
 
 ## Core Usage
 
-### Modes and Basics
+### Keybindings
 
+Global / stream-time:
+- `Ctrl-Z` suspend Zolt (resume with shell `fg`)
+- While streaming: `Esc Esc` interrupts generation
+- `PgUp` / `PgDn` scroll chat history (works in both normal and insert modes)
+
+Normal mode:
 - `i` enter insert mode
-- `esc` return to normal mode
-- `enter` send
-- `ctrl-v` paste image from clipboard into input as `@path`
-- `q` quit (normal mode)
+- `a` enter insert mode and move cursor right by one
+- `q` quit
+- `j` scroll down chat history
+- `k` scroll up chat history
+- `h` move input cursor left
+- `l` move input cursor right
+- `x` delete character at cursor
+- `H` / `L` shift conversation strip left/right
+- `/` enter insert mode and start slash command input
 
-### Picker UX
+Insert mode:
+- `Esc` return to normal mode (or close active picker)
+- `Enter` send prompt (or accept active picker selection)
+- `Tab` accept active picker selection
+- `Backspace` delete character before cursor
+- `Ctrl-V` paste image from clipboard into input as `@path`
+- `Ctrl-N` / `Ctrl-P` move picker selection down/up
+- `Up` / `Down` arrows move picker selection up/down
 
+Picker triggers:
 - `/` opens slash command picker
 - `/model` opens model picker
 - `@` opens file picker
-- In pickers: `ctrl-n/ctrl-p` or `up/down` to move, `enter` or `tab` to accept, `esc` to close
 
 ### Slash Commands
 
