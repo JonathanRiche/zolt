@@ -28,8 +28,13 @@ const TerminalMetrics = struct {
 };
 
 const MODEL_PICKER_MAX_ROWS: usize = 8;
+const FILE_PICKER_MAX_ROWS: usize = 8;
 const READ_TOOL_MAX_STEPS: usize = 4;
 const READ_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
+const FILE_INJECT_MAX_FILES: usize = 8;
+const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
+const FILE_INJECT_HEADER = "[file-inject]";
+const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const READ_TOOL_SYSTEM_PROMPT =
     "You can use one local read-only tool.\n" ++
     "When you need to inspect files, reply with ONLY:\n" ++
@@ -81,6 +86,7 @@ pub fn run(
         .notice = try allocator.dupe(u8, "Press i for insert mode. Type /help for commands."),
     };
     defer app.deinit();
+    app.refreshFileIndex() catch {};
     app.ensureCurrentConversationVisibleInStrip();
 
     var raw_mode = try RawMode.enable();
@@ -93,12 +99,48 @@ pub fn run(
         const read_len = try std.posix.read(std.fs.File.stdin().handle, byte_buf[0..]);
         if (read_len == 0) break;
 
-        try app.handleByte(byte_buf[0]);
+        const mapped_key = if (byte_buf[0] == 27) try mapEscapeSequenceToKey() else null;
+        if (mapped_key) |key| {
+            try app.handleByte(key);
+        } else {
+            try app.handleByte(byte_buf[0]);
+        }
 
         if (!app.should_exit) {
             try app.render();
         }
     }
+}
+
+fn mapEscapeSequenceToKey() !?u8 {
+    if (!try stdinHasPendingByte(2)) return null;
+
+    var second: [1]u8 = undefined;
+    const second_read = try std.posix.read(std.fs.File.stdin().handle, second[0..]);
+    if (second_read == 0) return null;
+    if (second[0] != '[' and second[0] != 'O') return null;
+
+    if (!try stdinHasPendingByte(2)) return null;
+
+    var third: [1]u8 = undefined;
+    const third_read = try std.posix.read(std.fs.File.stdin().handle, third[0..]);
+    if (third_read == 0) return null;
+
+    return switch (third[0]) {
+        'A' => 16, // Up arrow -> Ctrl-P semantics
+        'B' => 14, // Down arrow -> Ctrl-N semantics
+        else => null,
+    };
+}
+
+fn stdinHasPendingByte(timeout_ms: i32) !bool {
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = std.fs.File.stdin().handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready_count = try std.posix.poll(&poll_fds, timeout_ms);
+    return ready_count > 0 and (poll_fds[0].revents & std.posix.POLL.IN) == std.posix.POLL.IN;
 }
 
 const App = struct {
@@ -118,6 +160,10 @@ const App = struct {
     model_picker_open: bool = false,
     model_picker_index: usize = 0,
     model_picker_scroll: usize = 0,
+    file_picker_open: bool = false,
+    file_picker_index: usize = 0,
+    file_picker_scroll: usize = 0,
+    file_index: std.ArrayList([]u8) = .empty,
     compact_mode: bool = true,
     theme: Theme = .codex,
 
@@ -125,6 +171,8 @@ const App = struct {
 
     pub fn deinit(self: *App) void {
         self.input_buffer.deinit(self.allocator);
+        for (self.file_index.items) |path| self.allocator.free(path);
+        self.file_index.deinit(self.allocator);
         self.allocator.free(self.notice);
     }
 
@@ -145,12 +193,12 @@ const App = struct {
             'q' => self.should_exit = true,
             'i' => {
                 self.mode = .insert;
-                self.syncModelPickerFromInput();
+                self.syncPickersFromInput();
             },
             'a' => {
                 if (self.input_cursor < self.input_buffer.items.len) self.input_cursor += 1;
                 self.mode = .insert;
-                self.syncModelPickerFromInput();
+                self.syncPickersFromInput();
             },
             'h' => {
                 if (self.input_cursor > 0) self.input_cursor -= 1;
@@ -179,7 +227,7 @@ const App = struct {
                     try self.input_buffer.append(self.allocator, '/');
                     self.input_cursor = 1;
                 }
-                self.syncModelPickerFromInput();
+                self.syncPickersFromInput();
             },
             27 => self.mode = .normal,
             else => {},
@@ -193,6 +241,10 @@ const App = struct {
                     self.model_picker_open = false;
                     return;
                 }
+                if (self.file_picker_open) {
+                    self.file_picker_open = false;
+                    return;
+                }
                 self.mode = .normal;
             },
             127 => {
@@ -200,30 +252,48 @@ const App = struct {
                     self.input_cursor -= 1;
                     _ = self.input_buffer.orderedRemove(self.input_cursor);
                 }
-                self.syncModelPickerFromInput();
+                self.syncPickersFromInput();
             },
             '\r', '\n' => {
                 if (self.model_picker_open) {
                     try self.acceptModelPickerSelection();
                     return;
                 }
+                if (self.file_picker_open) {
+                    try self.acceptFilePickerSelection();
+                    return;
+                }
                 try self.submitInput();
+            },
+            '\t' => {
+                if (self.model_picker_open) {
+                    try self.acceptModelPickerSelection();
+                    return;
+                }
+                if (self.file_picker_open) {
+                    try self.acceptFilePickerSelection();
+                    return;
+                }
             },
             14 => {
                 if (self.model_picker_open) {
                     self.moveModelPickerSelection(1);
+                } else if (self.file_picker_open) {
+                    self.moveFilePickerSelection(1);
                 }
             },
             16 => {
                 if (self.model_picker_open) {
                     self.moveModelPickerSelection(-1);
+                } else if (self.file_picker_open) {
+                    self.moveFilePickerSelection(-1);
                 }
             },
             else => {
                 if (key_byte >= 32 and key_byte <= 126) {
                     try self.input_buffer.insert(self.allocator, self.input_cursor, key_byte);
                     self.input_cursor += 1;
-                    self.syncModelPickerFromInput();
+                    self.syncPickersFromInput();
                 }
             },
         }
@@ -236,6 +306,8 @@ const App = struct {
 
         self.input_buffer.clearRetainingCapacity();
         self.input_cursor = 0;
+        self.model_picker_open = false;
+        self.file_picker_open = false;
 
         if (line.len == 0) return;
 
@@ -249,7 +321,13 @@ const App = struct {
     }
 
     fn handlePrompt(self: *App, prompt: []const u8) !void {
+        const inject_result = try buildFileInjectionPayload(self.allocator, prompt);
+        defer if (inject_result.payload) |payload| self.allocator.free(payload);
+
         try self.app_state.appendMessage(self.allocator, .user, prompt);
+        if (inject_result.payload) |payload| {
+            try self.app_state.appendMessage(self.allocator, .system, payload);
+        }
         try self.app_state.appendMessage(self.allocator, .assistant, "");
 
         const provider_id = self.app_state.selected_provider_id;
@@ -272,6 +350,17 @@ const App = struct {
 
         self.is_streaming = true;
         defer self.is_streaming = false;
+
+        if (inject_result.referenced_count > 0) {
+            try self.setNoticeFmt(
+                "Injected {d}/{d} @file refs (skipped:{d})",
+                .{
+                    inject_result.included_count,
+                    inject_result.referenced_count,
+                    inject_result.skipped_count,
+                },
+            );
+        }
 
         var step: usize = 0;
         while (step < READ_TOOL_MAX_STEPS) : (step += 1) {
@@ -501,7 +590,7 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  keys: H/L conv tabs, /model picker: Ctrl-N/P + Enter, assistant tool: <READ>rg --files</READ>");
+            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  input: use @path, pickers: Ctrl-N/P + Enter, assistant tool: <READ>rg --files</READ>");
             return;
         }
 
@@ -583,6 +672,21 @@ const App = struct {
             }
 
             try self.setNoticeFmt("models cache has {d} providers. Use /model to inspect current provider.", .{self.catalog.providers.items.len});
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "files")) {
+            const action = parts.next();
+            if (action != null and std.mem.eql(u8, action.?, "refresh")) {
+                self.refreshFileIndex() catch |err| {
+                    try self.setNoticeFmt("file index refresh failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                try self.setNoticeFmt("file index refreshed ({d} files)", .{self.file_index.items.len});
+                return;
+            }
+
+            try self.setNoticeFmt("file index has {d} files. Use /files refresh after file changes.", .{self.file_index.items.len});
             return;
         }
 
@@ -746,8 +850,8 @@ const App = struct {
         const lines = metrics.lines;
         const content_width = if (width > 4) width - 4 else 56;
         const top_lines: usize = if (self.compact_mode) 3 else 4;
-        const model_picker_lines = self.modelPickerLineCount(lines);
-        const bottom_lines: usize = 3 + model_picker_lines;
+        const picker_lines = self.pickerLineCount(lines);
+        const bottom_lines: usize = 3 + picker_lines;
         const viewport_height = @max(@as(usize, 4), lines - top_lines - bottom_lines);
 
         var body_writer: std.Io.Writer.Allocating = .init(self.allocator);
@@ -839,7 +943,9 @@ const App = struct {
         try writeRule(&screen_writer.writer, width, palette, self.compact_mode);
 
         const key_hint = if (self.model_picker_open)
-            "ctrl-n/p pick, enter select, esc close"
+            "ctrl-n/p or up/down, enter/tab select, esc close"
+        else if (self.file_picker_open)
+            "ctrl-n/p or up/down, enter/tab insert, esc close"
         else if (self.mode == .insert)
             "enter esc /"
         else
@@ -865,6 +971,8 @@ const App = struct {
 
         if (self.model_picker_open) {
             try self.renderModelPicker(&screen_writer.writer, width, lines, palette);
+        } else if (self.file_picker_open) {
+            try self.renderFilePicker(&screen_writer.writer, width, lines, palette);
         }
 
         const before_cursor = self.input_buffer.items[0..self.input_cursor];
@@ -989,6 +1097,17 @@ const App = struct {
         return null;
     }
 
+    fn syncPickersFromInput(self: *App) void {
+        self.syncModelPickerFromInput();
+        if (self.model_picker_open) {
+            self.file_picker_open = false;
+            self.file_picker_index = 0;
+            self.file_picker_scroll = 0;
+            return;
+        }
+        self.syncFilePickerFromInput();
+    }
+
     fn syncModelPickerFromInput(self: *App) void {
         const query = parseModelPickerQuery(self.input_buffer.items);
         if (query == null) {
@@ -1011,6 +1130,29 @@ const App = struct {
             return;
         }
         if (self.model_picker_index >= total) self.model_picker_index = total - 1;
+    }
+
+    fn syncFilePickerFromInput(self: *App) void {
+        const query = currentAtTokenQuery(self.input_buffer.items, self.input_cursor) orelse {
+            self.file_picker_open = false;
+            self.file_picker_index = 0;
+            self.file_picker_scroll = 0;
+            return;
+        };
+
+        if (!self.file_picker_open) {
+            self.file_picker_index = 0;
+            self.file_picker_scroll = 0;
+        }
+        self.file_picker_open = true;
+
+        const total = self.filePickerMatchCount(query);
+        if (total == 0) {
+            self.file_picker_index = 0;
+            self.file_picker_scroll = 0;
+            return;
+        }
+        if (self.file_picker_index >= total) self.file_picker_index = total - 1;
     }
 
     fn modelPickerMatchCount(self: *App, query: []const u8) usize {
@@ -1110,9 +1252,30 @@ const App = struct {
         return 1 + shown_rows;
     }
 
+    fn filePickerLineCount(self: *App, terminal_lines: usize) usize {
+        if (!self.file_picker_open) return 0;
+
+        const query = currentAtTokenQuery(self.input_buffer.items, self.input_cursor) orelse return 0;
+        const total = self.filePickerMatchCount(query);
+        const max_rows = self.filePickerMaxRows(terminal_lines);
+        const shown_rows = if (total == 0) @as(usize, 1) else @min(total, max_rows);
+        return 1 + shown_rows;
+    }
+
+    fn pickerLineCount(self: *App, terminal_lines: usize) usize {
+        if (self.model_picker_open) return self.modelPickerLineCount(terminal_lines);
+        if (self.file_picker_open) return self.filePickerLineCount(terminal_lines);
+        return 0;
+    }
+
     fn modelPickerMaxRows(_: *App, terminal_lines: usize) usize {
         const budget = @max(@as(usize, 3), terminal_lines / 5);
         return @min(MODEL_PICKER_MAX_ROWS, budget);
+    }
+
+    fn filePickerMaxRows(_: *App, terminal_lines: usize) usize {
+        const budget = @max(@as(usize, 3), terminal_lines / 5);
+        return @min(FILE_PICKER_MAX_ROWS, budget);
     }
 
     fn renderModelPicker(self: *App, writer: *std.Io.Writer, width: usize, terminal_lines: usize, palette: Palette) !void {
@@ -1169,6 +1332,146 @@ const App = struct {
             const row_line = try truncateLineAlloc(self.allocator, row_text, width);
             defer self.allocator.free(row_line);
             try writer.print("{s}{s}{s}\n", .{ row_color, row_line, palette.reset });
+        }
+    }
+
+    fn filePickerMatchCount(self: *App, query: []const u8) usize {
+        var count: usize = 0;
+        for (self.file_index.items) |path| {
+            if (filePathMatchesQuery(path, query)) count += 1;
+        }
+        return count;
+    }
+
+    fn filePickerNthMatch(self: *App, query: []const u8, target_index: usize) ?[]const u8 {
+        var seen: usize = 0;
+        for (self.file_index.items) |path| {
+            if (!filePathMatchesQuery(path, query)) continue;
+            if (seen == target_index) return path;
+            seen += 1;
+        }
+        return null;
+    }
+
+    fn moveFilePickerSelection(self: *App, delta: i32) void {
+        const query = currentAtTokenQuery(self.input_buffer.items, self.input_cursor) orelse return;
+        const total = self.filePickerMatchCount(query);
+        if (total == 0) {
+            self.file_picker_index = 0;
+            self.file_picker_scroll = 0;
+            return;
+        }
+
+        if (delta < 0) {
+            if (self.file_picker_index > 0) self.file_picker_index -= 1;
+        } else if (delta > 0) {
+            if (self.file_picker_index + 1 < total) self.file_picker_index += 1;
+        }
+    }
+
+    fn acceptFilePickerSelection(self: *App) !void {
+        const query = currentAtTokenQuery(self.input_buffer.items, self.input_cursor) orelse return;
+        const total = self.filePickerMatchCount(query);
+        if (total == 0) {
+            try self.setNotice("No file matches current @query");
+            return;
+        }
+
+        if (self.file_picker_index >= total) self.file_picker_index = total - 1;
+        const selected = self.filePickerNthMatch(query, self.file_picker_index) orelse return;
+
+        try self.insertSelectedFilePathAtCursor(selected);
+        self.file_picker_open = false;
+        self.file_picker_index = 0;
+        self.file_picker_scroll = 0;
+        try self.setNoticeFmt("Inserted @{s}", .{selected});
+    }
+
+    fn insertSelectedFilePathAtCursor(self: *App, path: []const u8) !void {
+        const rewritten = try rewriteInputWithSelectedAtPath(self.allocator, self.input_buffer.items, self.input_cursor, path);
+        defer self.allocator.free(rewritten.text);
+
+        self.input_buffer.clearRetainingCapacity();
+        try self.input_buffer.appendSlice(self.allocator, rewritten.text);
+        self.input_cursor = rewritten.cursor;
+    }
+
+    fn renderFilePicker(self: *App, writer: *std.Io.Writer, width: usize, terminal_lines: usize, palette: Palette) !void {
+        const query = currentAtTokenQuery(self.input_buffer.items, self.input_cursor) orelse return;
+        const total = self.filePickerMatchCount(query);
+        const max_rows = self.filePickerMaxRows(terminal_lines);
+        const shown_rows = if (total == 0) @as(usize, 1) else @min(total, max_rows);
+
+        if (total > 0) {
+            if (self.file_picker_index >= total) self.file_picker_index = total - 1;
+            if (self.file_picker_index < self.file_picker_scroll) {
+                self.file_picker_scroll = self.file_picker_index;
+            } else if (self.file_picker_index >= self.file_picker_scroll + shown_rows) {
+                self.file_picker_scroll = self.file_picker_index - shown_rows + 1;
+            }
+            const max_scroll = total - shown_rows;
+            if (self.file_picker_scroll > max_scroll) self.file_picker_scroll = max_scroll;
+        } else {
+            self.file_picker_index = 0;
+            self.file_picker_scroll = 0;
+        }
+
+        const header_text = try std.fmt.allocPrint(
+            self.allocator,
+            "file picker ({d}) query:{s}",
+            .{ total, if (query.len == 0) "*" else query },
+        );
+        defer self.allocator.free(header_text);
+        const header_line = try truncateLineAlloc(self.allocator, header_text, width);
+        defer self.allocator.free(header_line);
+        try writer.print("{s}{s}{s}\n", .{ palette.accent, header_line, palette.reset });
+
+        if (total == 0) {
+            const empty_line = try truncateLineAlloc(self.allocator, "  no matches", width);
+            defer self.allocator.free(empty_line);
+            try writer.print("{s}{s}{s}\n", .{ palette.dim, empty_line, palette.reset });
+            return;
+        }
+
+        const end_index = @min(self.file_picker_scroll + shown_rows, total);
+        var index = self.file_picker_scroll;
+        while (index < end_index) : (index += 1) {
+            const selected_path = self.filePickerNthMatch(query, index) orelse continue;
+            const selected = index == self.file_picker_index;
+            const marker = if (selected) ">" else " ";
+            const row_color = if (selected) palette.accent else palette.dim;
+
+            const row_text = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ marker, selected_path });
+            defer self.allocator.free(row_text);
+            const row_line = try truncateLineAlloc(self.allocator, row_text, width);
+            defer self.allocator.free(row_line);
+            try writer.print("{s}{s}{s}\n", .{ row_color, row_line, palette.reset });
+        }
+    }
+
+    fn refreshFileIndex(self: *App) !void {
+        const result = try std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &.{ "rg", "--files" },
+            .cwd = ".",
+            .max_output_bytes = FILE_INDEX_MAX_OUTPUT_BYTES,
+        });
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        switch (result.term) {
+            .Exited => |code| if (code != 0) return error.FileIndexRefreshFailed,
+            else => return error.FileIndexRefreshFailed,
+        }
+
+        for (self.file_index.items) |path| self.allocator.free(path);
+        self.file_index.clearRetainingCapacity();
+
+        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trimRight(u8, raw_line, "\r");
+            if (line.len == 0) continue;
+            try self.file_index.append(self.allocator, try self.allocator.dupe(u8, line));
         }
     }
 };
@@ -1240,9 +1543,10 @@ fn appendMessageBlock(writer: *std.Io.Writer, message: anytype, width: usize, pa
         .system => .{ "○ ", "  ", palette.system },
     };
 
+    const rendered_content = messageDisplayContent(message);
     _ = try writeWrappedPrefixed(
         writer,
-        if (message.content.len == 0) "..." else message.content,
+        rendered_content,
         width,
         marker,
         continuation,
@@ -1250,6 +1554,17 @@ fn appendMessageBlock(writer: *std.Io.Writer, message: anytype, width: usize, pa
         palette.reset,
     );
     try writer.writeByte('\n');
+}
+
+fn messageDisplayContent(message: anytype) []const u8 {
+    if (message.content.len == 0) return "...";
+
+    if (message.role == .system and std.mem.startsWith(u8, message.content, FILE_INJECT_HEADER)) {
+        const line_end = std.mem.indexOfScalar(u8, message.content, '\n') orelse message.content.len;
+        return message.content[0..line_end];
+    }
+
+    return message.content;
 }
 
 fn writeWrappedPrefixed(
@@ -1387,6 +1702,265 @@ fn parseReadToolCommand(text: []const u8) ?[]const u8 {
     return null;
 }
 
+const AtTokenRange = struct {
+    start: usize,
+    end: usize,
+    query: []const u8,
+};
+
+const RewriteResult = struct {
+    text: []u8,
+    cursor: usize,
+};
+
+fn currentAtTokenRange(input: []const u8, cursor: usize) ?AtTokenRange {
+    const safe_cursor = @min(cursor, input.len);
+    const before = input[0..safe_cursor];
+    const after = input[safe_cursor..];
+
+    const start = blk: {
+        var i = before.len;
+        while (i > 0) : (i -= 1) {
+            if (std.ascii.isWhitespace(before[i - 1])) break;
+        }
+        break :blk i;
+    };
+
+    const end = blk: {
+        var i: usize = 0;
+        while (i < after.len and !std.ascii.isWhitespace(after[i])) : (i += 1) {}
+        break :blk safe_cursor + i;
+    };
+
+    if (start >= end) return null;
+    const token = input[start..end];
+    if (token[0] != '@') return null;
+
+    var query = token[1..];
+    if (query.len > 0 and (query[0] == '"' or query[0] == '\'')) {
+        query = query[1..];
+    }
+
+    return .{
+        .start = start,
+        .end = end,
+        .query = query,
+    };
+}
+
+fn currentAtTokenQuery(input: []const u8, cursor: usize) ?[]const u8 {
+    const token = currentAtTokenRange(input, cursor) orelse return null;
+    return token.query;
+}
+
+fn filePathMatchesQuery(path: []const u8, query: []const u8) bool {
+    if (query.len == 0) return true;
+    return containsAsciiIgnoreCase(path, query);
+}
+
+fn rewriteInputWithSelectedAtPath(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    cursor: usize,
+    path: []const u8,
+) !RewriteResult {
+    const token = currentAtTokenRange(input, cursor) orelse return error.MissingAtToken;
+
+    const quoted = blk: {
+        if (!containsWhitespace(path)) break :blk false;
+        if (std.mem.indexOfScalar(u8, path, '"') == null) break :blk true;
+        break :blk false;
+    };
+    const inserted_token = if (quoted)
+        try std.fmt.allocPrint(allocator, "@\"{s}\"", .{path})
+    else
+        try std.fmt.allocPrint(allocator, "@{s}", .{path});
+    defer allocator.free(inserted_token);
+
+    const suffix = std.mem.trimLeft(u8, input[token.end..], " \t");
+    const new_len = token.start + inserted_token.len + 1 + suffix.len;
+    var out = try allocator.alloc(u8, new_len);
+
+    @memcpy(out[0..token.start], input[0..token.start]);
+    @memcpy(out[token.start .. token.start + inserted_token.len], inserted_token);
+    out[token.start + inserted_token.len] = ' ';
+    @memcpy(out[token.start + inserted_token.len + 1 ..], suffix);
+
+    return .{
+        .text = out,
+        .cursor = token.start + inserted_token.len + 1,
+    };
+}
+
+fn containsWhitespace(text: []const u8) bool {
+    for (text) |ch| {
+        if (std.ascii.isWhitespace(ch)) return true;
+    }
+    return false;
+}
+
+const FileInjectResult = struct {
+    payload: ?[]u8 = null,
+    referenced_count: usize = 0,
+    included_count: usize = 0,
+    skipped_count: usize = 0,
+};
+
+fn buildFileInjectionPayload(allocator: std.mem.Allocator, prompt: []const u8) !FileInjectResult {
+    var references = try collectAtFileReferences(allocator, prompt);
+    defer {
+        for (references.items) |entry| allocator.free(entry);
+        references.deinit(allocator);
+    }
+
+    if (references.items.len == 0) return .{};
+
+    var body_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer body_writer.deinit();
+
+    var included_count: usize = 0;
+    var skipped_count: usize = 0;
+
+    for (references.items, 0..) |reference, index| {
+        if (included_count >= FILE_INJECT_MAX_FILES) {
+            skipped_count += references.items.len - index;
+            break;
+        }
+
+        const path = trimMatchingOuterQuotes(reference);
+        if (path.len == 0) {
+            skipped_count += 1;
+            continue;
+        }
+
+        const file_content = readFileForInjection(allocator, path) catch {
+            skipped_count += 1;
+            continue;
+        };
+        defer allocator.free(file_content);
+
+        if (looksBinary(file_content)) {
+            skipped_count += 1;
+            continue;
+        }
+
+        included_count += 1;
+        try body_writer.writer.print("<file path=\"{s}\">\n", .{path});
+        try body_writer.writer.writeAll(file_content);
+        if (file_content.len == 0 or file_content[file_content.len - 1] != '\n') {
+            try body_writer.writer.writeByte('\n');
+        }
+        try body_writer.writer.writeAll("</file>\n");
+    }
+
+    if (included_count == 0) {
+        return .{
+            .referenced_count = references.items.len,
+            .included_count = 0,
+            .skipped_count = skipped_count,
+        };
+    }
+
+    const body = try body_writer.toOwnedSlice();
+    defer allocator.free(body);
+
+    var payload_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer payload_writer.deinit();
+
+    try payload_writer.writer.print(
+        "{s} included:{d} referenced:{d} skipped:{d}\n",
+        .{ FILE_INJECT_HEADER, included_count, references.items.len, skipped_count },
+    );
+    try payload_writer.writer.writeAll(
+        "The user referenced these files with @path. Treat this as project context.\n",
+    );
+    try payload_writer.writer.writeAll(body);
+
+    return .{
+        .payload = try payload_writer.toOwnedSlice(),
+        .referenced_count = references.items.len,
+        .included_count = included_count,
+        .skipped_count = skipped_count,
+    };
+}
+
+fn collectAtFileReferences(allocator: std.mem.Allocator, text: []const u8) !std.ArrayList([]u8) {
+    var refs: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (refs.items) |entry| allocator.free(entry);
+        refs.deinit(allocator);
+    }
+
+    var dedupe: std.StringHashMapUnmanaged(void) = .empty;
+    defer dedupe.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < text.len) : (index += 1) {
+        if (text[index] != '@') continue;
+        if (index > 0 and !std.ascii.isWhitespace(text[index - 1])) continue;
+
+        var normalized: []const u8 = undefined;
+        if (index + 1 < text.len and (text[index + 1] == '"' or text[index + 1] == '\'')) {
+            const quote = text[index + 1];
+            var end = index + 2;
+            while (end < text.len and text[end] != quote) : (end += 1) {}
+            if (end >= text.len) continue;
+
+            normalized = text[index + 2 .. end];
+            index = end;
+        } else {
+            var end = index + 1;
+            while (end < text.len and !std.ascii.isWhitespace(text[end])) : (end += 1) {}
+            if (end <= index + 1) continue;
+
+            const token = text[index + 1 .. end];
+            normalized = trimMatchingOuterQuotes(token);
+            index = end - 1;
+        }
+
+        if (normalized.len == 0) continue;
+
+        if (dedupe.contains(normalized)) continue;
+        try dedupe.put(allocator, normalized, {});
+        try refs.append(allocator, try allocator.dupe(u8, normalized));
+    }
+
+    return refs;
+}
+
+fn trimMatchingOuterQuotes(text: []const u8) []const u8 {
+    if (text.len >= 2) {
+        if ((text[0] == '"' and text[text.len - 1] == '"') or
+            (text[0] == '\'' and text[text.len - 1] == '\''))
+        {
+            return text[1 .. text.len - 1];
+        }
+    }
+    return text;
+}
+
+fn readFileForInjection(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        var file = try std.fs.openFileAbsolute(path, .{});
+        defer file.close();
+        return file.readToEndAlloc(allocator, FILE_INJECT_MAX_FILE_BYTES);
+    }
+    return std.fs.cwd().readFileAlloc(allocator, path, FILE_INJECT_MAX_FILE_BYTES);
+}
+
+fn looksBinary(content: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, content, 0) != null) return true;
+    if (content.len == 0) return false;
+
+    const sample_len = @min(content.len, 1024);
+    var control_count: usize = 0;
+    for (content[0..sample_len]) |byte| {
+        if (byte == '\n' or byte == '\r' or byte == '\t') continue;
+        if (byte < 0x20 or byte == 0x7f) control_count += 1;
+    }
+    return control_count * 10 > sample_len;
+}
+
 fn isAllowedReadCommand(command: []const u8) bool {
     if (command.len == 0) return false;
     if (std.mem.indexOfScalar(u8, command, '/')) |_| return false;
@@ -1468,6 +2042,94 @@ test "isAllowedReadCommand allowlist and slash rejection" {
     try std.testing.expect(isAllowedReadCommand("ls"));
     try std.testing.expect(!isAllowedReadCommand("bash"));
     try std.testing.expect(!isAllowedReadCommand("/usr/bin/rg"));
+}
+
+test "collectAtFileReferences parses unique @path tokens" {
+    const allocator = std.testing.allocator;
+    const text = "review @src/main.zig and @src/tui.zig then @src/main.zig again";
+
+    var refs = try collectAtFileReferences(allocator, text);
+    defer {
+        for (refs.items) |entry| allocator.free(entry);
+        refs.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), refs.items.len);
+    try std.testing.expectEqualStrings("src/main.zig", refs.items[0]);
+    try std.testing.expectEqualStrings("src/tui.zig", refs.items[1]);
+}
+
+test "collectAtFileReferences parses quoted @path with spaces" {
+    const allocator = std.testing.allocator;
+    const text = "review @\"docs/My File.md\" then @'src/other file.zig'";
+
+    var refs = try collectAtFileReferences(allocator, text);
+    defer {
+        for (refs.items) |entry| allocator.free(entry);
+        refs.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), refs.items.len);
+    try std.testing.expectEqualStrings("docs/My File.md", refs.items[0]);
+    try std.testing.expectEqualStrings("src/other file.zig", refs.items[1]);
+}
+
+test "currentAtTokenRange detects @token under cursor" {
+    const text = "review @src/main.zig now";
+    const token = currentAtTokenRange(text, 11) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("src/main.zig", token.query);
+    try std.testing.expectEqual(@as(usize, 7), token.start);
+    try std.testing.expectEqual(@as(usize, 20), token.end);
+}
+
+test "rewriteInputWithSelectedAtPath inserts selected file token" {
+    const allocator = std.testing.allocator;
+    const rewritten = try rewriteInputWithSelectedAtPath(allocator, "review @sr now", 9, "src/main.zig");
+    defer allocator.free(rewritten.text);
+
+    try std.testing.expectEqualStrings("review @src/main.zig now", rewritten.text);
+    try std.testing.expectEqual(@as(usize, 21), rewritten.cursor);
+}
+
+test "rewriteInputWithSelectedAtPath quotes path with spaces" {
+    const allocator = std.testing.allocator;
+    const rewritten = try rewriteInputWithSelectedAtPath(allocator, "check @do", 8, "docs/My File.md");
+    defer allocator.free(rewritten.text);
+
+    try std.testing.expectEqualStrings("check @\"docs/My File.md\" ", rewritten.text);
+}
+
+test "buildFileInjectionPayload includes readable files and reports counts" {
+    const allocator = std.testing.allocator;
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const abs_dir = try temp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs_dir);
+
+    const file_path = try std.fs.path.join(allocator, &.{ abs_dir, "inject.txt" });
+    defer allocator.free(file_path);
+
+    var file = try std.fs.createFileAbsolute(file_path, .{ .truncate = true });
+    defer file.close();
+    var write_buf: [256]u8 = undefined;
+    var file_writer = file.writer(&write_buf);
+    defer file_writer.interface.flush() catch {};
+    try file_writer.interface.writeAll("hello inject\n");
+    try file_writer.interface.flush();
+
+    const prompt = try std.fmt.allocPrint(allocator, "check @{s} and @missing.txt", .{file_path});
+    defer allocator.free(prompt);
+
+    const result = try buildFileInjectionPayload(allocator, prompt);
+    defer if (result.payload) |payload| allocator.free(payload);
+
+    try std.testing.expectEqual(@as(usize, 2), result.referenced_count);
+    try std.testing.expectEqual(@as(usize, 1), result.included_count);
+    try std.testing.expectEqual(@as(usize, 1), result.skipped_count);
+    try std.testing.expect(result.payload != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.payload.?, "<file path=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.payload.?, "hello inject") != null);
 }
 
 test "formatTokenCount trims trailing .0 for compact context display" {
