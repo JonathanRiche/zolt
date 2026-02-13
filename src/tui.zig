@@ -111,6 +111,12 @@ const WebSearchResultItem = struct {
     }
 };
 
+const ApplyPatchPreview = struct {
+    text: []u8,
+    included_lines: usize,
+    omitted_lines: usize,
+};
+
 const SessionDrainResult = struct {
     stdout: []u8,
     stderr: []u8,
@@ -123,6 +129,7 @@ const COMMAND_PICKER_MAX_ROWS: usize = 8;
 const TOOL_MAX_STEPS: usize = 4;
 const READ_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
 const APPLY_PATCH_TOOL_MAX_PATCH_BYTES: usize = 256 * 1024;
+const APPLY_PATCH_PREVIEW_MAX_LINES: usize = 120;
 const COMMAND_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
 const COMMAND_TOOL_DEFAULT_YIELD_MS: u32 = 700;
 const COMMAND_TOOL_MAX_YIELD_MS: u32 = 5000;
@@ -1288,6 +1295,19 @@ const App = struct {
                 stats.moved,
             },
         );
+
+        const preview = try buildApplyPatchPreview(self.allocator, trimmed_patch, APPLY_PATCH_PREVIEW_MAX_LINES);
+        defer self.allocator.free(preview.text);
+        if (preview.included_lines > 0) {
+            try output.writer.writeAll("diff_preview:\n");
+            try output.writer.writeAll(preview.text);
+        }
+        if (preview.omitted_lines > 0) {
+            try output.writer.print(
+                "note: preview truncated ({d} patch lines omitted)\n",
+                .{preview.omitted_lines},
+            );
+        }
 
         return output.toOwnedSlice();
     }
@@ -2929,6 +2949,9 @@ const Palette = struct {
     user: []const u8,
     assistant: []const u8,
     system: []const u8,
+    diff_add: []const u8,
+    diff_remove: []const u8,
+    diff_meta: []const u8,
 };
 
 const CursorPlacement = struct {
@@ -2974,6 +2997,9 @@ fn paletteForTheme(theme: Theme) Palette {
             .user = "\x1b[38;5;215m",
             .assistant = "\x1b[38;5;114m",
             .system = "\x1b[38;5;146m",
+            .diff_add = "\x1b[38;5;114m",
+            .diff_remove = "\x1b[38;5;203m",
+            .diff_meta = "\x1b[38;5;180m",
         },
         .plain => .{
             .reset = "",
@@ -2983,6 +3009,9 @@ fn paletteForTheme(theme: Theme) Palette {
             .user = "",
             .assistant = "",
             .system = "",
+            .diff_add = "",
+            .diff_remove = "",
+            .diff_meta = "",
         },
         .forest => .{
             .reset = "\x1b[0m",
@@ -2992,6 +3021,9 @@ fn paletteForTheme(theme: Theme) Palette {
             .user = "\x1b[38;5;151m",
             .assistant = "\x1b[38;5;108m",
             .system = "\x1b[38;5;145m",
+            .diff_add = "\x1b[38;5;114m",
+            .diff_remove = "\x1b[38;5;203m",
+            .diff_meta = "\x1b[38;5;151m",
         },
     };
 }
@@ -3029,15 +3061,28 @@ fn appendMessageBlock(
     };
 
     const rendered_content = content_override orelse messageDisplayContent(message);
-    _ = try writeWrappedPrefixed(
-        writer,
-        rendered_content,
-        width,
-        marker,
-        continuation,
-        color,
-        palette.reset,
-    );
+    if (shouldRenderDiffMode(message, rendered_content)) {
+        _ = try writeWrappedPrefixedDiff(
+            writer,
+            rendered_content,
+            width,
+            marker,
+            continuation,
+            color,
+            palette,
+            palette.reset,
+        );
+    } else {
+        _ = try writeWrappedPrefixed(
+            writer,
+            rendered_content,
+            width,
+            marker,
+            continuation,
+            color,
+            palette.reset,
+        );
+    }
     try writer.writeByte('\n');
 }
 
@@ -3095,6 +3140,25 @@ fn buildWorkingPlaceholder(
     );
 }
 
+fn shouldRenderDiffMode(message: anytype, text: []const u8) bool {
+    if (text.len == 0) return false;
+    if (std.mem.indexOf(u8, text, "*** Begin Patch") != null) return true;
+
+    if (message.role == .system and std.mem.startsWith(u8, text, "[apply-patch-result]")) {
+        return std.mem.indexOf(u8, text, "diff_preview:") != null;
+    }
+
+    return false;
+}
+
+fn diffLineColor(line: []const u8, palette: Palette) []const u8 {
+    if (line.len == 0) return "";
+    if (std.mem.startsWith(u8, line, "+") and !std.mem.startsWith(u8, line, "+++")) return palette.diff_add;
+    if (std.mem.startsWith(u8, line, "-") and !std.mem.startsWith(u8, line, "---")) return palette.diff_remove;
+    if (std.mem.startsWith(u8, line, "@@") or std.mem.startsWith(u8, line, "*** ")) return palette.diff_meta;
+    return "";
+}
+
 fn writeWrappedPrefixed(
     writer: *std.Io.Writer,
     text: []const u8,
@@ -3135,6 +3199,63 @@ fn writeWrappedPrefixed(
 
             try writer.print("{s}{s}{s}", .{ prefix_color, prefix, reset });
             try writer.writeAll(std.mem.trimRight(u8, para[start..end], " "));
+            try writer.writeByte('\n');
+
+            line_count += 1;
+            first_line = false;
+            start = end;
+            while (start < para.len and para[start] == ' ') : (start += 1) {}
+        }
+    }
+
+    return line_count;
+}
+
+fn writeWrappedPrefixedDiff(
+    writer: *std.Io.Writer,
+    text: []const u8,
+    width: usize,
+    first_prefix: []const u8,
+    next_prefix: []const u8,
+    prefix_color: []const u8,
+    palette: Palette,
+    reset: []const u8,
+) !usize {
+    var line_count: usize = 0;
+    var first_line = true;
+
+    var paragraphs = std.mem.splitScalar(u8, text, '\n');
+    while (paragraphs.next()) |paragraph| {
+        const para = std.mem.trimRight(u8, paragraph, " ");
+        const content_color = diffLineColor(para, palette);
+
+        if (para.len == 0) {
+            const prefix = if (first_line) first_prefix else next_prefix;
+            try writer.print("{s}{s}{s}\n", .{ prefix_color, prefix, reset });
+            first_line = false;
+            line_count += 1;
+            continue;
+        }
+
+        var start: usize = 0;
+        while (start < para.len) {
+            const prefix = if (first_line) first_prefix else next_prefix;
+            const prefix_len = prefix.len;
+            const wrap_width = @max(@as(usize, 1), width -| prefix_len);
+            const max_end = @min(start + wrap_width, para.len);
+
+            var end = max_end;
+            if (max_end < para.len) {
+                var cursor = max_end;
+                while (cursor > start and para[cursor - 1] != ' ') : (cursor -= 1) {}
+                if (cursor > start) end = cursor - 1;
+            }
+            if (end <= start) end = max_end;
+
+            try writer.print("{s}{s}{s}", .{ prefix_color, prefix, reset });
+            if (content_color.len > 0) try writer.writeAll(content_color);
+            try writer.writeAll(std.mem.trimRight(u8, para[start..end], " "));
+            if (content_color.len > 0) try writer.writeAll(reset);
             try writer.writeByte('\n');
 
             line_count += 1;
@@ -4036,6 +4157,50 @@ fn isValidApplyPatchPayload(patch_text: []const u8) bool {
     return std.mem.indexOf(u8, patch_text, "*** End Patch") != null;
 }
 
+fn buildApplyPatchPreview(
+    allocator: std.mem.Allocator,
+    patch_text: []const u8,
+    max_lines: usize,
+) !ApplyPatchPreview {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    var included_lines: usize = 0;
+    var matched_lines: usize = 0;
+    var lines = std.mem.splitScalar(u8, patch_text, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trimRight(u8, line_raw, "\r");
+        if (!isDiffPreviewLine(line)) continue;
+
+        matched_lines += 1;
+        if (included_lines >= max_lines) continue;
+
+        included_lines += 1;
+        try writer.writer.writeAll(line);
+        try writer.writer.writeByte('\n');
+    }
+
+    return .{
+        .text = try writer.toOwnedSlice(),
+        .included_lines = included_lines,
+        .omitted_lines = matched_lines - included_lines,
+    };
+}
+
+fn isDiffPreviewLine(line: []const u8) bool {
+    if (line.len == 0) return false;
+    if (std.mem.startsWith(u8, line, "*** Begin Patch")) return true;
+    if (std.mem.startsWith(u8, line, "*** End Patch")) return true;
+    if (std.mem.startsWith(u8, line, "*** Add File:")) return true;
+    if (std.mem.startsWith(u8, line, "*** Update File:")) return true;
+    if (std.mem.startsWith(u8, line, "*** Delete File:")) return true;
+    if (std.mem.startsWith(u8, line, "*** Move to:")) return true;
+    if (std.mem.startsWith(u8, line, "@@")) return true;
+    if (std.mem.startsWith(u8, line, "+")) return true;
+    if (std.mem.startsWith(u8, line, "-")) return true;
+    return false;
+}
+
 const AtTokenRange = struct {
     start: usize,
     end: usize,
@@ -4662,6 +4827,34 @@ test "parseApplyPatchToolPayload extracts codex patch formats" {
     );
 
     try std.testing.expect(parseApplyPatchToolPayload("normal assistant text") == null);
+}
+
+test "buildApplyPatchPreview keeps diff-relevant lines and truncates" {
+    const allocator = std.testing.allocator;
+    const patch =
+        "*** Begin Patch\n" ++
+        "*** Update File: src/main.zig\n" ++
+        "@@\n" ++
+        "-old\n" ++
+        " context line\n" ++
+        "+new\n" ++
+        "*** End Patch\n";
+
+    const preview = try buildApplyPatchPreview(allocator, patch, 4);
+    defer allocator.free(preview.text);
+
+    try std.testing.expectEqual(@as(usize, 4), preview.included_lines);
+    try std.testing.expectEqual(@as(usize, 2), preview.omitted_lines);
+    try std.testing.expect(std.mem.indexOf(u8, preview.text, "*** Begin Patch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview.text, "+new") == null);
+}
+
+test "diffLineColor classifies add/remove/meta lines" {
+    const palette = paletteForTheme(.codex);
+    try std.testing.expectEqualStrings(palette.diff_add, diffLineColor("+added", palette));
+    try std.testing.expectEqualStrings(palette.diff_remove, diffLineColor("-removed", palette));
+    try std.testing.expectEqualStrings(palette.diff_meta, diffLineColor("@@ hunk", palette));
+    try std.testing.expectEqualStrings("", diffLineColor("normal line", palette));
 }
 
 test "parseAssistantToolCall detects discovery/edit/exec/web tools" {
