@@ -246,7 +246,145 @@ fn providerLessThan(_: void, left: ProviderInfo, right: ProviderInfo) bool {
 }
 
 fn modelLessThan(_: void, left: ModelInfo, right: ModelInfo) bool {
-    return std.mem.lessThan(u8, left.id, right.id);
+    const left_latest = containsAsciiIgnoreCase(left.id, "latest");
+    const right_latest = containsAsciiIgnoreCase(right.id, "latest");
+    if (left_latest != right_latest) return left_latest;
+
+    const left_date_score = modelDateScore(left.id);
+    const right_date_score = modelDateScore(right.id);
+    if (left_date_score != right_date_score) return left_date_score > right_date_score;
+
+    const left_version_score = modelVersionScore(left.id);
+    const right_version_score = modelVersionScore(right.id);
+    if (left_version_score != right_version_score) return left_version_score > right_version_score;
+
+    const left_priority = modelPriorityBucket(left.id);
+    const right_priority = modelPriorityBucket(right.id);
+    if (left_priority != right_priority) return left_priority < right_priority;
+
+    // Fall back to descending lexical order so newer suffixes like 5.3 sort above 5.2.
+    return std.mem.lessThan(u8, right.id, left.id);
+}
+
+fn modelDateScore(model_id: []const u8) u32 {
+    var best: u32 = 0;
+    var i: usize = 0;
+    while (i < model_id.len) : (i += 1) {
+        if (!std.ascii.isDigit(model_id[i])) continue;
+
+        if (i + 10 <= model_id.len and std.ascii.isDigit(model_id[i + 0]) and std.ascii.isDigit(model_id[i + 1]) and std.ascii.isDigit(model_id[i + 2]) and std.ascii.isDigit(model_id[i + 3]) and model_id[i + 4] == '-' and std.ascii.isDigit(model_id[i + 5]) and std.ascii.isDigit(model_id[i + 6]) and model_id[i + 7] == '-' and std.ascii.isDigit(model_id[i + 8]) and std.ascii.isDigit(model_id[i + 9])) {
+            const year = parseDecU16(model_id[i .. i + 4]);
+            const month = parseDecU8(model_id[i + 5 .. i + 7]);
+            const day = parseDecU8(model_id[i + 8 .. i + 10]);
+            const score = packDate(year, month, day);
+            if (score > best) best = score;
+        }
+
+        if (i + 8 <= model_id.len and std.ascii.isDigit(model_id[i + 0]) and std.ascii.isDigit(model_id[i + 1]) and std.ascii.isDigit(model_id[i + 2]) and std.ascii.isDigit(model_id[i + 3]) and std.ascii.isDigit(model_id[i + 4]) and std.ascii.isDigit(model_id[i + 5]) and std.ascii.isDigit(model_id[i + 6]) and std.ascii.isDigit(model_id[i + 7])) {
+            const year = parseDecU16(model_id[i .. i + 4]);
+            const month = parseDecU8(model_id[i + 4 .. i + 6]);
+            const day = parseDecU8(model_id[i + 6 .. i + 8]);
+            const score = packDate(year, month, day);
+            if (score > best) best = score;
+        }
+    }
+    return best;
+}
+
+fn modelVersionScore(model_id: []const u8) u64 {
+    var best: u64 = 0;
+    var i: usize = 0;
+    while (i < model_id.len) : (i += 1) {
+        if (!std.ascii.isDigit(model_id[i])) continue;
+        const major = parseDigitsClamped(model_id, &i);
+
+        var minor: u64 = 0;
+        var patch: u64 = 0;
+
+        if (i < model_id.len and model_id[i] == '.' and i + 1 < model_id.len and std.ascii.isDigit(model_id[i + 1])) {
+            i += 1;
+            minor = parseDigitsClamped(model_id, &i);
+            if (i < model_id.len and model_id[i] == '.' and i + 1 < model_id.len and std.ascii.isDigit(model_id[i + 1])) {
+                i += 1;
+                patch = parseDigitsClamped(model_id, &i);
+            }
+        }
+
+        const score = major * 1_000_000 + minor * 1_000 + patch;
+        if (score > best) best = score;
+        if (i > 0) i -= 1;
+    }
+    return best;
+}
+
+fn parseDigitsClamped(text: []const u8, index: *usize) u64 {
+    var value: u64 = 0;
+    while (index.* < text.len and std.ascii.isDigit(text[index.*])) : (index.* += 1) {
+        value = value * 10 + (text[index.*] - '0');
+        if (value > 9_999) {
+            while (index.* < text.len and std.ascii.isDigit(text[index.*])) : (index.* += 1) {}
+            return 9_999;
+        }
+    }
+    return value;
+}
+
+fn parseDecU16(text: []const u8) u16 {
+    var value: u16 = 0;
+    for (text) |ch| {
+        value = value * 10 + (ch - '0');
+    }
+    return value;
+}
+
+fn parseDecU8(text: []const u8) u8 {
+    var value: u8 = 0;
+    for (text) |ch| {
+        value = value * 10 + (ch - '0');
+    }
+    return value;
+}
+
+fn packDate(year: u16, month: u8, day: u8) u32 {
+    if (year < 2000 or year > 2100) return 0;
+    if (month < 1 or month > 12) return 0;
+    if (day < 1 or day > 31) return 0;
+    return @as(u32, year) * 10_000 + @as(u32, month) * 100 + @as(u32, day);
+}
+
+fn modelPriorityBucket(model_id: []const u8) usize {
+    const hints = [_][]const u8{
+        "codex",
+        "gpt-5",
+        "claude-sonnet-4",
+        "big-pickle",
+        "gemini-3-pro",
+    };
+
+    for (hints, 0..) |hint, index| {
+        if (containsAsciiIgnoreCase(model_id, hint)) return index;
+    }
+    return hints.len;
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var matched = true;
+        var i: usize = 0;
+        while (i < needle.len) : (i += 1) {
+            if (std.ascii.toLower(haystack[start + i]) != std.ascii.toLower(needle[i])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+
+    return false;
 }
 
 fn createFileForPath(path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
@@ -312,4 +450,26 @@ test "loadFromPath reads catalog file" {
     defer catalog.deinit(allocator);
 
     try std.testing.expect(catalog.hasModel("anthropic", "claude-opus-4-1"));
+}
+
+test "model ordering prioritizes latest and codex first" {
+    const allocator = std.testing.allocator;
+
+    const sample_json =
+        "{\"openai\":{\"id\":\"openai\",\"name\":\"OpenAI\",\"models\":{" ++
+        "\"gpt-4.1\":{\"id\":\"gpt-4.1\",\"name\":\"GPT-4.1\"}," ++
+        "\"gpt-5\":{\"id\":\"gpt-5\",\"name\":\"GPT-5\"}," ++
+        "\"gpt-5-codex-2024-11-10\":{\"id\":\"gpt-5-codex-2024-11-10\",\"name\":\"GPT-5 Codex 2024-11-10\"}," ++
+        "\"gpt-5.2-codex\":{\"id\":\"gpt-5.2-codex\",\"name\":\"GPT-5.2 Codex\"}," ++
+        "\"gpt-5-codex-2025-02-01\":{\"id\":\"gpt-5-codex-2025-02-01\",\"name\":\"GPT-5 Codex 2025-02-01\"}," ++
+        "\"gpt-5-chat-latest\":{\"id\":\"gpt-5-chat-latest\",\"name\":\"GPT-5 Chat Latest\"}" ++
+        "}}}";
+
+    var catalog = try parseCatalogFromJson(allocator, sample_json);
+    defer catalog.deinit(allocator);
+
+    const provider = catalog.findProviderConst("openai") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("gpt-5-chat-latest", provider.models.items[0].id);
+    try std.testing.expectEqualStrings("gpt-5-codex-2025-02-01", provider.models.items[1].id);
+    try std.testing.expectEqualStrings("gpt-5-codex-2024-11-10", provider.models.items[2].id);
 }

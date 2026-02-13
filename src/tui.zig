@@ -26,6 +26,8 @@ const TerminalMetrics = struct {
     lines: usize,
 };
 
+const MODEL_PICKER_MAX_ROWS: usize = 8;
+
 const RawMode = struct {
     original_termios: std.posix.termios,
 
@@ -102,6 +104,9 @@ const App = struct {
     input_cursor: usize = 0,
     scroll_lines: usize = 0,
     conv_strip_start: usize = 0,
+    model_picker_open: bool = false,
+    model_picker_index: usize = 0,
+    model_picker_scroll: usize = 0,
     compact_mode: bool = true,
     theme: Theme = .codex,
 
@@ -127,10 +132,14 @@ const App = struct {
     fn handleNormalByte(self: *App, key_byte: u8) !void {
         switch (key_byte) {
             'q' => self.should_exit = true,
-            'i' => self.mode = .insert,
+            'i' => {
+                self.mode = .insert;
+                self.syncModelPickerFromInput();
+            },
             'a' => {
                 if (self.input_cursor < self.input_buffer.items.len) self.input_cursor += 1;
                 self.mode = .insert;
+                self.syncModelPickerFromInput();
             },
             'h' => {
                 if (self.input_cursor > 0) self.input_cursor -= 1;
@@ -159,6 +168,7 @@ const App = struct {
                     try self.input_buffer.append(self.allocator, '/');
                     self.input_cursor = 1;
                 }
+                self.syncModelPickerFromInput();
             },
             27 => self.mode = .normal,
             else => {},
@@ -167,20 +177,42 @@ const App = struct {
 
     fn handleInsertByte(self: *App, key_byte: u8) !void {
         switch (key_byte) {
-            27 => self.mode = .normal,
+            27 => {
+                if (self.model_picker_open) {
+                    self.model_picker_open = false;
+                    return;
+                }
+                self.mode = .normal;
+            },
             127 => {
                 if (self.input_cursor > 0) {
                     self.input_cursor -= 1;
                     _ = self.input_buffer.orderedRemove(self.input_cursor);
                 }
+                self.syncModelPickerFromInput();
             },
             '\r', '\n' => {
+                if (self.model_picker_open) {
+                    try self.acceptModelPickerSelection();
+                    return;
+                }
                 try self.submitInput();
+            },
+            14 => {
+                if (self.model_picker_open) {
+                    self.moveModelPickerSelection(1);
+                }
+            },
+            16 => {
+                if (self.model_picker_open) {
+                    self.moveModelPickerSelection(-1);
+                }
             },
             else => {
                 if (key_byte >= 32 and key_byte <= 126) {
                     try self.input_buffer.insert(self.allocator, self.input_cursor, key_byte);
                     self.input_cursor += 1;
+                    self.syncModelPickerFromInput();
                 }
             },
         }
@@ -197,6 +229,7 @@ const App = struct {
         if (line.len == 0) return;
 
         if (line[0] == '/') {
+            self.model_picker_open = false;
             try self.handleCommand(line);
             return;
         }
@@ -243,13 +276,25 @@ const App = struct {
             .on_token = onStreamToken,
             .context = self,
         }) catch |err| {
-            try self.setNoticeFmt("Provider request failed: {s}", .{@errorName(err)});
+            const provider_detail = provider_client.lastProviderErrorDetail();
+            if (provider_detail) |detail| {
+                try self.setNoticeFmt("Provider request failed: {s}", .{detail});
+            } else {
+                try self.setNoticeFmt("Provider request failed: {s}", .{@errorName(err)});
+            }
             const conversation = self.app_state.currentConversationConst();
             const needs_paragraph_break = if (conversation.messages.items.len == 0) false else blk: {
                 const last = conversation.messages.items[conversation.messages.items.len - 1];
                 break :blk last.content.len > 0;
             };
-            try self.appendToLastAssistantMessage(if (needs_paragraph_break) "\n\n[local] Request failed." else "[local] Request failed.");
+            if (provider_detail) |detail| {
+                const failure_line = try std.fmt.allocPrint(self.allocator, "[local] Request failed ({s}).", .{detail});
+                defer self.allocator.free(failure_line);
+                try self.appendToLastAssistantMessage(if (needs_paragraph_break) "\n\n" else "");
+                try self.appendToLastAssistantMessage(failure_line);
+            } else {
+                try self.appendToLastAssistantMessage(if (needs_paragraph_break) "\n\n[local] Request failed." else "[local] Request failed.");
+            }
             try self.app_state.saveToPath(self.allocator, self.paths.state_path);
             return;
         };
@@ -313,7 +358,7 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  keys: H/L scroll conv tabs");
+            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  keys: H/L conv tabs, /model picker: Ctrl-N/P + Enter");
             return;
         }
 
@@ -558,7 +603,8 @@ const App = struct {
         const lines = metrics.lines;
         const content_width = if (width > 4) width - 4 else 56;
         const top_lines: usize = if (self.compact_mode) 3 else 4;
-        const bottom_lines: usize = 3;
+        const model_picker_lines = self.modelPickerLineCount(lines);
+        const bottom_lines: usize = 3 + model_picker_lines;
         const viewport_height = @max(@as(usize, 4), lines - top_lines - bottom_lines);
 
         var body_writer: std.Io.Writer.Allocating = .init(self.allocator);
@@ -649,7 +695,12 @@ const App = struct {
 
         try writeRule(&screen_writer.writer, width, palette, self.compact_mode);
 
-        const key_hint = if (self.mode == .insert) "enter esc /" else "i j/k H/L / q";
+        const key_hint = if (self.model_picker_open)
+            "ctrl-n/p pick, enter select, esc close"
+        else if (self.mode == .insert)
+            "enter esc /"
+        else
+            "i j/k H/L / q";
         const status_text = try std.fmt.allocPrint(
             self.allocator,
             "{s} | keys:{s} | scroll:{d}/{d}",
@@ -659,6 +710,10 @@ const App = struct {
         const status_line = try truncateLineAlloc(self.allocator, status_text, width);
         defer self.allocator.free(status_line);
         try screen_writer.writer.print("{s}{s}{s}\n", .{ palette.dim, status_line, palette.reset });
+
+        if (self.model_picker_open) {
+            try self.renderModelPicker(&screen_writer.writer, width, lines, palette);
+        }
 
         const before_cursor = self.input_buffer.items[0..self.input_cursor];
         const after_cursor = self.input_buffer.items[self.input_cursor..];
@@ -774,6 +829,167 @@ const App = struct {
             .lines = std.math.clamp(env_lines, 20, 120),
         };
     }
+
+    fn parseModelPickerQuery(input: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, input, "/model")) return null;
+        if (input.len == 6) return "";
+        if (input.len > 6 and input[6] == ' ') return std.mem.trimLeft(u8, input[7..], " ");
+        return null;
+    }
+
+    fn syncModelPickerFromInput(self: *App) void {
+        const query = parseModelPickerQuery(self.input_buffer.items);
+        if (query == null) {
+            self.model_picker_open = false;
+            self.model_picker_index = 0;
+            self.model_picker_scroll = 0;
+            return;
+        }
+
+        if (!self.model_picker_open) {
+            self.model_picker_index = 0;
+            self.model_picker_scroll = 0;
+        }
+        self.model_picker_open = true;
+
+        const total = self.modelPickerMatchCount(query.?);
+        if (total == 0) {
+            self.model_picker_index = 0;
+            self.model_picker_scroll = 0;
+            return;
+        }
+        if (self.model_picker_index >= total) self.model_picker_index = total - 1;
+    }
+
+    fn modelPickerMatchCount(self: *App, query: []const u8) usize {
+        const provider = self.catalog.findProviderConst(self.app_state.selected_provider_id) orelse return 0;
+        var count: usize = 0;
+        for (provider.models.items) |model| {
+            if (modelMatchesQuery(model, query)) count += 1;
+        }
+        return count;
+    }
+
+    fn modelPickerNthMatch(self: *App, query: []const u8, target_index: usize) ?*const models.ModelInfo {
+        const provider = self.catalog.findProviderConst(self.app_state.selected_provider_id) orelse return null;
+        var seen: usize = 0;
+        for (provider.models.items) |*model| {
+            if (!modelMatchesQuery(model.*, query)) continue;
+            if (seen == target_index) return model;
+            seen += 1;
+        }
+        return null;
+    }
+
+    fn moveModelPickerSelection(self: *App, delta: i32) void {
+        const query = parseModelPickerQuery(self.input_buffer.items) orelse return;
+        const total = self.modelPickerMatchCount(query);
+        if (total == 0) {
+            self.model_picker_index = 0;
+            self.model_picker_scroll = 0;
+            return;
+        }
+
+        if (delta < 0) {
+            if (self.model_picker_index > 0) self.model_picker_index -= 1;
+        } else if (delta > 0) {
+            if (self.model_picker_index + 1 < total) self.model_picker_index += 1;
+        }
+    }
+
+    fn acceptModelPickerSelection(self: *App) !void {
+        const query = parseModelPickerQuery(self.input_buffer.items) orelse return;
+        const total = self.modelPickerMatchCount(query);
+        if (total == 0) {
+            try self.setNotice("No model matches the current filter");
+            return;
+        }
+
+        if (self.model_picker_index >= total) self.model_picker_index = total - 1;
+        const selected = self.modelPickerNthMatch(query, self.model_picker_index) orelse return;
+
+        try self.app_state.setSelectedModel(self.allocator, selected.id);
+        try self.app_state.saveToPath(self.allocator, self.paths.state_path);
+        try self.setNoticeFmt("Model set to {s}", .{selected.id});
+
+        self.input_buffer.clearRetainingCapacity();
+        self.input_cursor = 0;
+        self.model_picker_open = false;
+        self.model_picker_index = 0;
+        self.model_picker_scroll = 0;
+    }
+
+    fn modelPickerLineCount(self: *App, terminal_lines: usize) usize {
+        if (!self.model_picker_open) return 0;
+
+        const query = parseModelPickerQuery(self.input_buffer.items) orelse return 0;
+        const total = self.modelPickerMatchCount(query);
+        const max_rows = self.modelPickerMaxRows(terminal_lines);
+        const shown_rows = if (total == 0) @as(usize, 1) else @min(total, max_rows);
+        return 1 + shown_rows;
+    }
+
+    fn modelPickerMaxRows(_: *App, terminal_lines: usize) usize {
+        const budget = @max(@as(usize, 3), terminal_lines / 5);
+        return @min(MODEL_PICKER_MAX_ROWS, budget);
+    }
+
+    fn renderModelPicker(self: *App, writer: *std.Io.Writer, width: usize, terminal_lines: usize, palette: Palette) !void {
+        const query = parseModelPickerQuery(self.input_buffer.items) orelse return;
+        const total = self.modelPickerMatchCount(query);
+        const max_rows = self.modelPickerMaxRows(terminal_lines);
+        const shown_rows = if (total == 0) @as(usize, 1) else @min(total, max_rows);
+
+        if (total > 0) {
+            if (self.model_picker_index >= total) self.model_picker_index = total - 1;
+            if (self.model_picker_index < self.model_picker_scroll) {
+                self.model_picker_scroll = self.model_picker_index;
+            } else if (self.model_picker_index >= self.model_picker_scroll + shown_rows) {
+                self.model_picker_scroll = self.model_picker_index - shown_rows + 1;
+            }
+            const max_scroll = total - shown_rows;
+            if (self.model_picker_scroll > max_scroll) self.model_picker_scroll = max_scroll;
+        } else {
+            self.model_picker_index = 0;
+            self.model_picker_scroll = 0;
+        }
+
+        const header_text = try std.fmt.allocPrint(
+            self.allocator,
+            "model picker ({d}) provider:{s} query:{s}",
+            .{ total, self.app_state.selected_provider_id, if (query.len == 0) "*" else query },
+        );
+        defer self.allocator.free(header_text);
+        const header_line = try truncateLineAlloc(self.allocator, header_text, width);
+        defer self.allocator.free(header_line);
+        try writer.print("{s}{s}{s}\n", .{ palette.accent, header_line, palette.reset });
+
+        if (total == 0) {
+            const empty_line = try truncateLineAlloc(self.allocator, "  no matches", width);
+            defer self.allocator.free(empty_line);
+            try writer.print("{s}{s}{s}\n", .{ palette.dim, empty_line, palette.reset });
+            return;
+        }
+
+        const end_index = @min(self.model_picker_scroll + shown_rows, total);
+        var index = self.model_picker_scroll;
+        while (index < end_index) : (index += 1) {
+            const model = self.modelPickerNthMatch(query, index) orelse continue;
+            const selected = index == self.model_picker_index;
+            const marker = if (selected) ">" else " ";
+            const row_color = if (selected) palette.accent else palette.dim;
+
+            const row_text = if (std.mem.eql(u8, model.id, model.name))
+                try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ marker, model.id })
+            else
+                try std.fmt.allocPrint(self.allocator, "{s} {s} ({s})", .{ marker, model.id, model.name });
+            defer self.allocator.free(row_text);
+
+            const row_line = try truncateLineAlloc(self.allocator, row_text, width);
+            defer self.allocator.free(row_line);
+            try writer.print("{s}{s}{s}\n", .{ row_color, row_line, palette.reset });
+        }
+    }
 };
 
 const Palette = struct {
@@ -826,56 +1042,6 @@ fn writeRule(writer: *std.Io.Writer, width: usize, palette: Palette, compact_mod
     try writer.writeByte('\n');
 }
 
-fn writeIndent(writer: *std.Io.Writer, indent: usize) !void {
-    if (indent == 0) return;
-    try writer.splatByteAll(' ', indent);
-}
-
-fn writeWrapped(writer: *std.Io.Writer, text: []const u8, width: usize, indent: usize) !usize {
-    var line_count: usize = 0;
-    var paragraphs = std.mem.splitScalar(u8, text, '\n');
-    while (paragraphs.next()) |paragraph| {
-        if (paragraph.len == 0) {
-            try writeIndent(writer, indent);
-            try writer.writeByte('\n');
-            line_count += 1;
-            continue;
-        }
-
-        var start: usize = 0;
-        while (start < paragraph.len) {
-            const max_end = @min(start + width, paragraph.len);
-            var end = max_end;
-            if (max_end < paragraph.len) {
-                var cursor = max_end;
-                while (cursor > start and paragraph[cursor - 1] != ' ') : (cursor -= 1) {}
-                if (cursor > start) {
-                    end = cursor - 1;
-                }
-            }
-
-            if (end <= start) end = max_end;
-
-            try writeIndent(writer, indent);
-            try writer.writeAll(std.mem.trimRight(u8, paragraph[start..end], " "));
-            try writer.writeByte('\n');
-            line_count += 1;
-
-            start = end;
-            while (start < paragraph.len and paragraph[start] == ' ') : (start += 1) {}
-        }
-    }
-    return line_count;
-}
-
-fn roleLabel(role: Role) []const u8 {
-    return switch (role) {
-        .user => "u",
-        .assistant => "a",
-        .system => "s",
-    };
-}
-
 fn roleColor(role: Role, palette: Palette) []const u8 {
     return switch (role) {
         .user => palette.user,
@@ -885,10 +1051,76 @@ fn roleColor(role: Role, palette: Palette) []const u8 {
 }
 
 fn appendMessageBlock(writer: *std.Io.Writer, message: anytype, width: usize, palette: Palette, compact_mode: bool) !void {
-    const color = roleColor(message.role, palette);
-    try writer.print("{s}{s}>{s}\n", .{ color, roleLabel(message.role), palette.reset });
-    _ = try writeWrapped(writer, if (message.content.len == 0) "..." else message.content, width, if (compact_mode) 1 else 2);
-    if (!compact_mode) try writer.writeByte('\n');
+    _ = compact_mode;
+
+    const marker, const continuation, const color = switch (message.role) {
+        .user => .{ "› ", "  ", palette.user },
+        .assistant => .{ "• ", "  ", palette.assistant },
+        .system => .{ "○ ", "  ", palette.system },
+    };
+
+    _ = try writeWrappedPrefixed(
+        writer,
+        if (message.content.len == 0) "..." else message.content,
+        width,
+        marker,
+        continuation,
+        color,
+        palette.reset,
+    );
+    try writer.writeByte('\n');
+}
+
+fn writeWrappedPrefixed(
+    writer: *std.Io.Writer,
+    text: []const u8,
+    width: usize,
+    first_prefix: []const u8,
+    next_prefix: []const u8,
+    prefix_color: []const u8,
+    reset: []const u8,
+) !usize {
+    var line_count: usize = 0;
+    var first_line = true;
+
+    var paragraphs = std.mem.splitScalar(u8, text, '\n');
+    while (paragraphs.next()) |paragraph| {
+        const para = std.mem.trimRight(u8, paragraph, " ");
+        if (para.len == 0) {
+            const prefix = if (first_line) first_prefix else next_prefix;
+            try writer.print("{s}{s}{s}\n", .{ prefix_color, prefix, reset });
+            first_line = false;
+            line_count += 1;
+            continue;
+        }
+
+        var start: usize = 0;
+        while (start < para.len) {
+            const prefix = if (first_line) first_prefix else next_prefix;
+            const prefix_len = prefix.len;
+            const wrap_width = @max(@as(usize, 1), width -| prefix_len);
+            const max_end = @min(start + wrap_width, para.len);
+
+            var end = max_end;
+            if (max_end < para.len) {
+                var cursor = max_end;
+                while (cursor > start and para[cursor - 1] != ' ') : (cursor -= 1) {}
+                if (cursor > start) end = cursor - 1;
+            }
+            if (end <= start) end = max_end;
+
+            try writer.print("{s}{s}{s}", .{ prefix_color, prefix, reset });
+            try writer.writeAll(std.mem.trimRight(u8, para[start..end], " "));
+            try writer.writeByte('\n');
+
+            line_count += 1;
+            first_line = false;
+            start = end;
+            while (start < para.len and para[start] == ' ') : (start += 1) {}
+        }
+    }
+
+    return line_count;
 }
 
 fn truncateLineAlloc(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
@@ -923,6 +1155,30 @@ fn buildInputView(allocator: std.mem.Allocator, before: []const u8, after: []con
     out[2] = '.';
     @memcpy(out[3..], full[full.len - tail_len ..]);
     return out;
+}
+
+fn modelMatchesQuery(model: models.ModelInfo, query: []const u8) bool {
+    if (query.len == 0) return true;
+    return containsAsciiIgnoreCase(model.id, query) or containsAsciiIgnoreCase(model.name, query);
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var matched = true;
+        var i: usize = 0;
+        while (i < needle.len) : (i += 1) {
+            if (std.ascii.toLower(haystack[start + i]) != std.ascii.toLower(needle[i])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+    return false;
 }
 
 fn fallbackEnvVars(provider_id: []const u8) []const []const u8 {

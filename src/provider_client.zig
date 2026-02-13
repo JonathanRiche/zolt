@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const Role = @import("state.zig").Role;
+const DECOMPRESS_BUFFER_SIZE = 64 * 1024;
 
 pub const StreamMessage = struct {
     role: Role,
@@ -22,11 +23,25 @@ pub const StreamCallbacks = struct {
     context: ?*anyopaque = null,
 };
 
+threadlocal var last_error_buffer: [512]u8 = undefined;
+threadlocal var last_error_len: usize = 0;
+
+pub fn lastProviderErrorDetail() ?[]const u8 {
+    if (last_error_len == 0) return null;
+    return last_error_buffer[0..last_error_len];
+}
+
+fn clearLastProviderErrorDetail() void {
+    last_error_len = 0;
+}
+
 pub fn streamChat(
     allocator: std.mem.Allocator,
     request: StreamRequest,
     callbacks: StreamCallbacks,
 ) !void {
+    clearLastProviderErrorDetail();
+
     if (std.mem.eql(u8, request.provider_id, "anthropic")) {
         return streamAnthropic(allocator, request, callbacks);
     }
@@ -92,11 +107,136 @@ fn streamOpenAiCompatible(
     if (response.head.status != .ok) {
         const error_body = readResponseBodyAlloc(allocator, &response) catch "";
         defer if (error_body.len > 0) allocator.free(error_body);
+
+        if (shouldRetryWithLegacyCompletions(response.head.status, error_body)) {
+            return streamOpenAiLegacyCompletions(allocator, request, callbacks, use_referrer_headers);
+        }
+
         std.log.err("openai-compatible request failed: status={s} body={s}", .{ @tagName(response.head.status), error_body });
+        setLastProviderErrorDetail(response.head.status, error_body);
         return error.ProviderRequestFailed;
     }
 
     try streamSseResponse(allocator, &response, callbacks, extractOpenAiTokenAlloc);
+}
+
+fn streamOpenAiLegacyCompletions(
+    allocator: std.mem.Allocator,
+    request: StreamRequest,
+    callbacks: StreamCallbacks,
+    use_referrer_headers: bool,
+) !void {
+    const base_url = request.base_url orelse defaultBaseUrl(request.provider_id) orelse return error.MissingProviderBaseUrl;
+
+    const endpoint = try joinUrl(allocator, base_url, "/completions");
+    defer allocator.free(endpoint);
+
+    const payload = try buildOpenAiLegacyCompletionsPayload(allocator, request);
+    defer allocator.free(payload);
+
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
+    defer allocator.free(auth_header);
+
+    var extra_headers: [2]std.http.Header = .{
+        .{ .name = "HTTP-Referer", .value = "https://opencode.ai/" },
+        .{ .name = "X-Title", .value = "zig-ai" },
+    };
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(endpoint);
+    var req = try client.request(.POST, uri, .{
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .authorization = .{ .override = auth_header },
+            .user_agent = .{ .override = "zig-ai/0.1" },
+        },
+        .extra_headers = if (use_referrer_headers) extra_headers[0..] else &.{},
+        .keep_alive = false,
+    });
+    defer req.deinit();
+
+    req.transfer_encoding = .{ .content_length = payload.len };
+
+    var body_writer = try req.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(payload);
+    try body_writer.end();
+    try req.connection.?.flush();
+
+    var response = try req.receiveHead(&.{});
+
+    if (response.head.status != .ok) {
+        const error_body = readResponseBodyAlloc(allocator, &response) catch "";
+        defer if (error_body.len > 0) allocator.free(error_body);
+
+        if (shouldRetryWithResponsesEndpoint(response.head.status, error_body)) {
+            return streamOpenAiResponses(allocator, request, callbacks, use_referrer_headers);
+        }
+
+        std.log.err("openai legacy completions request failed: status={s} body={s}", .{ @tagName(response.head.status), error_body });
+        setLastProviderErrorDetail(response.head.status, error_body);
+        return error.ProviderRequestFailed;
+    }
+
+    try streamSseResponse(allocator, &response, callbacks, extractOpenAiTokenAlloc);
+}
+
+fn streamOpenAiResponses(
+    allocator: std.mem.Allocator,
+    request: StreamRequest,
+    callbacks: StreamCallbacks,
+    use_referrer_headers: bool,
+) !void {
+    const base_url = request.base_url orelse defaultBaseUrl(request.provider_id) orelse return error.MissingProviderBaseUrl;
+
+    const endpoint = try joinUrl(allocator, base_url, "/responses");
+    defer allocator.free(endpoint);
+
+    const payload = try buildOpenAiResponsesPayload(allocator, request);
+    defer allocator.free(payload);
+
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
+    defer allocator.free(auth_header);
+
+    var extra_headers: [2]std.http.Header = .{
+        .{ .name = "HTTP-Referer", .value = "https://opencode.ai/" },
+        .{ .name = "X-Title", .value = "zig-ai" },
+    };
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(endpoint);
+    var req = try client.request(.POST, uri, .{
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .authorization = .{ .override = auth_header },
+            .user_agent = .{ .override = "zig-ai/0.1" },
+        },
+        .extra_headers = if (use_referrer_headers) extra_headers[0..] else &.{},
+        .keep_alive = false,
+    });
+    defer req.deinit();
+
+    req.transfer_encoding = .{ .content_length = payload.len };
+
+    var body_writer = try req.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(payload);
+    try body_writer.end();
+    try req.connection.?.flush();
+
+    var response = try req.receiveHead(&.{});
+
+    if (response.head.status != .ok) {
+        const error_body = readResponseBodyAlloc(allocator, &response) catch "";
+        defer if (error_body.len > 0) allocator.free(error_body);
+        std.log.err("openai responses request failed: status={s} body={s}", .{ @tagName(response.head.status), error_body });
+        setLastProviderErrorDetail(response.head.status, error_body);
+        return error.ProviderRequestFailed;
+    }
+
+    try streamSseResponse(allocator, &response, callbacks, extractOpenAiResponsesTokenAlloc);
 }
 
 fn streamAnthropic(
@@ -144,6 +284,7 @@ fn streamAnthropic(
         const error_body = readResponseBodyAlloc(allocator, &response) catch "";
         defer if (error_body.len > 0) allocator.free(error_body);
         std.log.err("anthropic request failed: status={s} body={s}", .{ @tagName(response.head.status), error_body });
+        setLastProviderErrorDetail(response.head.status, error_body);
         return error.ProviderRequestFailed;
     }
 
@@ -193,6 +334,7 @@ fn streamGoogle(
         const error_body = readResponseBodyAlloc(allocator, &response) catch "";
         defer if (error_body.len > 0) allocator.free(error_body);
         std.log.err("google request failed: status={s} body={s}", .{ @tagName(response.head.status), error_body });
+        setLastProviderErrorDetail(response.head.status, error_body);
         return error.ProviderRequestFailed;
     }
 
@@ -206,7 +348,9 @@ fn streamSseResponse(
     comptime extract_token: fn (std.mem.Allocator, []const u8) anyerror!?[]u8,
 ) !void {
     var transfer_buffer: [256 * 1024]u8 = undefined;
-    var reader = response.reader(&transfer_buffer);
+    var decompress: std.http.Decompress = undefined;
+    var decompress_buffer: [DECOMPRESS_BUFFER_SIZE]u8 = undefined;
+    var reader = response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
 
     while (true) {
         const maybe_line = try reader.takeDelimiter('\n');
@@ -234,7 +378,9 @@ fn streamSseResponse(
 
 fn readResponseBodyAlloc(allocator: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
     var transfer_buffer: [8192]u8 = undefined;
-    var reader = response.reader(&transfer_buffer);
+    var decompress: std.http.Decompress = undefined;
+    var decompress_buffer: [DECOMPRESS_BUFFER_SIZE]u8 = undefined;
+    var reader = response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
 
     var body_writer: std.Io.Writer.Allocating = .init(allocator);
     defer body_writer.deinit();
@@ -245,6 +391,39 @@ fn readResponseBodyAlloc(allocator: std.mem.Allocator, response: *std.http.Clien
     };
 
     return body_writer.toOwnedSlice();
+}
+
+fn setLastProviderErrorDetail(status: std.http.Status, body: []const u8) void {
+    var sanitized: [220]u8 = undefined;
+    const body_preview = sanitizeErrorPreview(body, &sanitized);
+    const detail = std.fmt.bufPrint(
+        &last_error_buffer,
+        "status={s} body={s}",
+        .{ @tagName(status), body_preview },
+    ) catch "provider request failed";
+    last_error_len = detail.len;
+}
+
+fn sanitizeErrorPreview(input: []const u8, out: []u8) []const u8 {
+    if (out.len == 0) return "";
+    var written: usize = 0;
+    for (input) |ch| {
+        if (written >= out.len) break;
+        out[written] = if (std.ascii.isPrint(ch) and ch != '\n' and ch != '\r' and ch != '\t') ch else ' ';
+        written += 1;
+    }
+    return std.mem.trim(u8, out[0..written], " ");
+}
+
+fn shouldRetryWithLegacyCompletions(status: std.http.Status, error_body: []const u8) bool {
+    if (status != .not_found and status != .bad_request) return false;
+    return containsAsciiIgnoreCase(error_body, "not a chat model") and
+        containsAsciiIgnoreCase(error_body, "v1/completions");
+}
+
+fn shouldRetryWithResponsesEndpoint(status: std.http.Status, error_body: []const u8) bool {
+    if (status != .not_found and status != .bad_request) return false;
+    return containsAsciiIgnoreCase(error_body, "not supported in the v1/completions endpoint");
 }
 
 fn buildOpenAiPayload(allocator: std.mem.Allocator, request: StreamRequest) ![]u8 {
@@ -276,6 +455,64 @@ fn buildOpenAiPayload(allocator: std.mem.Allocator, request: StreamRequest) ![]u
     try jw.endObject();
 
     return payload_writer.toOwnedSlice();
+}
+
+fn buildOpenAiLegacyCompletionsPayload(allocator: std.mem.Allocator, request: StreamRequest) ![]u8 {
+    const prompt = try buildLegacyPromptFromMessages(allocator, request.messages);
+    defer allocator.free(prompt);
+
+    var payload_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer payload_writer.deinit();
+
+    var jw: std.json.Stringify = .{
+        .writer = &payload_writer.writer,
+    };
+
+    try jw.beginObject();
+    try jw.objectField("model");
+    try jw.write(request.model_id);
+    try jw.objectField("stream");
+    try jw.write(true);
+    try jw.objectField("prompt");
+    try jw.write(prompt);
+    try jw.endObject();
+
+    return payload_writer.toOwnedSlice();
+}
+
+fn buildOpenAiResponsesPayload(allocator: std.mem.Allocator, request: StreamRequest) ![]u8 {
+    const prompt = try buildLegacyPromptFromMessages(allocator, request.messages);
+    defer allocator.free(prompt);
+
+    var payload_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer payload_writer.deinit();
+
+    var jw: std.json.Stringify = .{
+        .writer = &payload_writer.writer,
+    };
+
+    try jw.beginObject();
+    try jw.objectField("model");
+    try jw.write(request.model_id);
+    try jw.objectField("stream");
+    try jw.write(true);
+    try jw.objectField("input");
+    try jw.write(prompt);
+    try jw.endObject();
+
+    return payload_writer.toOwnedSlice();
+}
+
+fn buildLegacyPromptFromMessages(allocator: std.mem.Allocator, messages: []const StreamMessage) ![]u8 {
+    var prompt_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer prompt_writer.deinit();
+
+    for (messages) |message| {
+        if (message.content.len == 0) continue;
+        try prompt_writer.writer.print("{s}: {s}\n\n", .{ openAiRole(message.role), message.content });
+    }
+    try prompt_writer.writer.writeAll("assistant: ");
+    return prompt_writer.toOwnedSlice();
 }
 
 fn buildAnthropicPayload(allocator: std.mem.Allocator, request: StreamRequest) ![]u8 {
@@ -440,6 +677,19 @@ fn extractGoogleTokenAlloc(allocator: std.mem.Allocator, data_text: []const u8) 
     return @as(?[]u8, try allocator.dupe(u8, text));
 }
 
+fn extractOpenAiResponsesTokenAlloc(allocator: std.mem.Allocator, data_text: []const u8) !?[]u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data_text, .{});
+    defer parsed.deinit();
+
+    const event_type_value = objectField(parsed.value, "type") orelse return null;
+    const event_type = asString(event_type_value) orelse return null;
+    if (!std.mem.eql(u8, event_type, "response.output_text.delta")) return null;
+
+    const delta_value = objectField(parsed.value, "delta") orelse return null;
+    const delta = asString(delta_value) orelse return null;
+    return @as(?[]u8, try allocator.dupe(u8, delta));
+}
+
 fn objectField(value: std.json.Value, key: []const u8) ?std.json.Value {
     return switch (value) {
         .object => |object| object.get(key),
@@ -518,6 +768,26 @@ fn joinUrl(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, suffix });
 }
 
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var matched = true;
+        var i: usize = 0;
+        while (i < needle.len) : (i += 1) {
+            if (std.ascii.toLower(haystack[start + i]) != std.ascii.toLower(needle[i])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+
+    return false;
+}
+
 test "extractOpenAiTokenAlloc parses delta content" {
     const allocator = std.testing.allocator;
 
@@ -555,4 +825,85 @@ test "extractGoogleTokenAlloc parses candidates parts text" {
 
     try std.testing.expect(token != null);
     try std.testing.expect(std.mem.eql(u8, token.?, "gemini"));
+}
+
+test "extractOpenAiResponsesTokenAlloc parses output_text delta" {
+    const allocator = std.testing.allocator;
+
+    const line =
+        "{\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}";
+
+    const token = try extractOpenAiResponsesTokenAlloc(allocator, line);
+    defer if (token) |t| allocator.free(t);
+
+    try std.testing.expect(token != null);
+    try std.testing.expect(std.mem.eql(u8, token.?, "Hello"));
+}
+
+test "shouldRetryWithLegacyCompletions detects non-chat model errors" {
+    try std.testing.expect(shouldRetryWithLegacyCompletions(
+        .not_found,
+        "{\"error\":{\"message\":\"This is not a chat model and thus not supported in the v1/chat/completions endpoint. Did you mean to use v1/completions?\"}}",
+    ));
+    try std.testing.expect(!shouldRetryWithLegacyCompletions(.unauthorized, "not a chat model"));
+    try std.testing.expect(!shouldRetryWithLegacyCompletions(.not_found, "other error"));
+}
+
+test "shouldRetryWithResponsesEndpoint detects legacy completions incompatibility" {
+    try std.testing.expect(shouldRetryWithResponsesEndpoint(
+        .not_found,
+        "{\"error\":{\"message\":\"This model is not supported in the v1/completions endpoint.\"}}",
+    ));
+    try std.testing.expect(!shouldRetryWithResponsesEndpoint(.unauthorized, "v1/completions endpoint"));
+    try std.testing.expect(!shouldRetryWithResponsesEndpoint(.not_found, "other error"));
+}
+
+test "buildOpenAiLegacyCompletionsPayload includes prompt transcript" {
+    const allocator = std.testing.allocator;
+
+    const messages = [_]StreamMessage{
+        .{ .role = .system, .content = "be concise" },
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = "hello" },
+    };
+
+    const request: StreamRequest = .{
+        .provider_id = "openai",
+        .model_id = "gpt-5.2-codex",
+        .api_key = "test",
+        .base_url = null,
+        .messages = messages[0..],
+    };
+
+    const payload = try buildOpenAiLegacyCompletionsPayload(allocator, request);
+    defer allocator.free(payload);
+
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"prompt\""));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "system: be concise"));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "user: hi"));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "assistant: "));
+}
+
+test "buildOpenAiResponsesPayload includes input transcript" {
+    const allocator = std.testing.allocator;
+
+    const messages = [_]StreamMessage{
+        .{ .role = .system, .content = "be concise" },
+        .{ .role = .user, .content = "hi" },
+    };
+
+    const request: StreamRequest = .{
+        .provider_id = "openai",
+        .model_id = "gpt-5.2-codex",
+        .api_key = "test",
+        .base_url = null,
+        .messages = messages[0..],
+    };
+
+    const payload = try buildOpenAiResponsesPayload(allocator, request);
+    defer allocator.free(payload);
+
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"input\""));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "system: be concise"));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "user: hi"));
 }

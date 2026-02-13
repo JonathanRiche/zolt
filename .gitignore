@@ -3,3 +3,4 @@ zig-out/
 .zig-global-cache/
 .zig-ai/
 opencode/
+codex/
