@@ -370,11 +370,17 @@ fn streamSseResponse(
         if (std.mem.eql(u8, data_text, "[DONE]")) break;
 
         const maybe_token = try extract_token(allocator, data_text);
+        var emitted_text = false;
         if (maybe_token) |token| {
             defer allocator.free(token);
             if (token.len > 0) {
                 try callbacks.on_token(callbacks.context, token);
+                emitted_text = true;
             }
+        }
+
+        if (!emitted_text) {
+            try callbacks.on_token(callbacks.context, "");
         }
 
         if (callbacks.on_usage) |on_usage| {

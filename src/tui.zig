@@ -34,6 +34,7 @@ const COMMAND_PICKER_MAX_ROWS: usize = 8;
 const TOOL_MAX_STEPS: usize = 4;
 const READ_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
 const APPLY_PATCH_TOOL_MAX_PATCH_BYTES: usize = 256 * 1024;
+const STREAM_INTERRUPT_ESC_WINDOW_MS: i64 = 1200;
 const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
@@ -181,6 +182,11 @@ const App = struct {
     file_index: std.ArrayList([]u8) = .empty,
     compact_mode: bool = true,
     theme: Theme = .codex,
+    stream_interrupt_esc_count: u8 = 0,
+    stream_interrupt_last_esc_ms: i64 = 0,
+    stream_interrupt_hint_shown: bool = false,
+    stream_was_interrupted: bool = false,
+    stream_started_ms: i64 = 0,
 
     notice: []u8,
 
@@ -381,7 +387,14 @@ const App = struct {
         defer self.allocator.free(api_key.?);
 
         self.is_streaming = true;
-        defer self.is_streaming = false;
+        self.stream_was_interrupted = false;
+        self.stream_started_ms = std.time.milliTimestamp();
+        self.resetStreamInterruptState();
+        defer {
+            self.is_streaming = false;
+            self.stream_started_ms = 0;
+            self.resetStreamInterruptState();
+        }
 
         if (inject_result.referenced_count > 0) {
             try self.setNoticeFmt(
@@ -440,7 +453,7 @@ const App = struct {
             }
         }
 
-        if (provider_client.lastProviderErrorDetail() == null) {
+        if (!self.stream_was_interrupted and provider_client.lastProviderErrorDetail() == null) {
             try self.setNoticeFmt("Completed response from {s}/{s}", .{ provider_id, model_id });
         }
         try self.app_state.saveToPath(self.allocator, self.paths.state_path);
@@ -465,6 +478,14 @@ const App = struct {
             .on_usage = onStreamUsage,
             .context = self,
         }) catch |err| {
+            if (err == error.StreamInterrupted) {
+                self.stream_was_interrupted = true;
+                try self.appendInterruptedMessage();
+                try self.setNotice("Streaming interrupted (Esc Esc)");
+                try self.app_state.saveToPath(self.allocator, self.paths.state_path);
+                return false;
+            }
+
             const provider_detail = provider_client.lastProviderErrorDetail();
             if (provider_detail) |detail| {
                 try self.setNoticeFmt("Provider request failed: {s}", .{detail});
@@ -488,6 +509,18 @@ const App = struct {
             return false;
         };
         return true;
+    }
+
+    fn appendInterruptedMessage(self: *App) !void {
+        const conversation = self.app_state.currentConversationConst();
+        if (conversation.messages.items.len == 0) return;
+
+        const last = conversation.messages.items[conversation.messages.items.len - 1];
+        const needs_paragraph_break = last.role == .assistant and last.content.len > 0;
+        if (needs_paragraph_break) {
+            try self.appendToLastAssistantMessage("\n\n");
+        }
+        try self.appendToLastAssistantMessage("[local] Generation interrupted by user (Esc Esc).");
     }
 
     fn buildStreamMessages(self: *App, include_tool_prompt: bool) ![]provider_client.StreamMessage {
@@ -654,6 +687,13 @@ const App = struct {
 
     fn onStreamToken(context: ?*anyopaque, token: []const u8) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context.?));
+        if (try self.pollStreamInterrupt()) {
+            return error.StreamInterrupted;
+        }
+        if (token.len == 0) {
+            try self.render();
+            return;
+        }
         try self.appendToLastAssistantMessage(token);
         try self.render();
     }
@@ -661,6 +701,36 @@ const App = struct {
     fn onStreamUsage(context: ?*anyopaque, usage: TokenUsage) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context.?));
         self.app_state.appendTokenUsage(usage, self.selectedModelContextWindow());
+    }
+
+    fn resetStreamInterruptState(self: *App) void {
+        self.stream_interrupt_esc_count = 0;
+        self.stream_interrupt_last_esc_ms = 0;
+        self.stream_interrupt_hint_shown = false;
+    }
+
+    fn pollStreamInterrupt(self: *App) !bool {
+        while (try stdinHasPendingByte(0)) {
+            var byte_buf: [1]u8 = undefined;
+            const read_len = try std.posix.read(std.fs.File.stdin().handle, byte_buf[0..]);
+            if (read_len == 0) break;
+
+            const now_ms = std.time.milliTimestamp();
+            if (registerStreamInterruptByte(
+                &self.stream_interrupt_esc_count,
+                &self.stream_interrupt_last_esc_ms,
+                byte_buf[0],
+                now_ms,
+            )) {
+                return true;
+            }
+
+            if (self.stream_interrupt_esc_count == 1 and !self.stream_interrupt_hint_shown) {
+                self.stream_interrupt_hint_shown = true;
+                try self.setNotice("Press Esc again to stop stream");
+            }
+        }
+        return false;
     }
 
     fn appendToLastAssistantMessage(self: *App, token: []const u8) !void {
@@ -964,8 +1034,26 @@ const App = struct {
 
         var body_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer body_writer.deinit();
-        for (conversation.messages.items) |message| {
-            try appendMessageBlock(&body_writer.writer, message, content_width, palette, self.compact_mode);
+        const now_ms = std.time.milliTimestamp();
+        const last_index = if (conversation.messages.items.len == 0) @as(usize, 0) else conversation.messages.items.len - 1;
+        for (conversation.messages.items, 0..) |message, index| {
+            const loading_placeholder = if (self.is_streaming and
+                index == last_index and
+                message.role == .assistant and
+                message.content.len == 0)
+                try buildWorkingPlaceholder(self.allocator, content_width, self.stream_started_ms, now_ms)
+            else
+                null;
+            defer if (loading_placeholder) |text| self.allocator.free(text);
+
+            try appendMessageBlock(
+                &body_writer.writer,
+                message,
+                content_width,
+                palette,
+                self.compact_mode,
+                loading_placeholder,
+            );
         }
         const body = try body_writer.toOwnedSlice();
         defer self.allocator.free(body);
@@ -996,7 +1084,7 @@ const App = struct {
         if (self.compact_mode) {
             const compact = try std.fmt.allocPrint(
                 self.allocator,
-                "zig-ai  {s}/{s}  mode:{s}  conv:{s}  {s}",
+                "Zolt  {s}/{s}  mode:{s}  conv:{s}  {s}",
                 .{ self.app_state.selected_provider_id, self.app_state.selected_model_id, mode_label, short_conv_id, stream_label },
             );
             defer self.allocator.free(compact);
@@ -1010,7 +1098,7 @@ const App = struct {
         } else {
             const title = try std.fmt.allocPrint(
                 self.allocator,
-                "zig-ai  mode:{s}  conv:{s}",
+                "Zolt  mode:{s}  conv:{s}",
                 .{ mode_label, conversation.id },
             );
             defer self.allocator.free(title);
@@ -1050,7 +1138,9 @@ const App = struct {
 
         try writeRule(&screen_writer.writer, width, palette, self.compact_mode);
 
-        const key_hint = if (self.model_picker_open)
+        const key_hint = if (self.is_streaming)
+            "esc esc stop"
+        else if (self.model_picker_open)
             "ctrl-n/p or up/down, enter/tab select, esc close"
         else if (self.command_picker_open)
             "ctrl-n/p or up/down, enter/tab insert, esc close"
@@ -1857,7 +1947,14 @@ fn roleColor(role: Role, palette: Palette) []const u8 {
     };
 }
 
-fn appendMessageBlock(writer: *std.Io.Writer, message: anytype, width: usize, palette: Palette, compact_mode: bool) !void {
+fn appendMessageBlock(
+    writer: *std.Io.Writer,
+    message: anytype,
+    width: usize,
+    palette: Palette,
+    compact_mode: bool,
+    content_override: ?[]const u8,
+) !void {
     _ = compact_mode;
 
     const marker, const continuation, const color = switch (message.role) {
@@ -1866,7 +1963,7 @@ fn appendMessageBlock(writer: *std.Io.Writer, message: anytype, width: usize, pa
         .system => .{ "○ ", "  ", palette.system },
     };
 
-    const rendered_content = messageDisplayContent(message);
+    const rendered_content = content_override orelse messageDisplayContent(message);
     _ = try writeWrappedPrefixed(
         writer,
         rendered_content,
@@ -1888,6 +1985,40 @@ fn messageDisplayContent(message: anytype) []const u8 {
     }
 
     return message.content;
+}
+
+fn buildWorkingPlaceholder(
+    allocator: std.mem.Allocator,
+    width: usize,
+    started_ms: i64,
+    now_ms: i64,
+) ![]u8 {
+    const elapsed_ms = @max(@as(i64, 0), now_ms - started_ms);
+    const elapsed_s = @divFloor(elapsed_ms, 1000);
+
+    const max_bar = @max(@as(usize, 10), @min(@as(usize, 24), width / 4));
+    const span: usize = if (max_bar > 1) max_bar - 1 else 1;
+    const period_i64: i64 = @as(i64, @intCast(span)) * 2;
+    const frame = @divFloor(elapsed_ms, 80);
+    const phase = @as(usize, @intCast(@mod(frame, period_i64)));
+    const head = if (phase <= span) phase else @as(usize, @intCast(period_i64 - @as(i64, @intCast(phase))));
+
+    var bar_buf: [32]u8 = undefined;
+    std.debug.assert(max_bar <= bar_buf.len);
+    for (0..max_bar) |index| {
+        bar_buf[index] = '-';
+        if (index == head) {
+            bar_buf[index] = '#';
+        } else if ((head > 0 and index + 1 == head) or index == head + 1) {
+            bar_buf[index] = '=';
+        }
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "Working {d}s [{s}]  Esc Esc to interrupt",
+        .{ elapsed_s, bar_buf[0..max_bar] },
+    );
 }
 
 fn writeWrappedPrefixed(
@@ -2054,6 +2185,29 @@ fn parseCommandPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
 fn commandMatchesQuery(entry: BuiltinCommandEntry, query: []const u8) bool {
     if (query.len == 0) return true;
     return containsAsciiIgnoreCase(entry.name, query) or containsAsciiIgnoreCase(entry.description, query);
+}
+
+fn registerStreamInterruptByte(
+    esc_count: *u8,
+    last_esc_ms: *i64,
+    key_byte: u8,
+    now_ms: i64,
+) bool {
+    if (key_byte != 27) {
+        esc_count.* = 0;
+        last_esc_ms.* = 0;
+        return false;
+    }
+
+    if (esc_count.* == 0 or (now_ms - last_esc_ms.*) > STREAM_INTERRUPT_ESC_WINDOW_MS) {
+        esc_count.* = 1;
+        last_esc_ms.* = now_ms;
+        return false;
+    }
+
+    esc_count.* = 0;
+    last_esc_ms.* = 0;
+    return true;
 }
 
 const AssistantToolCall = union(enum) {
@@ -2535,6 +2689,30 @@ test "commandMatchesQuery matches name and description" {
     try std.testing.expect(!commandMatchesQuery(entry, "xyz"));
 }
 
+test "registerStreamInterruptByte requires double esc within window" {
+    var esc_count: u8 = 0;
+    var last_esc_ms: i64 = 0;
+
+    try std.testing.expect(!registerStreamInterruptByte(&esc_count, &last_esc_ms, 27, 1000));
+    try std.testing.expectEqual(@as(u8, 1), esc_count);
+
+    try std.testing.expect(registerStreamInterruptByte(&esc_count, &last_esc_ms, 27, 1500));
+    try std.testing.expectEqual(@as(u8, 0), esc_count);
+}
+
+test "registerStreamInterruptByte resets on non-esc and timeout" {
+    var esc_count: u8 = 0;
+    var last_esc_ms: i64 = 0;
+
+    _ = registerStreamInterruptByte(&esc_count, &last_esc_ms, 27, 1000);
+    try std.testing.expect(!registerStreamInterruptByte(&esc_count, &last_esc_ms, 'a', 1001));
+    try std.testing.expectEqual(@as(u8, 0), esc_count);
+
+    _ = registerStreamInterruptByte(&esc_count, &last_esc_ms, 27, 2000);
+    try std.testing.expect(!registerStreamInterruptByte(&esc_count, &last_esc_ms, 27, 4005));
+    try std.testing.expectEqual(@as(u8, 1), esc_count);
+}
+
 test "isAllowedReadCommand allowlist and slash rejection" {
     try std.testing.expect(isAllowedReadCommand("rg"));
     try std.testing.expect(isAllowedReadCommand("ls"));
@@ -2667,4 +2845,16 @@ test "formatTokenCount trims trailing .0 for compact context display" {
     const c = try formatTokenCount(allocator, 123_456);
     defer allocator.free(c);
     try std.testing.expectEqualStrings("123.5k", c);
+}
+
+test "buildWorkingPlaceholder includes timer and interrupt hint" {
+    const allocator = std.testing.allocator;
+
+    const placeholder = try buildWorkingPlaceholder(allocator, 120, 1_000, 6_500);
+    defer allocator.free(placeholder);
+
+    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Working 5s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Esc Esc to interrupt") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, placeholder, '[') != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, placeholder, '#') != null);
 }
