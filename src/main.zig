@@ -1,4 +1,4 @@
-//! zig-ai: a minimal terminal AI chat client.
+//! zolt: a minimal terminal AI chat client.
 
 const std = @import("std");
 
@@ -20,8 +20,8 @@ pub fn main() !void {
         var stdout_writer = std.fs.File.stdout().writer(&output_buffer);
         defer stdout_writer.interface.flush() catch {};
         try stdout_writer.interface.writeAll(
-            "zig-ai: minimal terminal AI chat\n" ++
-                "Usage: zig-ai\n" ++
+            "zolt: minimal terminal AI chat\n" ++
+                "Usage: zolt\n" ++
                 "Requires an interactive TTY.\n",
         );
         return;
@@ -72,7 +72,7 @@ pub fn main() !void {
             var output_buffer: [1024]u8 = undefined;
             var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
             defer stderr_writer.interface.flush() catch {};
-            try stderr_writer.interface.writeAll("zig-ai requires a TTY. Run it directly in a terminal.\n");
+            try stderr_writer.interface.writeAll("zolt requires a TTY. Run it directly in a terminal.\n");
             return;
         },
         else => return err,

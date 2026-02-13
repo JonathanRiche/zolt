@@ -30,7 +30,10 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 - `/model` popup picker
 - `@` file popup picker
 - `@path` file content injection into prompt context
-- Basic read-only tool loop (`READ`) for file inspection
+- Tool loop with discovery/edit/exec primitives:
+  - `READ` (allowlisted shell read commands)
+  - `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`
+  - `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`
 
 ## Requirements
 
@@ -52,7 +55,19 @@ zig build
 zig build run
 ```
 
-3. Set a provider key (example):
+3. Install to `~/.local` (puts binary at `~/.local/bin/zolt`):
+
+```bash
+zig build install -Doptimize=ReleaseFast --prefix "$HOME/.local"
+```
+
+If `~/.local/bin` is in your `PATH`, you can then run:
+
+```bash
+zolt
+```
+
+4. Set a provider key (example):
 
 ```bash
 export OPENAI_API_KEY=...
@@ -130,13 +145,16 @@ Quoted paths are supported for spaces:
 
 Default XDG paths:
 
-- state: `~/.local/share/zig-ai/state.json`
+- state: `~/.local/share/zig-ai/workspaces/<scope>.json`
 - models cache: `~/.cache/zig-ai/models.json`
+
+`<scope>` is derived from your git root when available (or current directory otherwise),
+so conversations are automatically scoped per project/workspace.
 
 If XDG paths are unavailable/unwritable, Zolt falls back to:
 
-- `.zig-ai/data/state.json`
-- `.zig-ai/cache/models.json`
+- `<workspace-root>/.zig-ai/data/workspaces/<scope>.json`
+- `<workspace-root>/.zig-ai/cache/models.json`
 
 ## Development
 
@@ -150,7 +168,7 @@ zig fmt src/*.zig build.zig
 
 Notes:
 - `zig build test` also runs formatting checks via `build.zig`.
-- main binary name is currently `zig_ai` (project/product name is Zolt).
+- main binary name is `zolt`.
 
 ### Project Layout
 

@@ -8,10 +8,10 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [x] `READ` (`rg`, `grep`, `ls`, `cat`, etc.) with allowlist
 
 ## File/Code Discovery
-- [ ] `grep_files` first-class tool (structured grep, not shell-only)
-- [ ] `read_file` first-class tool
-- [ ] `list_dir` first-class tool
-- [ ] richer project search (`search_tool_bm25` style)
+- [x] `grep_files` first-class tool (structured grep, not shell-only)
+- [x] `read_file` first-class tool
+- [x] `list_dir` first-class tool
+- [x] richer project search (`search_tool_bm25` style)
 
 ## Planning and UX Control
 - [ ] `update_plan` equivalent
@@ -21,7 +21,7 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [ ] `list_mcp_resources`
 - [ ] `list_mcp_resource_templates`
 - [ ] `read_mcp_resource`
-- [ ] `web_search` (optional mode)
+- [x] `web_search` (optional mode)
 - [ ] `view_image` (local screenshots/assets)
 
 ## Runtime / Advanced

@@ -47,6 +47,70 @@ const WriteStdinInput = struct {
     yield_ms: u32 = COMMAND_TOOL_DEFAULT_YIELD_MS,
 };
 
+const WebSearchInput = struct {
+    query: []u8,
+    limit: u8 = WEB_SEARCH_DEFAULT_RESULTS,
+};
+
+const ListDirInput = struct {
+    path: []u8,
+    recursive: bool = false,
+    max_entries: u16 = LIST_DIR_DEFAULT_MAX_ENTRIES,
+};
+
+const ReadFileInput = struct {
+    path: []u8,
+    max_bytes: u32 = READ_FILE_DEFAULT_MAX_BYTES,
+};
+
+const GrepFilesInput = struct {
+    query: []u8,
+    path: []u8,
+    glob: ?[]u8 = null,
+    max_matches: u16 = GREP_FILES_DEFAULT_MAX_MATCHES,
+
+    fn deinit(self: *GrepFilesInput, allocator: std.mem.Allocator) void {
+        allocator.free(self.query);
+        allocator.free(self.path);
+        if (self.glob) |glob| allocator.free(glob);
+    }
+};
+
+const ProjectSearchInput = struct {
+    query: []u8,
+    path: []u8,
+    max_files: u8 = PROJECT_SEARCH_DEFAULT_MAX_FILES,
+    max_matches: u16 = PROJECT_SEARCH_DEFAULT_MAX_MATCHES,
+
+    fn deinit(self: *ProjectSearchInput, allocator: std.mem.Allocator) void {
+        allocator.free(self.query);
+        allocator.free(self.path);
+    }
+};
+
+const ProjectSearchFileHit = struct {
+    path: []u8,
+    hits: u32 = 0,
+    first_line: u32 = 0,
+    first_col: u32 = 0,
+    first_snippet: []u8,
+
+    fn deinit(self: *ProjectSearchFileHit, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.first_snippet);
+    }
+};
+
+const WebSearchResultItem = struct {
+    title: []u8,
+    url: []u8,
+
+    fn deinit(self: *WebSearchResultItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.title);
+        allocator.free(self.url);
+    }
+};
+
 const SessionDrainResult = struct {
     stdout: []u8,
     stderr: []u8,
@@ -63,18 +127,45 @@ const COMMAND_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
 const COMMAND_TOOL_DEFAULT_YIELD_MS: u32 = 700;
 const COMMAND_TOOL_MAX_YIELD_MS: u32 = 5000;
 const COMMAND_TOOL_MAX_SESSIONS: usize = 8;
+const WEB_SEARCH_DEFAULT_RESULTS: u8 = 5;
+const WEB_SEARCH_MAX_RESULTS: u8 = 10;
+const WEB_SEARCH_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const LIST_DIR_DEFAULT_MAX_ENTRIES: u16 = 200;
+const LIST_DIR_MAX_ENTRIES: u16 = 1000;
+const READ_FILE_DEFAULT_MAX_BYTES: u32 = 12 * 1024;
+const READ_FILE_MAX_BYTES: u32 = 256 * 1024;
+const GREP_FILES_DEFAULT_MAX_MATCHES: u16 = 200;
+const GREP_FILES_MAX_MATCHES: u16 = 2000;
+const GREP_FILES_MAX_OUTPUT_BYTES: usize = 128 * 1024;
+const PROJECT_SEARCH_DEFAULT_MAX_FILES: u8 = 8;
+const PROJECT_SEARCH_MAX_FILES: u8 = 24;
+const PROJECT_SEARCH_DEFAULT_MAX_MATCHES: u16 = 300;
+const PROJECT_SEARCH_MAX_MATCHES: u16 = 5000;
 const STREAM_INTERRUPT_ESC_WINDOW_MS: i64 = 1200;
 const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
 const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const TOOL_SYSTEM_PROMPT =
-    "You can use four local tools.\n" ++
+    "You can use nine local tools.\n" ++
     "When you need to inspect files, reply with ONLY:\n" ++
     "<READ>\n" ++
     "<command>\n" ++
     "</READ>\n" ++
     "Allowed commands: rg, grep, ls, cat, find, head, tail, sed, wc, stat, pwd.\n" ++
+    "Prefer these structured discovery tools when possible:\n" ++
+    "<LIST_DIR>\n" ++
+    "{\"path\":\"src\",\"recursive\":false,\"max_entries\":200}\n" ++
+    "</LIST_DIR>\n" ++
+    "<READ_FILE>\n" ++
+    "{\"path\":\"src/main.zig\",\"max_bytes\":12288}\n" ++
+    "</READ_FILE>\n" ++
+    "<GREP_FILES>\n" ++
+    "{\"query\":\"TODO\",\"path\":\"src\",\"glob\":\"*.zig\",\"max_matches\":200}\n" ++
+    "</GREP_FILES>\n" ++
+    "<PROJECT_SEARCH>\n" ++
+    "{\"query\":\"token usage\",\"path\":\".\",\"max_files\":8,\"max_matches\":300}\n" ++
+    "</PROJECT_SEARCH>\n" ++
     "When you need to edit files, reply with ONLY:\n" ++
     "<APPLY_PATCH>\n" ++
     "*** Begin Patch\n" ++
@@ -92,7 +183,11 @@ const TOOL_SYSTEM_PROMPT =
     "<WRITE_STDIN>\n" ++
     "{\"session_id\":1,\"chars\":\"pwd\\n\",\"yield_ms\":700}\n" ++
     "</WRITE_STDIN>\n" ++
-    "After a system message that starts with [read-result], [apply-patch-result], [exec-result], or [write-stdin-result], continue the answer normally.";
+    "For web search, use:\n" ++
+    "<WEB_SEARCH>\n" ++
+    "{\"query\":\"zig 0.15 release notes\",\"limit\":5}\n" ++
+    "</WEB_SEARCH>\n" ++
+    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], or [web-search-result], continue the answer normally.";
 
 const RawMode = struct {
     original_termios: std.posix.termios,
@@ -504,6 +599,54 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNoticeFmt("Ran READ command: {s}", .{read_command_owned});
                 },
+                .list_dir => |list_dir_payload| {
+                    const payload_owned = try self.allocator.dupe(u8, list_dir_payload);
+                    defer self.allocator.free(payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] LIST_DIR");
+
+                    const tool_result = try self.runListDirToolPayload(payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran LIST_DIR tool");
+                },
+                .read_file => |read_file_payload| {
+                    const payload_owned = try self.allocator.dupe(u8, read_file_payload);
+                    defer self.allocator.free(payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] READ_FILE");
+
+                    const tool_result = try self.runReadFileToolPayload(payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran READ_FILE tool");
+                },
+                .grep_files => |grep_payload| {
+                    const payload_owned = try self.allocator.dupe(u8, grep_payload);
+                    defer self.allocator.free(payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] GREP_FILES");
+
+                    const tool_result = try self.runGrepFilesToolPayload(payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran GREP_FILES tool");
+                },
+                .project_search => |project_search_payload| {
+                    const payload_owned = try self.allocator.dupe(u8, project_search_payload);
+                    defer self.allocator.free(payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] PROJECT_SEARCH");
+
+                    const tool_result = try self.runProjectSearchToolPayload(payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran PROJECT_SEARCH tool");
+                },
                 .apply_patch => |patch_text| {
                     const patch_text_owned = try self.allocator.dupe(u8, patch_text);
                     defer self.allocator.free(patch_text_owned);
@@ -539,6 +682,18 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran WRITE_STDIN tool");
+                },
+                .web_search => |web_search_payload| {
+                    const web_search_payload_owned = try self.allocator.dupe(u8, web_search_payload);
+                    defer self.allocator.free(web_search_payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] WEB_SEARCH");
+
+                    const tool_result = try self.runWebSearchToolPayload(web_search_payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran WEB_SEARCH tool");
                 },
             }
             try self.render();
@@ -728,6 +883,355 @@ const App = struct {
         return output.toOwnedSlice();
     }
 
+    fn runListDirToolPayload(self: *App, payload: []const u8) ![]u8 {
+        const input = parseListDirInput(self.allocator, payload) catch {
+            return self.allocator.dupe(u8, "[list-dir-result]\nerror: invalid payload (expected plain path or JSON with path, recursive, max_entries)");
+        };
+        defer self.allocator.free(input.path);
+
+        var dir = openDirForPath(input.path, .{ .iterate = true }) catch |err| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[list-dir-result]\npath: {s}\nerror: {s}",
+                .{ input.path, @errorName(err) },
+            );
+        };
+        defer dir.close();
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+        try output.writer.print(
+            "[list-dir-result]\npath: {s}\nrecursive: {s}\nmax_entries: {d}\n",
+            .{ input.path, if (input.recursive) "true" else "false", input.max_entries },
+        );
+
+        var count: u32 = 0;
+        var truncated = false;
+
+        if (input.recursive) {
+            var walker = try dir.walk(self.allocator);
+            defer walker.deinit();
+
+            while (true) {
+                const entry = walker.next() catch |err| {
+                    try output.writer.print("error: {s}\n", .{@errorName(err)});
+                    break;
+                };
+                if (entry == null) break;
+
+                if (count >= input.max_entries) {
+                    truncated = true;
+                    break;
+                }
+                count += 1;
+                try output.writer.print(
+                    "{d}. [{s}] {s}\n",
+                    .{ count, dirEntryKindLabel(entry.?.kind), entry.?.path },
+                );
+            }
+        } else {
+            var iterator = dir.iterate();
+            while (true) {
+                const entry = iterator.next() catch |err| {
+                    try output.writer.print("error: {s}\n", .{@errorName(err)});
+                    break;
+                };
+                if (entry == null) break;
+
+                if (count >= input.max_entries) {
+                    truncated = true;
+                    break;
+                }
+                count += 1;
+                try output.writer.print(
+                    "{d}. [{s}] {s}\n",
+                    .{ count, dirEntryKindLabel(entry.?.kind), entry.?.name },
+                );
+            }
+        }
+
+        if (count == 0) {
+            try output.writer.writeAll("note: no entries\n");
+        }
+        if (truncated) {
+            try output.writer.writeAll("note: truncated by max_entries\n");
+        }
+
+        return output.toOwnedSlice();
+    }
+
+    fn runReadFileToolPayload(self: *App, payload: []const u8) ![]u8 {
+        const input = parseReadFileInput(self.allocator, payload) catch {
+            return self.allocator.dupe(u8, "[read-file-result]\nerror: invalid payload (expected plain path or JSON with path and optional max_bytes)");
+        };
+        defer self.allocator.free(input.path);
+
+        var file = openFileForPath(input.path, .{}) catch |err| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[read-file-result]\npath: {s}\nerror: {s}",
+                .{ input.path, @errorName(err) },
+            );
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, input.max_bytes) catch |err| switch (err) {
+            error.FileTooBig => return std.fmt.allocPrint(
+                self.allocator,
+                "[read-file-result]\npath: {s}\nerror: file too big (max_bytes:{d})",
+                .{ input.path, input.max_bytes },
+            ),
+            else => return std.fmt.allocPrint(
+                self.allocator,
+                "[read-file-result]\npath: {s}\nerror: {s}",
+                .{ input.path, @errorName(err) },
+            ),
+        };
+        defer self.allocator.free(content);
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+        try output.writer.print(
+            "[read-file-result]\npath: {s}\nbytes: {d}\n",
+            .{ input.path, content.len },
+        );
+        if (looksBinary(content)) {
+            try output.writer.writeAll("note: file appears binary; content omitted\n");
+            return output.toOwnedSlice();
+        }
+
+        try output.writer.writeAll("content:\n");
+        try output.writer.writeAll(content);
+        if (content.len == 0 or content[content.len - 1] != '\n') {
+            try output.writer.writeByte('\n');
+        }
+        return output.toOwnedSlice();
+    }
+
+    fn runGrepFilesToolPayload(self: *App, payload: []const u8) ![]u8 {
+        var input = parseGrepFilesInput(self.allocator, payload) catch {
+            return self.allocator.dupe(u8, "[grep-files-result]\nerror: invalid payload (expected plain query or JSON with query/path/glob/max_matches)");
+        };
+        defer input.deinit(self.allocator);
+
+        if (input.query.len == 0) {
+            return self.allocator.dupe(u8, "[grep-files-result]\nerror: empty query");
+        }
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(self.allocator);
+        try argv.appendSlice(self.allocator, &.{
+            "rg",
+            "--line-number",
+            "--column",
+            "--no-heading",
+            "--color",
+            "never",
+            "--smart-case",
+        });
+        if (input.glob) |glob| {
+            try argv.appendSlice(self.allocator, &.{ "--glob", glob });
+        }
+        try argv.append(self.allocator, input.query);
+        try argv.append(self.allocator, input.path);
+
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = argv.items,
+            .cwd = ".",
+            .max_output_bytes = GREP_FILES_MAX_OUTPUT_BYTES,
+        }) catch |err| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[grep-files-result]\nquery: {s}\npath: {s}\nerror: {s}",
+                .{ input.query, input.path, @errorName(err) },
+            );
+        };
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+
+        try output.writer.print("[grep-files-result]\nquery: {s}\npath: {s}\n", .{ input.query, input.path });
+        if (input.glob) |glob| try output.writer.print("glob: {s}\n", .{glob});
+
+        const exit_code = switch (result.term) {
+            .Exited => |code| code,
+            .Signal => |sig| return std.fmt.allocPrint(self.allocator, "[grep-files-result]\nerror: rg terminated by signal {d}", .{sig}),
+            .Stopped => |sig| return std.fmt.allocPrint(self.allocator, "[grep-files-result]\nerror: rg stopped by signal {d}", .{sig}),
+            .Unknown => |code| return std.fmt.allocPrint(self.allocator, "[grep-files-result]\nerror: rg unknown term {d}", .{code}),
+        };
+
+        if (exit_code == 1) {
+            try output.writer.writeAll("matches: 0\nnote: no matches\n");
+            return output.toOwnedSlice();
+        }
+        if (exit_code != 0) {
+            const stderr_trimmed = std.mem.trim(u8, result.stderr, " \t\r\n");
+            if (stderr_trimmed.len > 0) {
+                try output.writer.print("error: rg failed ({d}) {s}\n", .{ exit_code, stderr_trimmed });
+            } else {
+                try output.writer.print("error: rg failed ({d})\n", .{exit_code});
+            }
+            return output.toOwnedSlice();
+        }
+
+        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        var total_matches: u32 = 0;
+        var emitted_matches: u32 = 0;
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trimRight(u8, raw_line, "\r");
+            if (line.len == 0) continue;
+            total_matches += 1;
+            if (emitted_matches < input.max_matches) {
+                emitted_matches += 1;
+                try output.writer.print("{s}\n", .{line});
+            }
+        }
+
+        try output.writer.print("matches: {d}\n", .{total_matches});
+        if (total_matches > emitted_matches) {
+            try output.writer.print("note: truncated output ({d} hidden)\n", .{total_matches - emitted_matches});
+        }
+
+        return output.toOwnedSlice();
+    }
+
+    fn runProjectSearchToolPayload(self: *App, payload: []const u8) ![]u8 {
+        var input = parseProjectSearchInput(self.allocator, payload) catch {
+            return self.allocator.dupe(u8, "[project-search-result]\nerror: invalid payload (expected plain query or JSON with query/path/max_files/max_matches)");
+        };
+        defer input.deinit(self.allocator);
+
+        if (input.query.len == 0) {
+            return self.allocator.dupe(u8, "[project-search-result]\nerror: empty query");
+        }
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(self.allocator);
+        try argv.appendSlice(self.allocator, &.{
+            "rg",
+            "--line-number",
+            "--column",
+            "--no-heading",
+            "--color",
+            "never",
+            "--smart-case",
+            "--max-count",
+            "8",
+        });
+        try argv.append(self.allocator, input.query);
+        try argv.append(self.allocator, input.path);
+
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = argv.items,
+            .cwd = ".",
+            .max_output_bytes = GREP_FILES_MAX_OUTPUT_BYTES,
+        }) catch |err| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[project-search-result]\nquery: {s}\npath: {s}\nerror: {s}",
+                .{ input.query, input.path, @errorName(err) },
+            );
+        };
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        const exit_code = switch (result.term) {
+            .Exited => |code| code,
+            else => return self.allocator.dupe(u8, "[project-search-result]\nerror: rg did not exit cleanly"),
+        };
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+        try output.writer.print("[project-search-result]\nquery: {s}\npath: {s}\n", .{ input.query, input.path });
+
+        if (exit_code == 1) {
+            try output.writer.writeAll("files: 0\nnote: no matches\n");
+            return output.toOwnedSlice();
+        }
+        if (exit_code != 0) {
+            const stderr_trimmed = std.mem.trim(u8, result.stderr, " \t\r\n");
+            if (stderr_trimmed.len > 0) {
+                try output.writer.print("error: rg failed ({d}) {s}\n", .{ exit_code, stderr_trimmed });
+            } else {
+                try output.writer.print("error: rg failed ({d})\n", .{exit_code});
+            }
+            return output.toOwnedSlice();
+        }
+
+        var hits: std.ArrayList(ProjectSearchFileHit) = .empty;
+        defer {
+            for (hits.items) |*hit| hit.deinit(self.allocator);
+            hits.deinit(self.allocator);
+        }
+
+        var path_to_index: std.StringHashMapUnmanaged(usize) = .empty;
+        defer path_to_index.deinit(self.allocator);
+
+        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        var parsed_matches: u32 = 0;
+        while (lines.next()) |raw_line| {
+            if (parsed_matches >= input.max_matches) break;
+            const line = std.mem.trimRight(u8, raw_line, "\r");
+            if (line.len == 0) continue;
+
+            const rg_line = parseRgLine(line) orelse continue;
+            parsed_matches += 1;
+
+            if (path_to_index.get(rg_line.path)) |existing_index| {
+                const hit = &hits.items[existing_index];
+                hit.hits += 1;
+                if (rg_line.line < hit.first_line or (rg_line.line == hit.first_line and rg_line.col < hit.first_col)) {
+                    hit.first_line = rg_line.line;
+                    hit.first_col = rg_line.col;
+                    self.allocator.free(hit.first_snippet);
+                    hit.first_snippet = try self.allocator.dupe(u8, rg_line.text);
+                }
+                continue;
+            }
+
+            const new_index = hits.items.len;
+            const path_owned = try self.allocator.dupe(u8, rg_line.path);
+            errdefer self.allocator.free(path_owned);
+            const snippet_owned = try self.allocator.dupe(u8, rg_line.text);
+            errdefer self.allocator.free(snippet_owned);
+
+            try hits.append(self.allocator, .{
+                .path = path_owned,
+                .hits = 1,
+                .first_line = rg_line.line,
+                .first_col = rg_line.col,
+                .first_snippet = snippet_owned,
+            });
+            try path_to_index.put(self.allocator, hits.items[new_index].path, new_index);
+        }
+
+        if (hits.items.len == 0) {
+            try output.writer.writeAll("files: 0\nnote: no parseable matches\n");
+            return output.toOwnedSlice();
+        }
+
+        std.sort.pdq(ProjectSearchFileHit, hits.items, {}, projectSearchHitLessThan);
+
+        const shown = @min(hits.items.len, @as(usize, input.max_files));
+        try output.writer.print("files: {d}\n", .{hits.items.len});
+        for (hits.items[0..shown], 0..) |hit, index| {
+            const snippet = std.mem.trim(u8, hit.first_snippet, " \t\r\n");
+            try output.writer.print(
+                "{d}. {s} (hits:{d})\n   first: {d}:{d}: {s}\n",
+                .{ index + 1, hit.path, hit.hits, hit.first_line, hit.first_col, snippet },
+            );
+        }
+        if (hits.items.len > shown) {
+            try output.writer.print("note: omitted {d} files\n", .{hits.items.len - shown});
+        }
+
+        return output.toOwnedSlice();
+    }
+
     fn runApplyPatchToolPatch(self: *App, patch_text: []const u8) ![]u8 {
         const trimmed_patch = std.mem.trim(u8, patch_text, " \t\r\n");
         if (trimmed_patch.len == 0) {
@@ -871,6 +1375,110 @@ const App = struct {
         });
         try self.appendCommandSessionStateLine(&output.writer, session);
         try self.appendCommandDrainOutput(&output.writer, drained);
+        return output.toOwnedSlice();
+    }
+
+    fn runWebSearchToolPayload(self: *App, payload: []const u8) ![]u8 {
+        const input = parseWebSearchInput(self.allocator, payload) catch {
+            return self.allocator.dupe(u8, "[web-search-result]\nerror: invalid payload (expected plain query text or JSON with query and optional limit)");
+        };
+        defer self.allocator.free(input.query);
+
+        if (input.query.len == 0) {
+            return self.allocator.dupe(u8, "[web-search-result]\nerror: empty query");
+        }
+
+        var encoded_query_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer encoded_query_writer.deinit();
+        try (std.Uri.Component{ .raw = input.query }).formatQuery(&encoded_query_writer.writer);
+        const encoded_query = try encoded_query_writer.toOwnedSlice();
+        defer self.allocator.free(encoded_query);
+
+        const endpoint = try std.fmt.allocPrint(
+            self.allocator,
+            "https://duckduckgo.com/html/?q={s}&kl=us-en",
+            .{encoded_query},
+        );
+        defer self.allocator.free(endpoint);
+
+        var client: std.http.Client = .{ .allocator = self.allocator };
+        defer client.deinit();
+
+        var response_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer response_writer.deinit();
+
+        const fetch_result = client.fetch(.{
+            .location = .{ .url = endpoint },
+            .method = .GET,
+            .headers = .{
+                .user_agent = .{ .override = "Zolt/0.1" },
+            },
+            .response_writer = &response_writer.writer,
+            .keep_alive = false,
+        }) catch |err| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[web-search-result]\nquery: {s}\nerror: {s}",
+                .{ input.query, @errorName(err) },
+            );
+        };
+
+        if (fetch_result.status != .ok) {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[web-search-result]\nquery: {s}\nerror: http status {s}",
+                .{ input.query, @tagName(fetch_result.status) },
+            );
+        }
+
+        const html_body = try response_writer.toOwnedSlice();
+        defer self.allocator.free(html_body);
+
+        if (html_body.len == 0) {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[web-search-result]\nquery: {s}\nerror: empty response body",
+                .{input.query},
+            );
+        }
+
+        if (html_body.len > WEB_SEARCH_MAX_RESPONSE_BYTES) {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[web-search-result]\nquery: {s}\nerror: response too large ({d} bytes)",
+                .{ input.query, html_body.len },
+            );
+        }
+
+        const results = parseDuckDuckGoHtmlResults(self.allocator, html_body, input.limit) catch |err| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[web-search-result]\nquery: {s}\nerror: parse failed ({s})",
+                .{ input.query, @errorName(err) },
+            );
+        };
+        defer {
+            for (results) |*item| item.deinit(self.allocator);
+            self.allocator.free(results);
+        }
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+
+        try output.writer.print(
+            "[web-search-result]\nengine: duckduckgo\nquery: {s}\nresults: {d}\n",
+            .{ input.query, results.len },
+        );
+
+        for (results, 0..) |item, index| {
+            try output.writer.print("{d}. {s}\n", .{ index + 1, item.title });
+            try output.writer.print("   url: {s}\n", .{item.url});
+        }
+
+        if (results.len == 0) {
+            try output.writer.writeAll("note: no results found\n");
+        }
+
         return output.toOwnedSlice();
     }
 
@@ -1225,7 +1833,7 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  input: use @path, pickers: Ctrl-N/P + Enter, assistant tools: <READ>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>");
+            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  input: use @path, pickers: Ctrl-N/P + Enter, assistant tools: <READ>, <LIST_DIR>, <READ_FILE>, <GREP_FILES>, <PROJECT_SEARCH>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>, <WEB_SEARCH>");
             return;
         }
 
@@ -2678,17 +3286,37 @@ fn registerStreamInterruptByte(
 
 const AssistantToolCall = union(enum) {
     read: []const u8,
+    list_dir: []const u8,
+    read_file: []const u8,
+    grep_files: []const u8,
+    project_search: []const u8,
     apply_patch: []const u8,
     exec_command: []const u8,
     write_stdin: []const u8,
+    web_search: []const u8,
 };
 
 fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
+    if (parseListDirToolPayload(text)) |payload| {
+        return .{ .list_dir = payload };
+    }
+    if (parseReadFileToolPayload(text)) |payload| {
+        return .{ .read_file = payload };
+    }
+    if (parseGrepFilesToolPayload(text)) |payload| {
+        return .{ .grep_files = payload };
+    }
+    if (parseProjectSearchToolPayload(text)) |payload| {
+        return .{ .project_search = payload };
+    }
     if (parseExecCommandToolPayload(text)) |payload| {
         return .{ .exec_command = payload };
     }
     if (parseWriteStdinToolPayload(text)) |payload| {
         return .{ .write_stdin = payload };
+    }
+    if (parseWebSearchToolPayload(text)) |payload| {
+        return .{ .web_search = payload };
     }
     if (parseReadToolCommand(text)) |command| {
         return .{ .read = command };
@@ -2696,6 +3324,86 @@ fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
     if (parseApplyPatchToolPayload(text)) |patch_text| {
         return .{ .apply_patch = patch_text };
     }
+    return null;
+}
+
+fn parseListDirToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<LIST_DIR>")) {
+        const rest = trimmed["<LIST_DIR>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</LIST_DIR>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```list_dir")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    return null;
+}
+
+fn parseReadFileToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<READ_FILE>")) {
+        const rest = trimmed["<READ_FILE>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</READ_FILE>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```read_file")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    return null;
+}
+
+fn parseGrepFilesToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<GREP_FILES>")) {
+        const rest = trimmed["<GREP_FILES>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</GREP_FILES>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```grep_files")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    return null;
+}
+
+fn parseProjectSearchToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<PROJECT_SEARCH>")) {
+        const rest = trimmed["<PROJECT_SEARCH>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</PROJECT_SEARCH>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```project_search")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
     return null;
 }
 
@@ -2758,6 +3466,26 @@ fn parseWriteStdinToolPayload(text: []const u8) ?[]const u8 {
     }
 
     if (std.mem.startsWith(u8, trimmed, "```write_stdin")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    return null;
+}
+
+fn parseWebSearchToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<WEB_SEARCH>")) {
+        const rest = trimmed["<WEB_SEARCH>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</WEB_SEARCH>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```web_search")) {
         const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
         const body = trimmed[first_newline + 1 ..];
         const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
@@ -2868,6 +3596,405 @@ fn parseWriteStdinInput(allocator: std.mem.Allocator, payload: []const u8) !Writ
     };
 }
 
+fn parseWebSearchInput(allocator: std.mem.Allocator, payload: []const u8) !WebSearchInput {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidToolPayload;
+
+    if (trimmed[0] != '{') {
+        return .{
+            .query = try allocator.dupe(u8, trimmed),
+            .limit = WEB_SEARCH_DEFAULT_RESULTS,
+        };
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidToolPayload,
+    };
+
+    const query_value = object.get("query") orelse object.get("q") orelse return error.InvalidToolPayload;
+    const query = switch (query_value) {
+        .string => |text| text,
+        else => return error.InvalidToolPayload,
+    };
+
+    const limit = sanitizeWebSearchLimit(
+        jsonFieldU32(object, "limit") orelse
+            jsonFieldU32(object, "count") orelse
+            jsonFieldU32(object, "max_results") orelse
+            WEB_SEARCH_DEFAULT_RESULTS,
+    );
+
+    return .{
+        .query = try allocator.dupe(u8, std.mem.trim(u8, query, " \t\r\n")),
+        .limit = limit,
+    };
+}
+
+fn parseListDirInput(allocator: std.mem.Allocator, payload: []const u8) !ListDirInput {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidToolPayload;
+
+    if (trimmed[0] != '{') {
+        return .{
+            .path = try allocator.dupe(u8, trimmed),
+            .recursive = false,
+            .max_entries = LIST_DIR_DEFAULT_MAX_ENTRIES,
+        };
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidToolPayload,
+    };
+
+    const path = if (object.get("path")) |value| switch (value) {
+        .string => |text| text,
+        else => return error.InvalidToolPayload,
+    } else ".";
+
+    return .{
+        .path = try allocator.dupe(u8, std.mem.trim(u8, path, " \t\r\n")),
+        .recursive = jsonFieldBool(object, "recursive") orelse false,
+        .max_entries = sanitizeListDirMaxEntries(
+            jsonFieldU32(object, "max_entries") orelse
+                jsonFieldU32(object, "limit") orelse
+                LIST_DIR_DEFAULT_MAX_ENTRIES,
+        ),
+    };
+}
+
+fn parseReadFileInput(allocator: std.mem.Allocator, payload: []const u8) !ReadFileInput {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidToolPayload;
+
+    if (trimmed[0] != '{') {
+        return .{
+            .path = try allocator.dupe(u8, trimmed),
+            .max_bytes = READ_FILE_DEFAULT_MAX_BYTES,
+        };
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidToolPayload,
+    };
+
+    const path_value = object.get("path") orelse object.get("file") orelse return error.InvalidToolPayload;
+    const path = switch (path_value) {
+        .string => |text| text,
+        else => return error.InvalidToolPayload,
+    };
+
+    const max_bytes = sanitizeReadFileMaxBytes(
+        jsonFieldU32(object, "max_bytes") orelse
+            jsonFieldU32(object, "limit") orelse
+            READ_FILE_DEFAULT_MAX_BYTES,
+    );
+
+    return .{
+        .path = try allocator.dupe(u8, std.mem.trim(u8, path, " \t\r\n")),
+        .max_bytes = max_bytes,
+    };
+}
+
+fn parseGrepFilesInput(allocator: std.mem.Allocator, payload: []const u8) !GrepFilesInput {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidToolPayload;
+
+    if (trimmed[0] != '{') {
+        return .{
+            .query = try allocator.dupe(u8, trimmed),
+            .path = try allocator.dupe(u8, "."),
+            .glob = null,
+            .max_matches = GREP_FILES_DEFAULT_MAX_MATCHES,
+        };
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidToolPayload,
+    };
+
+    const query_value = object.get("query") orelse object.get("q") orelse object.get("pattern") orelse return error.InvalidToolPayload;
+    const query = switch (query_value) {
+        .string => |text| text,
+        else => return error.InvalidToolPayload,
+    };
+
+    const path = if (object.get("path")) |value| switch (value) {
+        .string => |text| text,
+        else => return error.InvalidToolPayload,
+    } else ".";
+
+    const glob = if (object.get("glob")) |value| switch (value) {
+        .string => |text| text,
+        else => return error.InvalidToolPayload,
+    } else null;
+
+    return .{
+        .query = try allocator.dupe(u8, std.mem.trim(u8, query, " \t\r\n")),
+        .path = try allocator.dupe(u8, std.mem.trim(u8, path, " \t\r\n")),
+        .glob = if (glob) |g| try allocator.dupe(u8, std.mem.trim(u8, g, " \t\r\n")) else null,
+        .max_matches = sanitizeGrepMatches(
+            jsonFieldU32(object, "max_matches") orelse
+                jsonFieldU32(object, "limit") orelse
+                GREP_FILES_DEFAULT_MAX_MATCHES,
+        ),
+    };
+}
+
+fn parseProjectSearchInput(allocator: std.mem.Allocator, payload: []const u8) !ProjectSearchInput {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidToolPayload;
+
+    if (trimmed[0] != '{') {
+        return .{
+            .query = try allocator.dupe(u8, trimmed),
+            .path = try allocator.dupe(u8, "."),
+            .max_files = PROJECT_SEARCH_DEFAULT_MAX_FILES,
+            .max_matches = PROJECT_SEARCH_DEFAULT_MAX_MATCHES,
+        };
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidToolPayload,
+    };
+
+    const query_value = object.get("query") orelse object.get("q") orelse return error.InvalidToolPayload;
+    const query = switch (query_value) {
+        .string => |text| text,
+        else => return error.InvalidToolPayload,
+    };
+
+    const path = if (object.get("path")) |value| switch (value) {
+        .string => |text| text,
+        else => return error.InvalidToolPayload,
+    } else ".";
+
+    return .{
+        .query = try allocator.dupe(u8, std.mem.trim(u8, query, " \t\r\n")),
+        .path = try allocator.dupe(u8, std.mem.trim(u8, path, " \t\r\n")),
+        .max_files = sanitizeProjectSearchMaxFiles(
+            jsonFieldU32(object, "max_files") orelse
+                jsonFieldU32(object, "limit") orelse
+                PROJECT_SEARCH_DEFAULT_MAX_FILES,
+        ),
+        .max_matches = sanitizeProjectSearchMatches(
+            jsonFieldU32(object, "max_matches") orelse
+                jsonFieldU32(object, "max_hits") orelse
+                PROJECT_SEARCH_DEFAULT_MAX_MATCHES,
+        ),
+    };
+}
+
+fn sanitizeListDirMaxEntries(limit: u32) u16 {
+    if (limit == 0) return LIST_DIR_DEFAULT_MAX_ENTRIES;
+    return @as(u16, @intCast(@min(limit, LIST_DIR_MAX_ENTRIES)));
+}
+
+fn sanitizeReadFileMaxBytes(limit: u32) u32 {
+    if (limit == 0) return READ_FILE_DEFAULT_MAX_BYTES;
+    return @min(limit, READ_FILE_MAX_BYTES);
+}
+
+fn sanitizeGrepMatches(limit: u32) u16 {
+    if (limit == 0) return GREP_FILES_DEFAULT_MAX_MATCHES;
+    return @as(u16, @intCast(@min(limit, GREP_FILES_MAX_MATCHES)));
+}
+
+fn sanitizeProjectSearchMaxFiles(limit: u32) u8 {
+    if (limit == 0) return PROJECT_SEARCH_DEFAULT_MAX_FILES;
+    return @as(u8, @intCast(@min(limit, PROJECT_SEARCH_MAX_FILES)));
+}
+
+fn sanitizeProjectSearchMatches(limit: u32) u16 {
+    if (limit == 0) return PROJECT_SEARCH_DEFAULT_MAX_MATCHES;
+    return @as(u16, @intCast(@min(limit, PROJECT_SEARCH_MAX_MATCHES)));
+}
+
+fn sanitizeWebSearchLimit(limit: u32) u8 {
+    if (limit == 0) return WEB_SEARCH_DEFAULT_RESULTS;
+    const clamped = @min(limit, WEB_SEARCH_MAX_RESULTS);
+    return @as(u8, @intCast(clamped));
+}
+
+fn parseDuckDuckGoHtmlResults(
+    allocator: std.mem.Allocator,
+    html: []const u8,
+    limit: u8,
+) ![]WebSearchResultItem {
+    var results: std.ArrayList(WebSearchResultItem) = .empty;
+    errdefer {
+        for (results.items) |*item| item.deinit(allocator);
+        results.deinit(allocator);
+    }
+
+    var cursor: usize = 0;
+    while (results.items.len < @as(usize, limit)) {
+        const marker = std.mem.indexOfPos(u8, html, cursor, "result__a") orelse break;
+        const tag_start = std.mem.lastIndexOfScalar(u8, html[0..marker], '<') orelse {
+            cursor = marker + "result__a".len;
+            continue;
+        };
+        const tag_end = std.mem.indexOfScalarPos(u8, html, marker, '>') orelse break;
+        if (tag_start + 2 > tag_end or html[tag_start + 1] != 'a') {
+            cursor = marker + "result__a".len;
+            continue;
+        }
+
+        const close_anchor = std.mem.indexOfPos(u8, html, tag_end + 1, "</a>") orelse break;
+        const tag = html[tag_start .. tag_end + 1];
+        const href_raw = extractAnchorHref(tag) orelse {
+            cursor = close_anchor + "</a>".len;
+            continue;
+        };
+
+        const title_raw = html[tag_end + 1 .. close_anchor];
+        const title = try stripHtmlTagsAndDecodeAlloc(allocator, title_raw);
+        errdefer allocator.free(title);
+        if (title.len == 0) {
+            allocator.free(title);
+            cursor = close_anchor + "</a>".len;
+            continue;
+        }
+
+        const href_decoded = try decodeHtmlEntitiesAlloc(allocator, href_raw);
+        defer allocator.free(href_decoded);
+        const normalized_url = try normalizeSearchResultUrlAlloc(allocator, href_decoded);
+
+        try results.append(allocator, .{
+            .title = title,
+            .url = normalized_url,
+        });
+
+        cursor = close_anchor + "</a>".len;
+    }
+
+    return results.toOwnedSlice(allocator);
+}
+
+fn extractAnchorHref(anchor_tag: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, anchor_tag, "href=\"")) |href_start| {
+        const start = href_start + "href=\"".len;
+        const end = std.mem.indexOfScalarPos(u8, anchor_tag, start, '"') orelse return null;
+        return anchor_tag[start..end];
+    }
+    if (std.mem.indexOf(u8, anchor_tag, "href='")) |href_start| {
+        const start = href_start + "href='".len;
+        const end = std.mem.indexOfScalarPos(u8, anchor_tag, start, '\'') orelse return null;
+        return anchor_tag[start..end];
+    }
+    return null;
+}
+
+fn stripHtmlTagsAndDecodeAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var stripped_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stripped_writer.deinit();
+
+    var in_tag = false;
+    for (text) |byte| {
+        if (byte == '<') {
+            in_tag = true;
+            continue;
+        }
+        if (byte == '>') {
+            in_tag = false;
+            continue;
+        }
+        if (!in_tag) try stripped_writer.writer.writeByte(byte);
+    }
+
+    const stripped = try stripped_writer.toOwnedSlice();
+    defer allocator.free(stripped);
+    return decodeHtmlEntitiesAlloc(allocator, std.mem.trim(u8, stripped, " \t\r\n"));
+}
+
+fn decodeHtmlEntitiesAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '&') {
+            const tail = text[i..];
+            if (std.mem.startsWith(u8, tail, "&amp;")) {
+                try out.writer.writeByte('&');
+                i += "&amp;".len;
+                continue;
+            }
+            if (std.mem.startsWith(u8, tail, "&quot;")) {
+                try out.writer.writeByte('"');
+                i += "&quot;".len;
+                continue;
+            }
+            if (std.mem.startsWith(u8, tail, "&#39;")) {
+                try out.writer.writeByte('\'');
+                i += "&#39;".len;
+                continue;
+            }
+            if (std.mem.startsWith(u8, tail, "&lt;")) {
+                try out.writer.writeByte('<');
+                i += "&lt;".len;
+                continue;
+            }
+            if (std.mem.startsWith(u8, tail, "&gt;")) {
+                try out.writer.writeByte('>');
+                i += "&gt;".len;
+                continue;
+            }
+        }
+
+        try out.writer.writeByte(text[i]);
+        i += 1;
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn normalizeSearchResultUrlAlloc(allocator: std.mem.Allocator, href: []const u8) ![]u8 {
+    if (try decodeDuckDuckGoRedirectUrlAlloc(allocator, href)) |decoded_target| {
+        return decoded_target;
+    }
+
+    if (std.mem.startsWith(u8, href, "//")) {
+        return std.fmt.allocPrint(allocator, "https:{s}", .{href});
+    }
+
+    return allocator.dupe(u8, href);
+}
+
+fn decodeDuckDuckGoRedirectUrlAlloc(allocator: std.mem.Allocator, href: []const u8) !?[]u8 {
+    if (std.mem.indexOf(u8, href, "duckduckgo.com/l/?") == null) return null;
+
+    const param_index = std.mem.indexOf(u8, href, "uddg=") orelse return null;
+    const value_start = param_index + "uddg=".len;
+    const remaining = href[value_start..];
+    const value_end = std.mem.indexOfScalar(u8, remaining, '&') orelse remaining.len;
+    const encoded_target = remaining[0..value_end];
+
+    const decoded_buffer = try allocator.dupe(u8, encoded_target);
+    defer allocator.free(decoded_buffer);
+    const decoded = std.Uri.percentDecodeInPlace(decoded_buffer);
+    return @as(?[]u8, try allocator.dupe(u8, decoded));
+}
+
 fn sanitizeCommandYieldMs(input_ms: u32) u32 {
     if (input_ms == 0) return 1;
     return @min(input_ms, COMMAND_TOOL_MAX_YIELD_MS);
@@ -2879,6 +4006,19 @@ fn jsonFieldU32(object: std.json.ObjectMap, key: []const u8) ?u32 {
         .integer => |number| if (number >= 0 and number <= std.math.maxInt(u32)) @as(u32, @intCast(number)) else null,
         .number_string => |number| std.fmt.parseInt(u32, number, 10) catch null,
         .float => |number| if (number >= 0 and number <= @as(f64, @floatFromInt(std.math.maxInt(u32)))) @as(u32, @intFromFloat(number)) else null,
+        else => null,
+    };
+}
+
+fn jsonFieldBool(object: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .bool => |flag| flag,
+        .string => |text| blk: {
+            if (std.ascii.eqlIgnoreCase(text, "true") or std.mem.eql(u8, text, "1")) break :blk true;
+            if (std.ascii.eqlIgnoreCase(text, "false") or std.mem.eql(u8, text, "0")) break :blk false;
+            break :blk null;
+        },
         else => null,
     };
 }
@@ -3134,12 +4274,65 @@ fn trimMatchingOuterQuotes(text: []const u8) []const u8 {
 }
 
 fn readFileForInjection(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var file = try openFileForPath(path, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, FILE_INJECT_MAX_FILE_BYTES);
+}
+
+fn openDirForPath(path: []const u8, flags: std.fs.Dir.OpenOptions) !std.fs.Dir {
     if (std.fs.path.isAbsolute(path)) {
-        var file = try std.fs.openFileAbsolute(path, .{});
-        defer file.close();
-        return file.readToEndAlloc(allocator, FILE_INJECT_MAX_FILE_BYTES);
+        return std.fs.openDirAbsolute(path, flags);
     }
-    return std.fs.cwd().readFileAlloc(allocator, path, FILE_INJECT_MAX_FILE_BYTES);
+    return std.fs.cwd().openDir(path, flags);
+}
+
+fn openFileForPath(path: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.openFileAbsolute(path, flags);
+    }
+    return std.fs.cwd().openFile(path, flags);
+}
+
+fn dirEntryKindLabel(kind: std.fs.Dir.Entry.Kind) []const u8 {
+    return switch (kind) {
+        .directory => "dir",
+        .file => "file",
+        .sym_link => "link",
+        .named_pipe => "pipe",
+        .character_device => "char",
+        .block_device => "block",
+        .unix_domain_socket => "sock",
+        else => "other",
+    };
+}
+
+const ParsedRgLine = struct {
+    path: []const u8,
+    line: u32,
+    col: u32,
+    text: []const u8,
+};
+
+fn parseRgLine(line: []const u8) ?ParsedRgLine {
+    const first = std.mem.indexOfScalar(u8, line, ':') orelse return null;
+    const second = std.mem.indexOfScalarPos(u8, line, first + 1, ':') orelse return null;
+    const third = std.mem.indexOfScalarPos(u8, line, second + 1, ':') orelse return null;
+    if (first == 0 or second <= first + 1 or third <= second + 1) return null;
+
+    const line_no = std.fmt.parseInt(u32, line[first + 1 .. second], 10) catch return null;
+    const col_no = std.fmt.parseInt(u32, line[second + 1 .. third], 10) catch return null;
+    return .{
+        .path = line[0..first],
+        .line = line_no,
+        .col = col_no,
+        .text = line[third + 1 ..],
+    };
+}
+
+fn projectSearchHitLessThan(_: void, lhs: ProjectSearchFileHit, rhs: ProjectSearchFileHit) bool {
+    if (lhs.hits != rhs.hits) return lhs.hits > rhs.hits;
+    if (lhs.first_line != rhs.first_line) return lhs.first_line < rhs.first_line;
+    return std.mem.lessThan(u8, lhs.path, rhs.path);
 }
 
 fn looksBinary(content: []const u8) bool {
@@ -3242,6 +4435,25 @@ test "parseReadToolCommand extracts command formats" {
     try std.testing.expect(parseReadToolCommand("normal assistant text") == null);
 }
 
+test "parse list/read/grep/project tool payload formats" {
+    try std.testing.expectEqualStrings(
+        "{\"path\":\"src\",\"recursive\":true}",
+        parseListDirToolPayload("<LIST_DIR>\n{\"path\":\"src\",\"recursive\":true}\n</LIST_DIR>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"path\":\"src/main.zig\"}",
+        parseReadFileToolPayload("```read_file\n{\"path\":\"src/main.zig\"}\n```").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"query\":\"TODO\",\"path\":\"src\"}",
+        parseGrepFilesToolPayload("<GREP_FILES>\n{\"query\":\"TODO\",\"path\":\"src\"}\n</GREP_FILES>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"query\":\"provider\",\"max_files\":4}",
+        parseProjectSearchToolPayload("```project_search\n{\"query\":\"provider\",\"max_files\":4}\n```").?,
+    );
+}
+
 test "parseExecCommandToolPayload extracts xml and fenced formats" {
     try std.testing.expectEqualStrings(
         "{\"cmd\":\"ls -la\"}",
@@ -3264,6 +4476,18 @@ test "parseWriteStdinToolPayload extracts xml and fenced formats" {
         parseWriteStdinToolPayload("```write_stdin\n{\"session_id\":2,\"chars\":\"exit\\n\"}\n```").?,
     );
     try std.testing.expect(parseWriteStdinToolPayload("no tool") == null);
+}
+
+test "parseWebSearchToolPayload extracts xml and fenced formats" {
+    try std.testing.expectEqualStrings(
+        "{\"query\":\"zig build system\",\"limit\":3}",
+        parseWebSearchToolPayload("<WEB_SEARCH>\n{\"query\":\"zig build system\",\"limit\":3}\n</WEB_SEARCH>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"query\":\"ziglang docs\"}",
+        parseWebSearchToolPayload("```web_search\n{\"query\":\"ziglang docs\"}\n```").?,
+    );
+    try std.testing.expect(parseWebSearchToolPayload("no tool") == null);
 }
 
 test "parseExecCommandInput parses json and plain command" {
@@ -3292,6 +4516,122 @@ test "parseWriteStdinInput parses json payload" {
     try std.testing.expectEqual(@as(u32, 9), input.session_id);
     try std.testing.expectEqualStrings("echo hi\n", input.chars);
     try std.testing.expectEqual(@as(u32, 300), input.yield_ms);
+}
+
+test "parseWebSearchInput parses json and plain query" {
+    const allocator = std.testing.allocator;
+
+    const json_input = try parseWebSearchInput(
+        allocator,
+        "{\"query\":\"zig allocator tutorial\",\"limit\":12}",
+    );
+    defer allocator.free(json_input.query);
+    try std.testing.expectEqualStrings("zig allocator tutorial", json_input.query);
+    try std.testing.expectEqual(@as(u8, WEB_SEARCH_MAX_RESULTS), json_input.limit);
+
+    const plain_input = try parseWebSearchInput(allocator, "zig async await");
+    defer allocator.free(plain_input.query);
+    try std.testing.expectEqualStrings("zig async await", plain_input.query);
+    try std.testing.expectEqual(@as(u8, WEB_SEARCH_DEFAULT_RESULTS), plain_input.limit);
+}
+
+test "parseListDirInput parses json and plain payloads" {
+    const allocator = std.testing.allocator;
+
+    const json_input = try parseListDirInput(
+        allocator,
+        "{\"path\":\"src\",\"recursive\":true,\"max_entries\":2048}",
+    );
+    defer allocator.free(json_input.path);
+    try std.testing.expectEqualStrings("src", json_input.path);
+    try std.testing.expect(json_input.recursive);
+    try std.testing.expectEqual(@as(u16, LIST_DIR_MAX_ENTRIES), json_input.max_entries);
+
+    const plain_input = try parseListDirInput(allocator, ".");
+    defer allocator.free(plain_input.path);
+    try std.testing.expectEqualStrings(".", plain_input.path);
+    try std.testing.expect(!plain_input.recursive);
+}
+
+test "parseReadFileInput parses json and plain payloads" {
+    const allocator = std.testing.allocator;
+
+    const json_input = try parseReadFileInput(
+        allocator,
+        "{\"path\":\"src/main.zig\",\"max_bytes\":999999}",
+    );
+    defer allocator.free(json_input.path);
+    try std.testing.expectEqualStrings("src/main.zig", json_input.path);
+    try std.testing.expectEqual(@as(u32, READ_FILE_MAX_BYTES), json_input.max_bytes);
+
+    const plain_input = try parseReadFileInput(allocator, "README.md");
+    defer allocator.free(plain_input.path);
+    try std.testing.expectEqualStrings("README.md", plain_input.path);
+}
+
+test "parseGrepFilesInput parses json and plain payloads" {
+    const allocator = std.testing.allocator;
+
+    var json_input = try parseGrepFilesInput(
+        allocator,
+        "{\"query\":\"TODO\",\"path\":\"src\",\"glob\":\"*.zig\",\"max_matches\":99999}",
+    );
+    defer json_input.deinit(allocator);
+    try std.testing.expectEqualStrings("TODO", json_input.query);
+    try std.testing.expectEqualStrings("src", json_input.path);
+    try std.testing.expectEqualStrings("*.zig", json_input.glob.?);
+    try std.testing.expectEqual(@as(u16, GREP_FILES_MAX_MATCHES), json_input.max_matches);
+
+    var plain_input = try parseGrepFilesInput(allocator, "token usage");
+    defer plain_input.deinit(allocator);
+    try std.testing.expectEqualStrings("token usage", plain_input.query);
+    try std.testing.expectEqualStrings(".", plain_input.path);
+}
+
+test "parseProjectSearchInput parses json and plain payloads" {
+    const allocator = std.testing.allocator;
+
+    var json_input = try parseProjectSearchInput(
+        allocator,
+        "{\"query\":\"provider\",\"path\":\"src\",\"max_files\":99,\"max_matches\":99999}",
+    );
+    defer json_input.deinit(allocator);
+    try std.testing.expectEqualStrings("provider", json_input.query);
+    try std.testing.expectEqualStrings("src", json_input.path);
+    try std.testing.expectEqual(@as(u8, PROJECT_SEARCH_MAX_FILES), json_input.max_files);
+    try std.testing.expectEqual(@as(u16, PROJECT_SEARCH_MAX_MATCHES), json_input.max_matches);
+
+    var plain_input = try parseProjectSearchInput(allocator, "stream");
+    defer plain_input.deinit(allocator);
+    try std.testing.expectEqualStrings("stream", plain_input.query);
+    try std.testing.expectEqualStrings(".", plain_input.path);
+}
+
+test "parseRgLine extracts path line column and text" {
+    const parsed = parseRgLine("src/main.zig:42:7:hello world").?;
+    try std.testing.expectEqualStrings("src/main.zig", parsed.path);
+    try std.testing.expectEqual(@as(u32, 42), parsed.line);
+    try std.testing.expectEqual(@as(u32, 7), parsed.col);
+    try std.testing.expectEqualStrings("hello world", parsed.text);
+}
+
+test "parseDuckDuckGoHtmlResults extracts titles and urls" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<div><a rel=\"nofollow\" class=\"result__a\" href=\"https://example.com/path?a=1&amp;b=2\">Example &amp; One</a></div>\n" ++
+        "<div><a class=\"result__a\" href=\"https://duckduckgo.com/l/?uddg=https%3A%2F%2Fziglang.org%2Flearn\">Zig Learn</a></div>\n";
+
+    const results = try parseDuckDuckGoHtmlResults(allocator, html, 5);
+    defer {
+        for (results) |*item| item.deinit(allocator);
+        allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("Example & One", results[0].title);
+    try std.testing.expectEqualStrings("https://example.com/path?a=1&b=2", results[0].url);
+    try std.testing.expectEqualStrings("Zig Learn", results[1].title);
+    try std.testing.expectEqualStrings("https://ziglang.org/learn", results[1].url);
 }
 
 test "parseApplyPatchToolPayload extracts codex patch formats" {
@@ -3324,10 +4664,34 @@ test "parseApplyPatchToolPayload extracts codex patch formats" {
     try std.testing.expect(parseApplyPatchToolPayload("normal assistant text") == null);
 }
 
-test "parseAssistantToolCall detects read apply_patch exec write" {
+test "parseAssistantToolCall detects discovery/edit/exec/web tools" {
     const read_tool = parseAssistantToolCall("<READ>ls</READ>").?;
     switch (read_tool) {
         .read => |command| try std.testing.expectEqualStrings("ls", command),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const list_dir_call = parseAssistantToolCall("<LIST_DIR>{\"path\":\"src\"}</LIST_DIR>").?;
+    switch (list_dir_call) {
+        .list_dir => |payload| try std.testing.expectEqualStrings("{\"path\":\"src\"}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const read_file_call = parseAssistantToolCall("<READ_FILE>{\"path\":\"src/main.zig\"}</READ_FILE>").?;
+    switch (read_file_call) {
+        .read_file => |payload| try std.testing.expectEqualStrings("{\"path\":\"src/main.zig\"}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const grep_call = parseAssistantToolCall("<GREP_FILES>{\"query\":\"TODO\"}</GREP_FILES>").?;
+    switch (grep_call) {
+        .grep_files => |payload| try std.testing.expectEqualStrings("{\"query\":\"TODO\"}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const project_search_call = parseAssistantToolCall("<PROJECT_SEARCH>{\"query\":\"provider\"}</PROJECT_SEARCH>").?;
+    switch (project_search_call) {
+        .project_search => |payload| try std.testing.expectEqualStrings("{\"query\":\"provider\"}", payload),
         else => return error.TestUnexpectedResult,
     }
 
@@ -3348,6 +4712,12 @@ test "parseAssistantToolCall detects read apply_patch exec write" {
     const write_call = parseAssistantToolCall("<WRITE_STDIN>{\"session_id\":1,\"chars\":\"pwd\\n\"}</WRITE_STDIN>").?;
     switch (write_call) {
         .write_stdin => |payload| try std.testing.expectEqualStrings("{\"session_id\":1,\"chars\":\"pwd\\n\"}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const web_search_call = parseAssistantToolCall("<WEB_SEARCH>{\"query\":\"zig fmt\"}</WEB_SEARCH>").?;
+    switch (web_search_call) {
+        .web_search => |payload| try std.testing.expectEqualStrings("{\"query\":\"zig fmt\"}", payload),
         else => return error.TestUnexpectedResult,
     }
 }
