@@ -199,6 +199,8 @@ const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
 const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const KEY_PAGE_UP: u8 = 245;
+const KEY_PAGE_DOWN: u8 = 246;
 const TOOL_SYSTEM_PROMPT =
     "You can use ten local tools.\n" ++
     "When you need to inspect files, reply with ONLY:\n" ++
@@ -359,11 +361,21 @@ fn mapEscapeSequenceToKey() !?u8 {
     const third_read = try std.posix.read(std.fs.File.stdin().handle, third[0..]);
     if (third_read == 0) return null;
 
-    return switch (third[0]) {
-        'A' => 16, // Up arrow -> Ctrl-P semantics
-        'B' => 14, // Down arrow -> Ctrl-N semantics
-        else => null,
-    };
+    switch (third[0]) {
+        'A' => return 16, // Up arrow -> Ctrl-P semantics
+        'B' => return 14, // Down arrow -> Ctrl-N semantics
+        '5', '6' => {
+            if (second[0] != '[') return null;
+            if (!try stdinHasPendingByte(2)) return null;
+
+            var fourth: [1]u8 = undefined;
+            const fourth_read = try std.posix.read(std.fs.File.stdin().handle, fourth[0..]);
+            if (fourth_read == 0 or fourth[0] != '~') return null;
+
+            return if (third[0] == '5') KEY_PAGE_UP else KEY_PAGE_DOWN;
+        },
+        else => return null,
+    }
 }
 
 fn stdinHasPendingByte(timeout_ms: i32) !bool {
@@ -466,6 +478,12 @@ const App = struct {
             'j' => {
                 if (self.scroll_lines > 0) self.scroll_lines -= 1;
             },
+            KEY_PAGE_UP => {
+                self.scrollPageUp();
+            },
+            KEY_PAGE_DOWN => {
+                self.scrollPageDown();
+            },
             'H' => {
                 self.shiftConversationStrip(-1);
             },
@@ -487,6 +505,12 @@ const App = struct {
 
     fn handleInsertByte(self: *App, key_byte: u8) !void {
         switch (key_byte) {
+            KEY_PAGE_UP => {
+                self.scrollPageUp();
+            },
+            KEY_PAGE_DOWN => {
+                self.scrollPageDown();
+            },
             27 => {
                 if (self.model_picker_open) {
                     self.model_picker_open = false;
@@ -567,6 +591,27 @@ const App = struct {
                 }
             },
         }
+    }
+
+    fn scrollPageUp(self: *App) void {
+        self.scroll_lines +|= self.chatPageScrollStep();
+    }
+
+    fn scrollPageDown(self: *App) void {
+        self.scroll_lines -|= self.chatPageScrollStep();
+    }
+
+    fn chatPageScrollStep(self: *App) usize {
+        const viewport_height = self.chatViewportHeight();
+        return if (viewport_height > 1) viewport_height - 1 else 1;
+    }
+
+    fn chatViewportHeight(self: *App) usize {
+        const metrics = self.terminalMetrics();
+        const top_lines: usize = if (self.compact_mode) 3 else 4;
+        const picker_lines = self.pickerLineCount(metrics.lines);
+        const bottom_lines: usize = 3 + picker_lines;
+        return @max(@as(usize, 4), metrics.lines - top_lines - bottom_lines);
     }
 
     fn submitInput(self: *App) !void {
@@ -2679,7 +2724,7 @@ const App = struct {
         try writeRule(&screen_writer.writer, width, palette, self.compact_mode);
 
         const key_hint = if (self.is_streaming)
-            "esc esc stop"
+            "esc esc stop pgup/pgdn"
         else if (self.model_picker_open)
             "ctrl-n/p or up/down, enter/tab select, esc close"
         else if (self.command_picker_open)
@@ -2687,9 +2732,9 @@ const App = struct {
         else if (self.file_picker_open)
             "ctrl-n/p or up/down, enter/tab insert, esc close"
         else if (self.mode == .insert)
-            "enter esc / ctrl-v"
+            "enter esc / ctrl-v pgup/pgdn"
         else
-            "i j/k H/L / q";
+            "i j/k pgup/pgdn H/L / q";
         const context_summary = try self.contextUsageSummary(conversation);
         defer if (context_summary) |summary| self.allocator.free(summary);
         const status_text = if (context_summary) |summary|
