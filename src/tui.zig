@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const models = @import("models.zig");
+const patch_tool = @import("patch_tool.zig");
 const provider_client = @import("provider_client.zig");
 const Paths = @import("paths.zig").Paths;
 const AppState = @import("state.zig").AppState;
@@ -30,20 +31,30 @@ const TerminalMetrics = struct {
 const MODEL_PICKER_MAX_ROWS: usize = 8;
 const FILE_PICKER_MAX_ROWS: usize = 8;
 const COMMAND_PICKER_MAX_ROWS: usize = 8;
-const READ_TOOL_MAX_STEPS: usize = 4;
+const TOOL_MAX_STEPS: usize = 4;
 const READ_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
+const APPLY_PATCH_TOOL_MAX_PATCH_BYTES: usize = 256 * 1024;
 const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
 const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
-const READ_TOOL_SYSTEM_PROMPT =
-    "You can use one local read-only tool.\n" ++
+const TOOL_SYSTEM_PROMPT =
+    "You can use two local tools.\n" ++
     "When you need to inspect files, reply with ONLY:\n" ++
     "<READ>\n" ++
     "<command>\n" ++
     "</READ>\n" ++
     "Allowed commands: rg, grep, ls, cat, find, head, tail, sed, wc, stat, pwd.\n" ++
-    "After a system message that starts with [read-result], continue the answer normally.";
+    "When you need to edit files, reply with ONLY:\n" ++
+    "<APPLY_PATCH>\n" ++
+    "*** Begin Patch\n" ++
+    "*** Update File: path/to/file\n" ++
+    "@@\n" ++
+    "-old text\n" ++
+    "+new text\n" ++
+    "*** End Patch\n" ++
+    "</APPLY_PATCH>\n" ++
+    "After a system message that starts with [read-result] or [apply-patch-result], continue the answer normally.";
 
 const RawMode = struct {
     original_termios: std.posix.termios,
@@ -384,32 +395,48 @@ const App = struct {
         }
 
         var step: usize = 0;
-        while (step < READ_TOOL_MAX_STEPS) : (step += 1) {
+        while (step < TOOL_MAX_STEPS) : (step += 1) {
             const success = try self.streamAssistantOnce(provider_id, model_id, api_key.?);
             if (!success) break;
 
             const assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
-            const read_command = parseReadToolCommand(assistant_message.content) orelse break;
-            const read_command_owned = try self.allocator.dupe(u8, read_command);
-            defer self.allocator.free(read_command_owned);
+            const tool_call = parseAssistantToolCall(assistant_message.content) orelse break;
+            switch (tool_call) {
+                .read => |read_command| {
+                    const read_command_owned = try self.allocator.dupe(u8, read_command);
+                    defer self.allocator.free(read_command_owned);
 
-            const tool_note = try std.fmt.allocPrint(self.allocator, "[tool] READ {s}", .{read_command_owned});
-            defer self.allocator.free(tool_note);
-            try self.setLastAssistantMessage(tool_note);
+                    const tool_note = try std.fmt.allocPrint(self.allocator, "[tool] READ {s}", .{read_command_owned});
+                    defer self.allocator.free(tool_note);
+                    try self.setLastAssistantMessage(tool_note);
 
-            const tool_result = try self.runReadToolCommand(read_command_owned);
-            defer self.allocator.free(tool_result);
-            try self.app_state.appendMessage(self.allocator, .system, tool_result);
-            try self.app_state.appendMessage(self.allocator, .assistant, "");
-            try self.setNoticeFmt("Ran READ command: {s}", .{read_command_owned});
+                    const tool_result = try self.runReadToolCommand(read_command_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNoticeFmt("Ran READ command: {s}", .{read_command_owned});
+                },
+                .apply_patch => |patch_text| {
+                    const patch_text_owned = try self.allocator.dupe(u8, patch_text);
+                    defer self.allocator.free(patch_text_owned);
+
+                    try self.setLastAssistantMessage("[tool] APPLY_PATCH");
+
+                    const tool_result = try self.runApplyPatchToolPatch(patch_text_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran APPLY_PATCH tool");
+                },
+            }
             try self.render();
         }
 
-        if (step == READ_TOOL_MAX_STEPS) {
+        if (step == TOOL_MAX_STEPS) {
             const conversation = self.app_state.currentConversationConst();
             const last_message = conversation.messages.items[conversation.messages.items.len - 1];
-            if (parseReadToolCommand(last_message.content) != null) {
-                try self.app_state.appendMessage(self.allocator, .system, "[read-result]\nREAD step limit reached. Continue without additional READ calls.");
+            if (parseAssistantToolCall(last_message.content) != null) {
+                try self.app_state.appendMessage(self.allocator, .system, "[tool-result]\nTool step limit reached. Continue without additional tool calls.");
             }
         }
 
@@ -463,7 +490,7 @@ const App = struct {
         return true;
     }
 
-    fn buildStreamMessages(self: *App, include_read_tool_prompt: bool) ![]provider_client.StreamMessage {
+    fn buildStreamMessages(self: *App, include_tool_prompt: bool) ![]provider_client.StreamMessage {
         const conversation = self.app_state.currentConversationConst();
         const conversation_len = conversation.messages.items.len;
         const skip_last_empty_assistant = conversation_len > 0 and
@@ -471,14 +498,14 @@ const App = struct {
             conversation.messages.items[conversation_len - 1].content.len == 0;
 
         const visible_count = if (skip_last_empty_assistant) conversation_len - 1 else conversation_len;
-        const prompt_count: usize = if (include_read_tool_prompt) 1 else 0;
+        const prompt_count: usize = if (include_tool_prompt) 1 else 0;
         const messages = try self.allocator.alloc(provider_client.StreamMessage, visible_count + prompt_count);
 
         var index: usize = 0;
-        if (include_read_tool_prompt) {
+        if (include_tool_prompt) {
             messages[index] = .{
                 .role = .system,
-                .content = READ_TOOL_SYSTEM_PROMPT,
+                .content = TOOL_SYSTEM_PROMPT,
             };
             index += 1;
         }
@@ -565,6 +592,66 @@ const App = struct {
         return output.toOwnedSlice();
     }
 
+    fn runApplyPatchToolPatch(self: *App, patch_text: []const u8) ![]u8 {
+        const trimmed_patch = std.mem.trim(u8, patch_text, " \t\r\n");
+        if (trimmed_patch.len == 0) {
+            return self.allocator.dupe(u8, "[apply-patch-result]\nerror: empty patch payload");
+        }
+
+        if (trimmed_patch.len > APPLY_PATCH_TOOL_MAX_PATCH_BYTES) {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[apply-patch-result]\nerror: patch too large ({d} bytes > {d})",
+                .{ trimmed_patch.len, APPLY_PATCH_TOOL_MAX_PATCH_BYTES },
+            );
+        }
+
+        if (!isValidApplyPatchPayload(trimmed_patch)) {
+            return self.allocator.dupe(u8, "[apply-patch-result]\nerror: invalid patch payload; expected codex apply_patch format");
+        }
+
+        const stats = patch_tool.applyCodexPatch(self.allocator, trimmed_patch) catch |err| {
+            const detail = switch (err) {
+                error.FileNotFound => "target file not found",
+                error.UpdateTargetMissing => "update target file not found (use *** Add File for new files)",
+                error.DeleteTargetMissing => "delete target file not found",
+                error.AddTargetExists => "add target already exists (use *** Update File instead)",
+                error.PatchContextNotFound => "patch context not found in target file",
+                error.MissingBeginPatch => "missing *** Begin Patch header",
+                error.MissingEndPatch => "missing *** End Patch trailer",
+                error.InvalidPatchHeader => "invalid patch operation header",
+                error.InvalidPatchPath => "invalid or empty patch path",
+                error.InvalidAddFileLine => "invalid add-file body line (expected leading +)",
+                error.InvalidUpdateLine => "invalid update hunk line (expected ' ', '+', '-', or @@)",
+                error.EmptyPatchOperations => "patch contains no operations",
+                else => @errorName(err),
+            };
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[apply-patch-result]\nerror: {s}",
+                .{detail},
+            );
+        };
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+
+        try output.writer.print(
+            "[apply-patch-result]\nbytes: {d}\nops:{d} files_changed:{d} added:{d} updated:{d} deleted:{d} moved:{d}\nstatus: ok\n",
+            .{
+                trimmed_patch.len,
+                stats.operations,
+                stats.files_changed,
+                stats.added,
+                stats.updated,
+                stats.deleted,
+                stats.moved,
+            },
+        );
+
+        return output.toOwnedSlice();
+    }
+
     fn onStreamToken(context: ?*anyopaque, token: []const u8) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context.?));
         try self.appendToLastAssistantMessage(token);
@@ -611,7 +698,7 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  input: use @path, pickers: Ctrl-N/P + Enter, assistant tool: <READ>rg --files</READ>");
+            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  input: use @path, pickers: Ctrl-N/P + Enter, assistant tools: <READ>rg --files</READ> and <APPLY_PATCH>*** Begin Patch ...");
             return;
         }
 
@@ -1003,8 +1090,18 @@ const App = struct {
         const before_cursor = self.input_buffer.items[0..self.input_cursor];
         const after_cursor = self.input_buffer.items[self.input_cursor..];
         const input_view = try buildInputView(self.allocator, before_cursor, after_cursor, if (width > 10) width - 10 else 22);
-        defer self.allocator.free(input_view);
-        try screen_writer.writer.print("{s}[{s}]>{s} {s}\n", .{ palette.accent, if (self.mode == .insert) "INS" else "NOR", palette.reset, input_view });
+        defer self.allocator.free(input_view.text);
+        try screen_writer.writer.print("{s}[{s}]>{s} {s}", .{ palette.accent, if (self.mode == .insert) "INS" else "NOR", palette.reset, input_view.text });
+
+        const cursor = computeInputCursorPlacement(
+            width,
+            lines,
+            self.compact_mode,
+            viewport_height,
+            picker_lines,
+            input_view.cursor_col,
+        );
+        try screen_writer.writer.print("\x1b[{d};{d}H", .{ cursor.row, cursor.col });
 
         const screen = try screen_writer.toOwnedSlice();
         defer self.allocator.free(screen);
@@ -1679,6 +1776,39 @@ const Palette = struct {
     system: []const u8,
 };
 
+const CursorPlacement = struct {
+    row: usize,
+    col: usize,
+};
+
+const InputView = struct {
+    text: []u8,
+    cursor_col: usize,
+};
+
+fn computeInputCursorPlacement(
+    width: usize,
+    lines: usize,
+    compact_mode: bool,
+    viewport_height: usize,
+    picker_lines: usize,
+    input_cursor_col: usize,
+) CursorPlacement {
+    const header_lines: usize = if (compact_mode) 2 else 3;
+    const input_row_unclamped = header_lines + 1 + viewport_height + 1 + 1 + picker_lines + 1;
+    const input_row = std.math.clamp(input_row_unclamped, @as(usize, 1), lines);
+
+    // Prompt prefix is always "[INS]> " or "[NOR]> " (6 chars + trailing space).
+    const prompt_visible_len: usize = 7;
+    const input_col_unclamped = prompt_visible_len + input_cursor_col + 1;
+    const input_col = std.math.clamp(input_col_unclamped, @as(usize, 1), width);
+
+    return .{
+        .row = input_row,
+        .col = input_col,
+    };
+}
+
 fn paletteForTheme(theme: Theme) Palette {
     return switch (theme) {
         .codex => .{
@@ -1846,7 +1976,7 @@ fn truncateLineAlloc(allocator: std.mem.Allocator, text: []const u8, max_width: 
     return out;
 }
 
-fn buildInputView(allocator: std.mem.Allocator, before: []const u8, after: []const u8, max_width: usize) ![]u8 {
+fn buildInputView(allocator: std.mem.Allocator, before: []const u8, after: []const u8, max_width: usize) !InputView {
     var full_writer: std.Io.Writer.Allocating = .init(allocator);
     defer full_writer.deinit();
     try full_writer.writer.writeAll(before);
@@ -1855,16 +1985,36 @@ fn buildInputView(allocator: std.mem.Allocator, before: []const u8, after: []con
     const full = try full_writer.toOwnedSlice();
     defer allocator.free(full);
 
-    if (full.len <= max_width) return allocator.dupe(u8, full);
-    if (max_width <= 3) return allocator.dupe(u8, full[full.len - max_width ..]);
+    const marker_view = blk: {
+        if (full.len <= max_width) break :blk try allocator.dupe(u8, full);
+        if (max_width <= 3) break :blk try allocator.dupe(u8, full[full.len - max_width ..]);
 
-    const tail_len = max_width - 3;
-    var out = try allocator.alloc(u8, max_width);
-    out[0] = '.';
-    out[1] = '.';
-    out[2] = '.';
-    @memcpy(out[3..], full[full.len - tail_len ..]);
-    return out;
+        const tail_len = max_width - 3;
+        var out = try allocator.alloc(u8, max_width);
+        out[0] = '.';
+        out[1] = '.';
+        out[2] = '.';
+        @memcpy(out[3..], full[full.len - tail_len ..]);
+        break :blk out;
+    };
+    defer allocator.free(marker_view);
+
+    const marker_index = std.mem.indexOfScalar(u8, marker_view, '|') orelse marker_view.len;
+    const has_marker = marker_index < marker_view.len;
+    const out_len = marker_view.len - (if (has_marker) @as(usize, 1) else @as(usize, 0));
+    var out = try allocator.alloc(u8, out_len);
+
+    if (has_marker) {
+        @memcpy(out[0..marker_index], marker_view[0..marker_index]);
+        @memcpy(out[marker_index..], marker_view[marker_index + 1 ..]);
+    } else {
+        @memcpy(out, marker_view);
+    }
+
+    return .{
+        .text = out,
+        .cursor_col = @min(marker_index, out_len),
+    };
 }
 
 const BuiltinCommandEntry = struct {
@@ -1906,6 +2056,21 @@ fn commandMatchesQuery(entry: BuiltinCommandEntry, query: []const u8) bool {
     return containsAsciiIgnoreCase(entry.name, query) or containsAsciiIgnoreCase(entry.description, query);
 }
 
+const AssistantToolCall = union(enum) {
+    read: []const u8,
+    apply_patch: []const u8,
+};
+
+fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
+    if (parseReadToolCommand(text)) |command| {
+        return .{ .read = command };
+    }
+    if (parseApplyPatchToolPayload(text)) |patch_text| {
+        return .{ .apply_patch = patch_text };
+    }
+    return null;
+}
+
 fn parseReadToolCommand(text: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return null;
@@ -1932,6 +2097,43 @@ fn parseReadToolCommand(text: []const u8) ?[]const u8 {
     }
 
     return null;
+}
+
+fn parseApplyPatchToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<APPLY_PATCH>")) {
+        const rest = trimmed["<APPLY_PATCH>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</APPLY_PATCH>") orelse return null;
+        const payload = std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+        if (payload.len == 0) return null;
+        return payload;
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```apply_patch")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        const payload = std.mem.trim(u8, body[0..close_index], " \t\r\n");
+        if (payload.len == 0) return null;
+        return payload;
+    }
+
+    return extractCodexPatchPayload(trimmed);
+}
+
+fn extractCodexPatchPayload(text: []const u8) ?[]const u8 {
+    const begin_index = std.mem.indexOf(u8, text, "*** Begin Patch") orelse return null;
+    const rest = text[begin_index..];
+    const end_index = std.mem.indexOf(u8, rest, "*** End Patch") orelse return null;
+    const end = begin_index + end_index + "*** End Patch".len;
+    return std.mem.trim(u8, text[begin_index..end], " \t\r\n");
+}
+
+fn isValidApplyPatchPayload(patch_text: []const u8) bool {
+    if (!std.mem.startsWith(u8, patch_text, "*** Begin Patch")) return false;
+    return std.mem.indexOf(u8, patch_text, "*** End Patch") != null;
 }
 
 const AtTokenRange = struct {
@@ -2269,6 +2471,52 @@ test "parseReadToolCommand extracts command formats" {
     try std.testing.expect(parseReadToolCommand("normal assistant text") == null);
 }
 
+test "parseApplyPatchToolPayload extracts codex patch formats" {
+    const xml_payload =
+        "<APPLY_PATCH>\n" ++
+        "*** Begin Patch\n" ++
+        "*** Update File: src/main.zig\n" ++
+        "@@\n" ++
+        "-old\n" ++
+        "+new\n" ++
+        "*** End Patch\n" ++
+        "</APPLY_PATCH>";
+    try std.testing.expectEqualStrings(
+        "*** Begin Patch\n*** Update File: src/main.zig\n@@\n-old\n+new\n*** End Patch",
+        parseApplyPatchToolPayload(xml_payload).?,
+    );
+
+    const fence_payload =
+        "```apply_patch\n" ++
+        "*** Begin Patch\n" ++
+        "*** Add File: notes.txt\n" ++
+        "+hello\n" ++
+        "*** End Patch\n" ++
+        "```";
+    try std.testing.expectEqualStrings(
+        "*** Begin Patch\n*** Add File: notes.txt\n+hello\n*** End Patch",
+        parseApplyPatchToolPayload(fence_payload).?,
+    );
+
+    try std.testing.expect(parseApplyPatchToolPayload("normal assistant text") == null);
+}
+
+test "parseAssistantToolCall detects read and apply_patch" {
+    const read_tool = parseAssistantToolCall("<READ>ls</READ>").?;
+    switch (read_tool) {
+        .read => |command| try std.testing.expectEqualStrings("ls", command),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const patch_call = parseAssistantToolCall(
+        "*** Begin Patch\n*** Update File: src/tui.zig\n@@\n-old\n+new\n*** End Patch",
+    ).?;
+    switch (patch_call) {
+        .apply_patch => |payload| try std.testing.expect(isValidApplyPatchPayload(payload)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "parseCommandPickerQuery handles slash token editing only" {
     try std.testing.expectEqualStrings("mo", parseCommandPickerQuery("/mo", 3).?);
     try std.testing.expectEqualStrings("", parseCommandPickerQuery("/", 1).?);
@@ -2347,6 +2595,29 @@ test "rewriteInputWithSelectedAtPath quotes path with spaces" {
     defer allocator.free(rewritten.text);
 
     try std.testing.expectEqualStrings("check @\"docs/My File.md\" ", rewritten.text);
+}
+
+test "computeInputCursorPlacement anchors cursor to input marker" {
+    const placement = computeInputCursorPlacement(
+        120,
+        40,
+        true,
+        30,
+        0,
+        3,
+    );
+
+    try std.testing.expectEqual(@as(usize, 36), placement.row);
+    try std.testing.expectEqual(@as(usize, 11), placement.col);
+}
+
+test "buildInputView hides inline marker and preserves cursor column" {
+    const allocator = std.testing.allocator;
+    const view = try buildInputView(allocator, "hello", " world", 64);
+    defer allocator.free(view.text);
+
+    try std.testing.expectEqualStrings("hello world", view.text);
+    try std.testing.expectEqual(@as(usize, 5), view.cursor_col);
 }
 
 test "buildFileInjectionPayload includes readable files and reports counts" {
