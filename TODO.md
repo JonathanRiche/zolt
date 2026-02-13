@@ -3,7 +3,7 @@
 Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 
 ## Core Tooling
-- [ ] `exec_command` + `write_stdin` (interactive shell sessions)
+- [x] `exec_command` + `write_stdin` (interactive shell sessions)
 - [x] `apply_patch` (Codex-style patch editing)
 - [x] `READ` (`rg`, `grep`, `ls`, `cat`, etc.) with allowlist
 

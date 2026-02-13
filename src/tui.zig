@@ -28,19 +28,48 @@ const TerminalMetrics = struct {
     lines: usize,
 };
 
+const CommandSession = struct {
+    id: u32,
+    command_line: []u8,
+    child: std.process.Child,
+    finished: bool = false,
+    term: ?std.process.Child.Term = null,
+};
+
+const ExecCommandInput = struct {
+    cmd: []u8,
+    yield_ms: u32 = COMMAND_TOOL_DEFAULT_YIELD_MS,
+};
+
+const WriteStdinInput = struct {
+    session_id: u32,
+    chars: []u8,
+    yield_ms: u32 = COMMAND_TOOL_DEFAULT_YIELD_MS,
+};
+
+const SessionDrainResult = struct {
+    stdout: []u8,
+    stderr: []u8,
+    output_limited: bool = false,
+};
+
 const MODEL_PICKER_MAX_ROWS: usize = 8;
 const FILE_PICKER_MAX_ROWS: usize = 8;
 const COMMAND_PICKER_MAX_ROWS: usize = 8;
 const TOOL_MAX_STEPS: usize = 4;
 const READ_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
 const APPLY_PATCH_TOOL_MAX_PATCH_BYTES: usize = 256 * 1024;
+const COMMAND_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
+const COMMAND_TOOL_DEFAULT_YIELD_MS: u32 = 700;
+const COMMAND_TOOL_MAX_YIELD_MS: u32 = 5000;
+const COMMAND_TOOL_MAX_SESSIONS: usize = 8;
 const STREAM_INTERRUPT_ESC_WINDOW_MS: i64 = 1200;
 const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
 const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const TOOL_SYSTEM_PROMPT =
-    "You can use two local tools.\n" ++
+    "You can use four local tools.\n" ++
     "When you need to inspect files, reply with ONLY:\n" ++
     "<READ>\n" ++
     "<command>\n" ++
@@ -55,7 +84,15 @@ const TOOL_SYSTEM_PROMPT =
     "+new text\n" ++
     "*** End Patch\n" ++
     "</APPLY_PATCH>\n" ++
-    "After a system message that starts with [read-result] or [apply-patch-result], continue the answer normally.";
+    "For shell commands, start/continue with:\n" ++
+    "<EXEC_COMMAND>\n" ++
+    "{\"cmd\":\"ls -la\",\"yield_ms\":700}\n" ++
+    "</EXEC_COMMAND>\n" ++
+    "To send input to an existing session:\n" ++
+    "<WRITE_STDIN>\n" ++
+    "{\"session_id\":1,\"chars\":\"pwd\\n\",\"yield_ms\":700}\n" ++
+    "</WRITE_STDIN>\n" ++
+    "After a system message that starts with [read-result], [apply-patch-result], [exec-result], or [write-stdin-result], continue the answer normally.";
 
 const RawMode = struct {
     original_termios: std.posix.termios,
@@ -208,6 +245,8 @@ const App = struct {
     file_picker_index: usize = 0,
     file_picker_scroll: usize = 0,
     file_index: std.ArrayList([]u8) = .empty,
+    command_sessions: std.ArrayList(*CommandSession) = .empty,
+    next_command_session_id: u32 = 1,
     compact_mode: bool = true,
     theme: Theme = .codex,
     stream_interrupt_esc_count: u8 = 0,
@@ -221,6 +260,11 @@ const App = struct {
     notice: []u8,
 
     pub fn deinit(self: *App) void {
+        for (self.command_sessions.items) |session| {
+            self.cleanupCommandSession(session);
+            self.allocator.destroy(session);
+        }
+        self.command_sessions.deinit(self.allocator);
         self.input_buffer.deinit(self.allocator);
         for (self.file_index.items) |path| self.allocator.free(path);
         self.file_index.deinit(self.allocator);
@@ -472,6 +516,30 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran APPLY_PATCH tool");
                 },
+                .exec_command => |exec_payload| {
+                    const exec_payload_owned = try self.allocator.dupe(u8, exec_payload);
+                    defer self.allocator.free(exec_payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] EXEC_COMMAND");
+
+                    const tool_result = try self.runExecCommandToolPayload(exec_payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran EXEC_COMMAND tool");
+                },
+                .write_stdin => |write_payload| {
+                    const write_payload_owned = try self.allocator.dupe(u8, write_payload);
+                    defer self.allocator.free(write_payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] WRITE_STDIN");
+
+                    const tool_result = try self.runWriteStdinToolPayload(write_payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran WRITE_STDIN tool");
+                },
             }
             try self.render();
         }
@@ -720,6 +788,354 @@ const App = struct {
         return output.toOwnedSlice();
     }
 
+    fn runExecCommandToolPayload(self: *App, payload: []const u8) ![]u8 {
+        const input = parseExecCommandInput(self.allocator, payload) catch {
+            return self.allocator.dupe(u8, "[exec-result]\nerror: invalid payload (expected JSON with cmd and optional yield_ms)");
+        };
+        defer self.allocator.free(input.cmd);
+
+        if (input.cmd.len == 0) {
+            return self.allocator.dupe(u8, "[exec-result]\nerror: empty command");
+        }
+
+        try self.pruneCommandSessionsForCapacity();
+
+        const session = try self.startCommandSession(input.cmd);
+        const drained = try self.drainCommandSessionOutput(session, input.yield_ms);
+        defer self.allocator.free(drained.stdout);
+        defer self.allocator.free(drained.stderr);
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+
+        try output.writer.print("[exec-result]\nsession_id: {d}\ncommand: {s}\n", .{
+            session.id,
+            session.command_line,
+        });
+        try self.appendCommandSessionStateLine(&output.writer, session);
+        try self.appendCommandDrainOutput(&output.writer, drained);
+
+        return output.toOwnedSlice();
+    }
+
+    fn runWriteStdinToolPayload(self: *App, payload: []const u8) ![]u8 {
+        var input = parseWriteStdinInput(self.allocator, payload) catch {
+            return self.allocator.dupe(u8, "[write-stdin-result]\nerror: invalid payload (expected JSON with session_id, chars, optional yield_ms)");
+        };
+        defer self.allocator.free(input.chars);
+
+        const session = self.findCommandSessionById(input.session_id) orelse {
+            return std.fmt.allocPrint(self.allocator, "[write-stdin-result]\nerror: session not found ({d})", .{input.session_id});
+        };
+
+        if (session.finished) {
+            var output: std.Io.Writer.Allocating = .init(self.allocator);
+            defer output.deinit();
+            try output.writer.print("[write-stdin-result]\nsession_id: {d}\nchars_written: 0\n", .{session.id});
+            try self.appendCommandSessionStateLine(&output.writer, session);
+            return output.toOwnedSlice();
+        }
+
+        var written: usize = 0;
+        if (input.chars.len > 0) {
+            const stdin_file = session.child.stdin orelse {
+                return std.fmt.allocPrint(self.allocator, "[write-stdin-result]\nsession_id: {d}\nerror: session stdin is closed", .{session.id});
+            };
+
+            while (written < input.chars.len) {
+                const n = std.posix.write(stdin_file.handle, input.chars[written..]) catch |err| switch (err) {
+                    error.BrokenPipe => {
+                        session.child.stdin.?.close();
+                        session.child.stdin = null;
+                        break;
+                    },
+                    else => return std.fmt.allocPrint(
+                        self.allocator,
+                        "[write-stdin-result]\nsession_id: {d}\nerror: {s}",
+                        .{ session.id, @errorName(err) },
+                    ),
+                };
+                written += n;
+            }
+        }
+
+        const drained = try self.drainCommandSessionOutput(session, input.yield_ms);
+        defer self.allocator.free(drained.stdout);
+        defer self.allocator.free(drained.stderr);
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+        try output.writer.print("[write-stdin-result]\nsession_id: {d}\nchars_written: {d}\n", .{
+            session.id,
+            written,
+        });
+        try self.appendCommandSessionStateLine(&output.writer, session);
+        try self.appendCommandDrainOutput(&output.writer, drained);
+        return output.toOwnedSlice();
+    }
+
+    fn appendCommandDrainOutput(self: *App, writer: *std.Io.Writer, drained: SessionDrainResult) !void {
+        _ = self;
+        if (drained.stdout.len > 0) {
+            try writer.writeAll("stdout:\n");
+            try writer.writeAll(drained.stdout);
+            if (drained.stdout[drained.stdout.len - 1] != '\n') try writer.writeByte('\n');
+        }
+
+        if (drained.stderr.len > 0) {
+            try writer.writeAll("stderr:\n");
+            try writer.writeAll(drained.stderr);
+            if (drained.stderr[drained.stderr.len - 1] != '\n') try writer.writeByte('\n');
+        }
+
+        if (drained.stdout.len == 0 and drained.stderr.len == 0) {
+            try writer.writeAll("stdout:\n(no output)\n");
+        }
+
+        if (drained.output_limited) {
+            try writer.writeAll("note: output truncated by limit\n");
+        }
+    }
+
+    fn appendCommandSessionStateLine(self: *App, writer: *std.Io.Writer, session: *CommandSession) !void {
+        _ = self;
+        if (session.finished and session.term != null) {
+            const term = session.term.?;
+            switch (term) {
+                .Exited => |code| try writer.print("state: exited:{d}\n", .{code}),
+                .Signal => |sig| try writer.print("state: signal:{d}\n", .{sig}),
+                .Stopped => |sig| try writer.print("state: stopped:{d}\n", .{sig}),
+                .Unknown => |code| try writer.print("state: unknown:{d}\n", .{code}),
+            }
+            return;
+        }
+        try writer.writeAll("state: running\n");
+    }
+
+    fn pruneCommandSessionsForCapacity(self: *App) !void {
+        if (self.command_sessions.items.len < COMMAND_TOOL_MAX_SESSIONS) return;
+
+        var index: usize = 0;
+        while (index < self.command_sessions.items.len) : (index += 1) {
+            const session = self.command_sessions.items[index];
+            self.refreshCommandSessionStatus(session);
+            if (session.finished) {
+                self.destroyCommandSessionAt(index);
+                if (self.command_sessions.items.len < COMMAND_TOOL_MAX_SESSIONS) return;
+                index -|= 1;
+            }
+        }
+
+        if (self.command_sessions.items.len >= COMMAND_TOOL_MAX_SESSIONS) {
+            self.destroyCommandSessionAt(0);
+        }
+    }
+
+    fn findCommandSessionById(self: *App, session_id: u32) ?*CommandSession {
+        for (self.command_sessions.items) |session| {
+            if (session.id == session_id) return session;
+        }
+        return null;
+    }
+
+    fn startCommandSession(self: *App, command_text: []const u8) !*CommandSession {
+        const session = try self.allocator.create(CommandSession);
+        errdefer self.allocator.destroy(session);
+
+        session.* = .{
+            .id = self.next_command_session_id,
+            .command_line = try self.allocator.dupe(u8, command_text),
+            .child = undefined,
+        };
+        errdefer self.allocator.free(session.command_line);
+
+        const argv = [_][]const u8{
+            "bash",
+            "-lc",
+            session.command_line,
+        };
+        session.child = std.process.Child.init(argv[0..], self.allocator);
+        session.child.cwd = ".";
+        session.child.stdin_behavior = .Pipe;
+        session.child.stdout_behavior = .Pipe;
+        session.child.stderr_behavior = .Pipe;
+
+        session.child.spawn() catch |err| {
+            self.cleanupCommandSession(session);
+            return err;
+        };
+        session.child.waitForSpawn() catch |err| {
+            self.cleanupCommandSession(session);
+            return err;
+        };
+
+        self.next_command_session_id += 1;
+        try self.command_sessions.append(self.allocator, session);
+        return session;
+    }
+
+    fn drainCommandSessionOutput(self: *App, session: *CommandSession, yield_ms: u32) !SessionDrainResult {
+        var stdout: std.ArrayList(u8) = .empty;
+        defer stdout.deinit(self.allocator);
+        var stderr: std.ArrayList(u8) = .empty;
+        defer stderr.deinit(self.allocator);
+        var output_limited = false;
+
+        const started_ms = std.time.milliTimestamp();
+        while (true) {
+            self.refreshCommandSessionStatus(session);
+
+            var poll_fds: [2]std.posix.pollfd = undefined;
+            var fd_kinds: [2]enum { stdout, stderr } = undefined;
+            var fd_count: usize = 0;
+
+            if (session.child.stdout) |stdout_file| {
+                poll_fds[fd_count] = .{
+                    .fd = stdout_file.handle,
+                    .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+                    .revents = 0,
+                };
+                fd_kinds[fd_count] = .stdout;
+                fd_count += 1;
+            }
+            if (session.child.stderr) |stderr_file| {
+                poll_fds[fd_count] = .{
+                    .fd = stderr_file.handle,
+                    .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+                    .revents = 0,
+                };
+                fd_kinds[fd_count] = .stderr;
+                fd_count += 1;
+            }
+
+            const elapsed_ms = @max(@as(i64, 0), std.time.milliTimestamp() - started_ms);
+            const remaining_ms_i64 = @as(i64, @intCast(yield_ms)) - elapsed_ms;
+            const timeout_ms: i32 = if (remaining_ms_i64 > 0)
+                @as(i32, @intCast(@min(remaining_ms_i64, 200)))
+            else
+                0;
+
+            if (fd_count > 0) {
+                const ready = try std.posix.poll(poll_fds[0..fd_count], timeout_ms);
+                if (ready > 0) {
+                    for (poll_fds[0..fd_count], 0..) |pollfd, index| {
+                        if ((pollfd.revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) == 0) continue;
+                        switch (fd_kinds[index]) {
+                            .stdout => try self.drainCommandPipeChunk(session, .stdout, &stdout, &output_limited),
+                            .stderr => try self.drainCommandPipeChunk(session, .stderr, &stderr, &output_limited),
+                        }
+                    }
+                }
+            } else if (timeout_ms > 0) {
+                std.Thread.sleep(@as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms);
+            }
+
+            if (remaining_ms_i64 <= 0) break;
+            if (session.finished and session.child.stdout == null and session.child.stderr == null) break;
+        }
+
+        self.refreshCommandSessionStatus(session);
+        return .{
+            .stdout = try stdout.toOwnedSlice(self.allocator),
+            .stderr = try stderr.toOwnedSlice(self.allocator),
+            .output_limited = output_limited,
+        };
+    }
+
+    fn drainCommandPipeChunk(
+        self: *App,
+        session: *CommandSession,
+        comptime pipe_kind: enum { stdout, stderr },
+        out: *std.ArrayList(u8),
+        output_limited: *bool,
+    ) !void {
+        const file = switch (pipe_kind) {
+            .stdout => session.child.stdout orelse return,
+            .stderr => session.child.stderr orelse return,
+        };
+
+        var buffer: [2048]u8 = undefined;
+        const read_len = std.posix.read(file.handle, buffer[0..]) catch |err| switch (err) {
+            error.WouldBlock => return,
+            error.BrokenPipe => {
+                switch (pipe_kind) {
+                    .stdout => {
+                        session.child.stdout.?.close();
+                        session.child.stdout = null;
+                    },
+                    .stderr => {
+                        session.child.stderr.?.close();
+                        session.child.stderr = null;
+                    },
+                }
+                return;
+            },
+            else => return err,
+        };
+
+        if (read_len == 0) {
+            switch (pipe_kind) {
+                .stdout => {
+                    session.child.stdout.?.close();
+                    session.child.stdout = null;
+                },
+                .stderr => {
+                    session.child.stderr.?.close();
+                    session.child.stderr = null;
+                },
+            }
+            return;
+        }
+
+        if (out.items.len < COMMAND_TOOL_MAX_OUTPUT_BYTES) {
+            const allowed = COMMAND_TOOL_MAX_OUTPUT_BYTES - out.items.len;
+            const slice_end = @min(read_len, allowed);
+            if (slice_end > 0) {
+                try out.appendSlice(self.allocator, buffer[0..slice_end]);
+            }
+            if (slice_end < read_len) output_limited.* = true;
+        } else {
+            output_limited.* = true;
+        }
+    }
+
+    fn refreshCommandSessionStatus(self: *App, session: *CommandSession) void {
+        _ = self;
+        if (session.finished) return;
+
+        const result = std.posix.waitpid(session.child.id, std.posix.W.NOHANG);
+        if (result.pid == 0) return;
+
+        session.finished = true;
+        session.term = statusToChildTerm(result.status);
+    }
+
+    fn destroyCommandSessionAt(self: *App, index: usize) void {
+        const session = self.command_sessions.orderedRemove(index);
+        self.cleanupCommandSession(session);
+        self.allocator.destroy(session);
+    }
+
+    fn cleanupCommandSession(self: *App, session: *CommandSession) void {
+        if (!session.finished) {
+            _ = session.child.kill() catch {};
+            session.finished = true;
+        }
+        if (session.child.stdin) |stdin_file| {
+            stdin_file.close();
+            session.child.stdin = null;
+        }
+        if (session.child.stdout) |stdout_file| {
+            stdout_file.close();
+            session.child.stdout = null;
+        }
+        if (session.child.stderr) |stderr_file| {
+            stderr_file.close();
+            session.child.stderr = null;
+        }
+        self.allocator.free(session.command_line);
+    }
+
     fn onStreamToken(context: ?*anyopaque, token: []const u8) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context.?));
         if (try self.pollStreamInterrupt()) {
@@ -809,7 +1225,7 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  input: use @path, pickers: Ctrl-N/P + Enter, assistant tools: <READ>rg --files</READ> and <APPLY_PATCH>*** Begin Patch ...");
+            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  input: use @path, pickers: Ctrl-N/P + Enter, assistant tools: <READ>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>");
             return;
         }
 
@@ -2263,9 +2679,17 @@ fn registerStreamInterruptByte(
 const AssistantToolCall = union(enum) {
     read: []const u8,
     apply_patch: []const u8,
+    exec_command: []const u8,
+    write_stdin: []const u8,
 };
 
 fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
+    if (parseExecCommandToolPayload(text)) |payload| {
+        return .{ .exec_command = payload };
+    }
+    if (parseWriteStdinToolPayload(text)) |payload| {
+        return .{ .write_stdin = payload };
+    }
     if (parseReadToolCommand(text)) |command| {
         return .{ .read = command };
     }
@@ -2303,6 +2727,46 @@ fn parseReadToolCommand(text: []const u8) ?[]const u8 {
     return null;
 }
 
+fn parseExecCommandToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<EXEC_COMMAND>")) {
+        const rest = trimmed["<EXEC_COMMAND>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</EXEC_COMMAND>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```exec_command")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    return null;
+}
+
+fn parseWriteStdinToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<WRITE_STDIN>")) {
+        const rest = trimmed["<WRITE_STDIN>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</WRITE_STDIN>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```write_stdin")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    return null;
+}
+
 fn parseApplyPatchToolPayload(text: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return null;
@@ -2325,6 +2789,98 @@ fn parseApplyPatchToolPayload(text: []const u8) ?[]const u8 {
     }
 
     return extractCodexPatchPayload(trimmed);
+}
+
+fn parseExecCommandInput(allocator: std.mem.Allocator, payload: []const u8) !ExecCommandInput {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidToolPayload;
+
+    if (trimmed[0] != '{') {
+        return .{
+            .cmd = try allocator.dupe(u8, trimmed),
+            .yield_ms = COMMAND_TOOL_DEFAULT_YIELD_MS,
+        };
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidToolPayload,
+    };
+
+    const cmd_value = object.get("cmd") orelse object.get("command") orelse return error.InvalidToolPayload;
+    const cmd_text = switch (cmd_value) {
+        .string => |text| text,
+        else => return error.InvalidToolPayload,
+    };
+
+    const yield_ms = sanitizeCommandYieldMs(
+        jsonFieldU32(object, "yield_ms") orelse
+            jsonFieldU32(object, "yield_time_ms") orelse
+            COMMAND_TOOL_DEFAULT_YIELD_MS,
+    );
+
+    return .{
+        .cmd = try allocator.dupe(u8, std.mem.trim(u8, cmd_text, " \t\r\n")),
+        .yield_ms = yield_ms,
+    };
+}
+
+fn parseWriteStdinInput(allocator: std.mem.Allocator, payload: []const u8) !WriteStdinInput {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[0] != '{') return error.InvalidToolPayload;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidToolPayload,
+    };
+
+    const session_value = object.get("session_id") orelse object.get("session") orelse return error.InvalidToolPayload;
+    const session_id = switch (session_value) {
+        .integer => |number| if (number > 0 and number <= std.math.maxInt(u32)) @as(u32, @intCast(number)) else return error.InvalidToolPayload,
+        .number_string => |number| std.fmt.parseInt(u32, number, 10) catch return error.InvalidToolPayload,
+        else => return error.InvalidToolPayload,
+    };
+
+    const chars_text = if (object.get("chars")) |chars_value|
+        switch (chars_value) {
+            .string => |text| text,
+            else => return error.InvalidToolPayload,
+        }
+    else
+        "";
+
+    const yield_ms = sanitizeCommandYieldMs(
+        jsonFieldU32(object, "yield_ms") orelse
+            jsonFieldU32(object, "yield_time_ms") orelse
+            COMMAND_TOOL_DEFAULT_YIELD_MS,
+    );
+
+    return .{
+        .session_id = session_id,
+        .chars = try allocator.dupe(u8, chars_text),
+        .yield_ms = yield_ms,
+    };
+}
+
+fn sanitizeCommandYieldMs(input_ms: u32) u32 {
+    if (input_ms == 0) return 1;
+    return @min(input_ms, COMMAND_TOOL_MAX_YIELD_MS);
+}
+
+fn jsonFieldU32(object: std.json.ObjectMap, key: []const u8) ?u32 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |number| if (number >= 0 and number <= std.math.maxInt(u32)) @as(u32, @intCast(number)) else null,
+        .number_string => |number| std.fmt.parseInt(u32, number, 10) catch null,
+        .float => |number| if (number >= 0 and number <= @as(f64, @floatFromInt(std.math.maxInt(u32)))) @as(u32, @intFromFloat(number)) else null,
+        else => null,
+    };
 }
 
 fn extractCodexPatchPayload(text: []const u8) ?[]const u8 {
@@ -2623,6 +3179,17 @@ fn isAllowedReadCommand(command: []const u8) bool {
     return false;
 }
 
+fn statusToChildTerm(status: u32) std.process.Child.Term {
+    return if (std.posix.W.IFEXITED(status))
+        .{ .Exited = std.posix.W.EXITSTATUS(status) }
+    else if (std.posix.W.IFSIGNALED(status))
+        .{ .Signal = std.posix.W.TERMSIG(status) }
+    else if (std.posix.W.IFSTOPPED(status))
+        .{ .Stopped = std.posix.W.STOPSIG(status) }
+    else
+        .{ .Unknown = status };
+}
+
 fn modelMatchesQuery(model: models.ModelInfo, query: []const u8) bool {
     if (query.len == 0) return true;
     return containsAsciiIgnoreCase(model.id, query) or containsAsciiIgnoreCase(model.name, query);
@@ -2675,6 +3242,58 @@ test "parseReadToolCommand extracts command formats" {
     try std.testing.expect(parseReadToolCommand("normal assistant text") == null);
 }
 
+test "parseExecCommandToolPayload extracts xml and fenced formats" {
+    try std.testing.expectEqualStrings(
+        "{\"cmd\":\"ls -la\"}",
+        parseExecCommandToolPayload("<EXEC_COMMAND>\n{\"cmd\":\"ls -la\"}\n</EXEC_COMMAND>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"cmd\":\"pwd\"}",
+        parseExecCommandToolPayload("```exec_command\n{\"cmd\":\"pwd\"}\n```").?,
+    );
+    try std.testing.expect(parseExecCommandToolPayload("no tool") == null);
+}
+
+test "parseWriteStdinToolPayload extracts xml and fenced formats" {
+    try std.testing.expectEqualStrings(
+        "{\"session_id\":3,\"chars\":\"pwd\\n\"}",
+        parseWriteStdinToolPayload("<WRITE_STDIN>\n{\"session_id\":3,\"chars\":\"pwd\\n\"}\n</WRITE_STDIN>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"session_id\":2,\"chars\":\"exit\\n\"}",
+        parseWriteStdinToolPayload("```write_stdin\n{\"session_id\":2,\"chars\":\"exit\\n\"}\n```").?,
+    );
+    try std.testing.expect(parseWriteStdinToolPayload("no tool") == null);
+}
+
+test "parseExecCommandInput parses json and plain command" {
+    const allocator = std.testing.allocator;
+
+    const json_input = try parseExecCommandInput(allocator, "{\"cmd\":\"ls -la\",\"yield_ms\":1200}");
+    defer allocator.free(json_input.cmd);
+    try std.testing.expectEqualStrings("ls -la", json_input.cmd);
+    try std.testing.expectEqual(@as(u32, 1200), json_input.yield_ms);
+
+    const plain_input = try parseExecCommandInput(allocator, "pwd");
+    defer allocator.free(plain_input.cmd);
+    try std.testing.expectEqualStrings("pwd", plain_input.cmd);
+    try std.testing.expectEqual(@as(u32, COMMAND_TOOL_DEFAULT_YIELD_MS), plain_input.yield_ms);
+}
+
+test "parseWriteStdinInput parses json payload" {
+    const allocator = std.testing.allocator;
+
+    const input = try parseWriteStdinInput(
+        allocator,
+        "{\"session_id\":9,\"chars\":\"echo hi\\n\",\"yield_time_ms\":300}",
+    );
+    defer allocator.free(input.chars);
+
+    try std.testing.expectEqual(@as(u32, 9), input.session_id);
+    try std.testing.expectEqualStrings("echo hi\n", input.chars);
+    try std.testing.expectEqual(@as(u32, 300), input.yield_ms);
+}
+
 test "parseApplyPatchToolPayload extracts codex patch formats" {
     const xml_payload =
         "<APPLY_PATCH>\n" ++
@@ -2705,7 +3324,7 @@ test "parseApplyPatchToolPayload extracts codex patch formats" {
     try std.testing.expect(parseApplyPatchToolPayload("normal assistant text") == null);
 }
 
-test "parseAssistantToolCall detects read and apply_patch" {
+test "parseAssistantToolCall detects read apply_patch exec write" {
     const read_tool = parseAssistantToolCall("<READ>ls</READ>").?;
     switch (read_tool) {
         .read => |command| try std.testing.expectEqualStrings("ls", command),
@@ -2717,6 +3336,18 @@ test "parseAssistantToolCall detects read and apply_patch" {
     ).?;
     switch (patch_call) {
         .apply_patch => |payload| try std.testing.expect(isValidApplyPatchPayload(payload)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const exec_call = parseAssistantToolCall("<EXEC_COMMAND>{\"cmd\":\"pwd\"}</EXEC_COMMAND>").?;
+    switch (exec_call) {
+        .exec_command => |payload| try std.testing.expectEqualStrings("{\"cmd\":\"pwd\"}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const write_call = parseAssistantToolCall("<WRITE_STDIN>{\"session_id\":1,\"chars\":\"pwd\\n\"}</WRITE_STDIN>").?;
+    switch (write_call) {
+        .write_stdin => |payload| try std.testing.expectEqualStrings("{\"session_id\":1,\"chars\":\"pwd\\n\"}", payload),
         else => return error.TestUnexpectedResult,
     }
 }
