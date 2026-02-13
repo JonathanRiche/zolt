@@ -2,6 +2,12 @@
 
 Zolt is a minimal Zig TUI chat client inspired by OpenCode and Codex.
 
+## Status
+
+This is **not ready for production use**.
+
+Right now, Zolt is a test project to see how quickly a harness can be built in Zig for experimentation and testing.
+
 It focuses on a fast single-pane workflow:
 - stream responses in-terminal
 - switch providers/models quickly
