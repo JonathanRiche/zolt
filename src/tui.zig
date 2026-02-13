@@ -112,6 +112,15 @@ pub fn run(
         const read_len = try std.posix.read(std.fs.File.stdin().handle, byte_buf[0..]);
         if (read_len == 0) break;
 
+        if (byte_buf[0] == 26) {
+            app.suspend_requested = true;
+        }
+
+        if (app.suspend_requested) {
+            try suspendForJobControl(&raw_mode, &app);
+            continue;
+        }
+
         const mapped_key = if (byte_buf[0] == 27) try mapEscapeSequenceToKey() else null;
         if (mapped_key) |key| {
             try app.handleByte(key);
@@ -119,9 +128,28 @@ pub fn run(
             try app.handleByte(byte_buf[0]);
         }
 
+        if (app.suspend_requested) {
+            try suspendForJobControl(&raw_mode, &app);
+            continue;
+        }
+
         if (!app.should_exit) {
             try app.render();
         }
+    }
+}
+
+fn suspendForJobControl(raw_mode: *RawMode, app: *App) !void {
+    app.suspend_requested = false;
+    app.stream_stop_for_suspend = false;
+
+    raw_mode.disable();
+    try std.posix.raise(std.posix.SIG.TSTP);
+    raw_mode.* = try RawMode.enable();
+
+    try app.setNotice("Resumed (fg)");
+    if (!app.should_exit) {
+        try app.render();
     }
 }
 
@@ -186,7 +214,9 @@ const App = struct {
     stream_interrupt_last_esc_ms: i64 = 0,
     stream_interrupt_hint_shown: bool = false,
     stream_was_interrupted: bool = false,
+    stream_stop_for_suspend: bool = false,
     stream_started_ms: i64 = 0,
+    suspend_requested: bool = false,
 
     notice: []u8,
 
@@ -388,6 +418,7 @@ const App = struct {
 
         self.is_streaming = true;
         self.stream_was_interrupted = false;
+        self.stream_stop_for_suspend = false;
         self.stream_started_ms = std.time.milliTimestamp();
         self.resetStreamInterruptState();
         defer {
@@ -480,8 +511,12 @@ const App = struct {
         }) catch |err| {
             if (err == error.StreamInterrupted) {
                 self.stream_was_interrupted = true;
-                try self.appendInterruptedMessage();
-                try self.setNotice("Streaming interrupted (Esc Esc)");
+                if (self.stream_stop_for_suspend) {
+                    try self.setNotice("Suspending... use fg to resume");
+                } else {
+                    try self.appendInterruptedMessage();
+                    try self.setNotice("Streaming interrupted (Esc Esc)");
+                }
                 try self.app_state.saveToPath(self.allocator, self.paths.state_path);
                 return false;
             }
@@ -714,6 +749,12 @@ const App = struct {
             var byte_buf: [1]u8 = undefined;
             const read_len = try std.posix.read(std.fs.File.stdin().handle, byte_buf[0..]);
             if (read_len == 0) break;
+
+            if (byte_buf[0] == 26) {
+                self.stream_stop_for_suspend = true;
+                self.suspend_requested = true;
+                return true;
+            }
 
             const now_ms = std.time.milliTimestamp();
             if (registerStreamInterruptByte(
@@ -1996,22 +2037,31 @@ fn buildWorkingPlaceholder(
     const elapsed_ms = @max(@as(i64, 0), now_ms - started_ms);
     const elapsed_s = @divFloor(elapsed_ms, 1000);
 
-    const max_bar = @max(@as(usize, 10), @min(@as(usize, 24), width / 4));
-    const span: usize = if (max_bar > 1) max_bar - 1 else 1;
-    const period_i64: i64 = @as(i64, @intCast(span)) * 2;
-    const frame = @divFloor(elapsed_ms, 80);
+    const max_bar = @max(@as(usize, 12), @min(@as(usize, 28), width / 3));
+    const segment_len = @max(@as(usize, 4), @min(@as(usize, 8), max_bar / 4));
+    const travel = if (max_bar > segment_len) max_bar - segment_len else 1;
+    const period_i64: i64 = @as(i64, @intCast(travel)) * 2;
+    const frame = @divFloor(elapsed_ms, 70);
     const phase = @as(usize, @intCast(@mod(frame, period_i64)));
-    const head = if (phase <= span) phase else @as(usize, @intCast(period_i64 - @as(i64, @intCast(phase))));
+    const forward = phase <= travel;
+    const offset = if (forward) phase else @as(usize, @intCast(period_i64 - @as(i64, @intCast(phase))));
 
     var bar_buf: [32]u8 = undefined;
     std.debug.assert(max_bar <= bar_buf.len);
     for (0..max_bar) |index| {
         bar_buf[index] = '-';
-        if (index == head) {
-            bar_buf[index] = '#';
-        } else if ((head > 0 and index + 1 == head) or index == head + 1) {
-            bar_buf[index] = '=';
-        }
+    }
+
+    var seg_index: usize = 0;
+    while (seg_index < segment_len and offset + seg_index < max_bar) : (seg_index += 1) {
+        bar_buf[offset + seg_index] = '=';
+    }
+
+    if (forward) {
+        const head = offset + segment_len - 1;
+        if (head < max_bar) bar_buf[head] = '>';
+    } else {
+        if (offset < max_bar) bar_buf[offset] = '<';
     }
 
     return std.fmt.allocPrint(
@@ -2856,5 +2906,8 @@ test "buildWorkingPlaceholder includes timer and interrupt hint" {
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "Working 5s") != null);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "Esc Esc to interrupt") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, placeholder, '[') != null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, placeholder, '#') != null);
+    try std.testing.expect(
+        std.mem.indexOfScalar(u8, placeholder, '>') != null or
+            std.mem.indexOfScalar(u8, placeholder, '<') != null,
+    );
 }
