@@ -36,6 +36,7 @@ const StreamTask = enum {
     running_exec_command,
     running_write_stdin,
     running_web_search,
+    running_view_image,
 };
 
 const TerminalMetrics = struct {
@@ -65,6 +66,10 @@ const WriteStdinInput = struct {
 const WebSearchInput = struct {
     query: []u8,
     limit: u8 = WEB_SEARCH_DEFAULT_RESULTS,
+};
+
+const ViewImageInput = struct {
+    path: []u8,
 };
 
 const ListDirInput = struct {
@@ -138,6 +143,29 @@ const SessionDrainResult = struct {
     output_limited: bool = false,
 };
 
+const VisionCaptionResult = struct {
+    caption: ?[]u8 = null,
+    error_detail: ?[]u8 = null,
+};
+
+const ImageFileInfo = struct {
+    bytes: u64,
+    format: []const u8,
+    mime: []const u8,
+    width: ?u32 = null,
+    height: ?u32 = null,
+    sha256_hex: ?[]u8 = null,
+
+    fn deinit(self: *ImageFileInfo, allocator: std.mem.Allocator) void {
+        if (self.sha256_hex) |sha| allocator.free(sha);
+    }
+};
+
+const ClipboardImageCapture = struct {
+    bytes: []u8,
+    mime: []const u8,
+};
+
 const MODEL_PICKER_MAX_ROWS: usize = 8;
 const FILE_PICKER_MAX_ROWS: usize = 8;
 const COMMAND_PICKER_MAX_ROWS: usize = 8;
@@ -152,6 +180,9 @@ const COMMAND_TOOL_MAX_SESSIONS: usize = 8;
 const WEB_SEARCH_DEFAULT_RESULTS: u8 = 5;
 const WEB_SEARCH_MAX_RESULTS: u8 = 10;
 const WEB_SEARCH_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const IMAGE_TOOL_MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+const IMAGE_VISION_MAX_BYTES: usize = 6 * 1024 * 1024;
+const CLIPBOARD_IMAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const LIST_DIR_DEFAULT_MAX_ENTRIES: u16 = 200;
 const LIST_DIR_MAX_ENTRIES: u16 = 1000;
 const READ_FILE_DEFAULT_MAX_BYTES: u32 = 12 * 1024;
@@ -169,7 +200,7 @@ const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
 const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const TOOL_SYSTEM_PROMPT =
-    "You can use nine local tools.\n" ++
+    "You can use ten local tools.\n" ++
     "When you need to inspect files, reply with ONLY:\n" ++
     "<READ>\n" ++
     "<command>\n" ++
@@ -209,7 +240,14 @@ const TOOL_SYSTEM_PROMPT =
     "<WEB_SEARCH>\n" ++
     "{\"query\":\"zig 0.15 release notes\",\"limit\":5}\n" ++
     "</WEB_SEARCH>\n" ++
-    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], or [web-search-result], continue the answer normally.";
+    "For image metadata inspection, use:\n" ++
+    "<VIEW_IMAGE>\n" ++
+    "{\"path\":\"/absolute/or/relative/image.png\"}\n" ++
+    "</VIEW_IMAGE>\n" ++
+    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], or [view-image-result], continue the answer normally.";
+
+const VIEW_IMAGE_VISION_PROMPT =
+    "Describe this image for a coding assistant. Focus on visible UI/text/code, layout, key errors/warnings, and actionable observations. Keep it concise.";
 
 const RawMode = struct {
     original_termios: std.posix.termios,
@@ -518,6 +556,9 @@ const App = struct {
                     self.moveFilePickerSelection(-1);
                 }
             },
+            22 => {
+                try self.pasteClipboardImageIntoInput();
+            },
             else => {
                 if (key_byte >= 32 and key_byte <= 126) {
                     try self.input_buffer.insert(self.allocator, self.input_cursor, key_byte);
@@ -604,7 +645,7 @@ const App = struct {
 
         var step: usize = 0;
         while (step < TOOL_MAX_STEPS) : (step += 1) {
-            const success = try self.streamAssistantOnce(provider_id, model_id, api_key.?);
+            const success = try self.streamAssistantOnce(provider_id, model_id, api_key.?, true);
             if (!success) break;
 
             const assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
@@ -738,16 +779,36 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran WEB_SEARCH tool");
                 },
+                .view_image => |view_image_payload| {
+                    self.stream_task = .running_view_image;
+                    try self.render();
+                    const view_image_payload_owned = try self.allocator.dupe(u8, view_image_payload);
+                    defer self.allocator.free(view_image_payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] VIEW_IMAGE");
+
+                    const tool_result = try self.runViewImageToolPayload(view_image_payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran VIEW_IMAGE tool");
+                },
             }
             self.stream_task = .thinking;
             try self.render();
         }
 
-        if (step == TOOL_MAX_STEPS) {
-            const conversation = self.app_state.currentConversationConst();
-            const last_message = conversation.messages.items[conversation.messages.items.len - 1];
-            if (parseAssistantToolCall(last_message.content) != null) {
-                try self.app_state.appendMessage(self.allocator, .system, "[tool-result]\nTool step limit reached. Continue without additional tool calls.");
+        const conversation_after_loop = self.app_state.currentConversationConst();
+        if (conversation_after_loop.messages.items.len > 0) {
+            const last_message = conversation_after_loop.messages.items[conversation_after_loop.messages.items.len - 1];
+            if (parseAssistantToolCall(last_message.content) != null and !self.stream_was_interrupted) {
+                if (step == TOOL_MAX_STEPS) {
+                    try self.app_state.appendMessage(self.allocator, .system, "[tool-result]\nTool step limit reached. Stop calling tools and answer the user directly.");
+                } else {
+                    try self.app_state.appendMessage(self.allocator, .system, "[tool-result]\nTool output is already available. Stop calling tools and answer the user directly.");
+                }
+                try self.app_state.appendMessage(self.allocator, .assistant, "");
+                _ = try self.streamAssistantOnce(provider_id, model_id, api_key.?, false);
             }
         }
 
@@ -757,14 +818,14 @@ const App = struct {
         try self.app_state.saveToPath(self.allocator, self.paths.state_path);
     }
 
-    fn streamAssistantOnce(self: *App, provider_id: []const u8, model_id: []const u8, api_key: []const u8) !bool {
+    fn streamAssistantOnce(self: *App, provider_id: []const u8, model_id: []const u8, api_key: []const u8, include_tool_prompt: bool) !bool {
         const provider_info = self.catalog.findProviderConst(provider_id);
         const request: provider_client.StreamRequest = .{
             .provider_id = provider_id,
             .model_id = model_id,
             .api_key = api_key,
             .base_url = if (provider_info) |info| info.api_base else null,
-            .messages = try self.buildStreamMessages(true),
+            .messages = try self.buildStreamMessages(include_tool_prompt),
         };
         defer self.allocator.free(request.messages);
 
@@ -1540,6 +1601,350 @@ const App = struct {
         return output.toOwnedSlice();
     }
 
+    fn runViewImageToolPayload(self: *App, payload: []const u8) ![]u8 {
+        const input = parseViewImageInput(self.allocator, payload) catch {
+            return self.allocator.dupe(u8, "[view-image-result]\nerror: invalid payload (expected plain path or JSON with path)");
+        };
+        defer self.allocator.free(input.path);
+
+        if (input.path.len == 0) {
+            return self.allocator.dupe(u8, "[view-image-result]\nerror: empty path");
+        }
+
+        const maybe_image_info = inspectImageFile(self.allocator, input.path, true) catch |err| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[view-image-result]\npath: {s}\nerror: {s}",
+                .{ input.path, @errorName(err) },
+            );
+        };
+        if (maybe_image_info == null) {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[view-image-result]\npath: {s}\nerror: unsupported or unknown image format",
+                .{input.path},
+            );
+        }
+        var image_info = maybe_image_info.?;
+        defer image_info.deinit(self.allocator);
+
+        if (image_info.format.len == 0) {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[view-image-result]\npath: {s}\nerror: unsupported or unknown image format",
+                .{input.path},
+            );
+        }
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+
+        try output.writer.print(
+            "[view-image-result]\npath: {s}\nbytes: {d}\nformat: {s}\nmime: {s}\n",
+            .{ input.path, image_info.bytes, image_info.format, image_info.mime },
+        );
+        if (image_info.width != null and image_info.height != null) {
+            try output.writer.print("dimensions: {d}x{d}\n", .{ image_info.width.?, image_info.height.? });
+        } else {
+            try output.writer.writeAll("dimensions: unknown\n");
+        }
+        if (image_info.sha256_hex) |sha| {
+            try output.writer.print("sha256: {s}\n", .{sha});
+        }
+
+        var vision_note: []const u8 = "metadata-only";
+        var vision_caption: ?[]u8 = null;
+        defer if (vision_caption) |caption| self.allocator.free(caption);
+        var vision_error: ?[]u8 = null;
+        defer if (vision_error) |detail| self.allocator.free(detail);
+
+        if (isOpenAiCompatibleProviderId(self.app_state.selected_provider_id)) {
+            const api_key = try self.resolveApiKey(self.app_state.selected_provider_id);
+            defer if (api_key) |key| self.allocator.free(key);
+
+            if (api_key) |key| {
+                const provider_info = self.catalog.findProviderConst(self.app_state.selected_provider_id);
+                const base_url = if (provider_info) |info|
+                    (info.api_base orelse defaultBaseUrlForProviderId(self.app_state.selected_provider_id) orelse "")
+                else
+                    (defaultBaseUrlForProviderId(self.app_state.selected_provider_id) orelse "");
+                if (base_url.len > 0) {
+                    const vision_result = try self.tryVisionCaptionOpenAiCompatible(
+                        input.path,
+                        image_info.mime,
+                        self.app_state.selected_provider_id,
+                        base_url,
+                        key,
+                    );
+                    if (vision_result.caption) |caption| {
+                        vision_note = "visual-caption-ok";
+                        vision_caption = caption;
+                    } else if (vision_result.error_detail) |detail| {
+                        vision_note = "visual-caption-failed";
+                        vision_error = detail;
+                    } else {
+                        vision_note = "visual-caption-unavailable";
+                    }
+                } else {
+                    vision_note = "visual-caption-unsupported-provider-base-url";
+                }
+            } else {
+                vision_note = "visual-caption-missing-api-key";
+            }
+        } else {
+            vision_note = "visual-caption-unsupported-provider";
+        }
+
+        if (vision_caption) |caption| {
+            try output.writer.writeAll("vision_caption:\n");
+            try output.writer.writeAll(caption);
+            if (caption.len == 0 or caption[caption.len - 1] != '\n') {
+                try output.writer.writeByte('\n');
+            }
+        } else if (vision_error) |detail| {
+            try output.writer.print("vision_error: {s}\n", .{detail});
+        }
+        try output.writer.print("note: {s}\n", .{vision_note});
+
+        return output.toOwnedSlice();
+    }
+
+    fn pasteClipboardImageIntoInput(self: *App) !void {
+        const capture = captureClipboardImage(self.allocator) catch |err| {
+            try self.setNoticeFmt("Clipboard image paste failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(capture.bytes);
+
+        const images_dir = try std.fs.path.join(self.allocator, &.{ self.paths.data_dir, "images" });
+        defer self.allocator.free(images_dir);
+        try std.fs.cwd().makePath(images_dir);
+
+        const ext = extensionForImageMime(capture.mime);
+        const timestamp_ms = @as(u64, @intCast(@max(@as(i64, 0), std.time.milliTimestamp())));
+        const filename = try std.fmt.allocPrint(self.allocator, "clipboard-{d}.{s}", .{ timestamp_ms, ext });
+        defer self.allocator.free(filename);
+
+        const image_path = try std.fs.path.join(self.allocator, &.{ images_dir, filename });
+        defer self.allocator.free(image_path);
+
+        var file = try std.fs.createFileAbsolute(image_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(capture.bytes);
+
+        const rewritten = rewriteInputWithSelectedAtPath(
+            self.allocator,
+            self.input_buffer.items,
+            self.input_cursor,
+            image_path,
+        ) catch |err| switch (err) {
+            error.MissingAtToken => try insertAtPathTokenAtCursor(
+                self.allocator,
+                self.input_buffer.items,
+                self.input_cursor,
+                image_path,
+            ),
+            else => return err,
+        };
+        defer self.allocator.free(rewritten.text);
+
+        self.input_buffer.clearRetainingCapacity();
+        try self.input_buffer.appendSlice(self.allocator, rewritten.text);
+        self.input_cursor = rewritten.cursor;
+        self.syncPickersFromInput();
+
+        try self.setNoticeFmt("Pasted image from clipboard -> @{s}", .{image_path});
+    }
+
+    fn tryVisionCaptionOpenAiCompatible(
+        self: *App,
+        image_path: []const u8,
+        image_mime: []const u8,
+        provider_id: []const u8,
+        base_url: []const u8,
+        api_key: []const u8,
+    ) !VisionCaptionResult {
+        var env_model_owned: ?[]u8 = null;
+        defer if (env_model_owned) |text| self.allocator.free(text);
+
+        env_model_owned = std.process.getEnvVarOwned(self.allocator, "ZOLT_VISION_MODEL") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        };
+
+        const selected_model = self.app_state.selected_model_id;
+        const env_model = if (env_model_owned) |text| std.mem.trim(u8, text, " \t\r\n") else "";
+        const default_model = defaultVisionModelForProvider(provider_id);
+
+        const candidates = [_][]const u8{
+            selected_model,
+            env_model,
+            default_model,
+        };
+        var attempted: [3][]const u8 = undefined;
+        var attempted_count: usize = 0;
+
+        var last_error_detail: ?[]u8 = null;
+        errdefer if (last_error_detail) |detail| self.allocator.free(detail);
+
+        for (candidates) |candidate| {
+            if (candidate.len == 0) continue;
+            var is_duplicate = false;
+            for (attempted[0..attempted_count]) |previous| {
+                if (std.mem.eql(u8, previous, candidate)) {
+                    is_duplicate = true;
+                    break;
+                }
+            }
+            if (is_duplicate) continue;
+            attempted[attempted_count] = candidate;
+            attempted_count += 1;
+
+            const attempt = try self.requestVisionCaptionOpenAiCompatible(
+                image_path,
+                image_mime,
+                provider_id,
+                base_url,
+                api_key,
+                candidate,
+            );
+            if (attempt.caption) |caption| {
+                if (last_error_detail) |detail| self.allocator.free(detail);
+                return .{ .caption = caption };
+            }
+            if (attempt.error_detail) |detail| {
+                if (last_error_detail) |old| self.allocator.free(old);
+                last_error_detail = detail;
+            }
+        }
+
+        return .{ .error_detail = last_error_detail };
+    }
+
+    fn requestVisionCaptionOpenAiCompatible(
+        self: *App,
+        image_path: []const u8,
+        image_mime: []const u8,
+        provider_id: []const u8,
+        base_url: []const u8,
+        api_key: []const u8,
+        model_id: []const u8,
+    ) !VisionCaptionResult {
+        const data_url = loadImageAsDataUrl(self.allocator, image_path, image_mime, IMAGE_VISION_MAX_BYTES) catch |err| switch (err) {
+            error.FileTooBig => return .{ .error_detail = try std.fmt.allocPrint(self.allocator, "image too large for vision request (max:{d} bytes)", .{IMAGE_VISION_MAX_BYTES}) },
+            else => return .{ .error_detail = try std.fmt.allocPrint(self.allocator, "failed to encode image: {s}", .{@errorName(err)}) },
+        };
+        defer self.allocator.free(data_url);
+
+        const endpoint = try std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{trimTrailingSlashLocal(base_url)});
+        defer self.allocator.free(endpoint);
+
+        var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer payload_writer.deinit();
+        var jw: std.json.Stringify = .{
+            .writer = &payload_writer.writer,
+        };
+
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(model_id);
+        try jw.objectField("max_tokens");
+        try jw.write(@as(u16, 400));
+        try jw.objectField("messages");
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write("user");
+        try jw.objectField("content");
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write("text");
+        try jw.objectField("text");
+        try jw.write(VIEW_IMAGE_VISION_PROMPT);
+        try jw.endObject();
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write("image_url");
+        try jw.objectField("image_url");
+        try jw.beginObject();
+        try jw.objectField("url");
+        try jw.write(data_url);
+        try jw.endObject();
+        try jw.endObject();
+        try jw.endArray();
+        try jw.endObject();
+        try jw.endArray();
+        try jw.endObject();
+
+        const payload = try payload_writer.toOwnedSlice();
+        defer self.allocator.free(payload);
+
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
+        defer self.allocator.free(auth_header);
+
+        var extra_headers: [2]std.http.Header = .{
+            .{ .name = "HTTP-Referer", .value = "https://opencode.ai/" },
+            .{ .name = "X-Title", .value = "zolt" },
+        };
+        const use_referrer_headers = std.mem.eql(u8, provider_id, "openrouter") or
+            std.mem.eql(u8, provider_id, "opencode") or
+            std.mem.eql(u8, provider_id, "zenmux");
+
+        var client: std.http.Client = .{ .allocator = self.allocator };
+        defer client.deinit();
+
+        const uri = std.Uri.parse(endpoint) catch {
+            return .{ .error_detail = try self.allocator.dupe(u8, "invalid provider endpoint") };
+        };
+        var req = client.request(.POST, uri, .{
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+                .authorization = .{ .override = auth_header },
+                .user_agent = .{ .override = "zolt/0.1" },
+            },
+            .extra_headers = if (use_referrer_headers) extra_headers[0..] else &.{},
+            .keep_alive = false,
+        }) catch |err| {
+            return .{ .error_detail = try std.fmt.allocPrint(self.allocator, "request build failed: {s}", .{@errorName(err)}) };
+        };
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var body_writer = req.sendBodyUnflushed(&.{}) catch |err| {
+            return .{ .error_detail = try std.fmt.allocPrint(self.allocator, "request send failed: {s}", .{@errorName(err)}) };
+        };
+        body_writer.writer.writeAll(payload) catch |err| {
+            return .{ .error_detail = try std.fmt.allocPrint(self.allocator, "request write failed: {s}", .{@errorName(err)}) };
+        };
+        body_writer.end() catch |err| {
+            return .{ .error_detail = try std.fmt.allocPrint(self.allocator, "request finalize failed: {s}", .{@errorName(err)}) };
+        };
+        req.connection.?.flush() catch |err| {
+            return .{ .error_detail = try std.fmt.allocPrint(self.allocator, "request flush failed: {s}", .{@errorName(err)}) };
+        };
+
+        var response = req.receiveHead(&.{}) catch |err| {
+            return .{ .error_detail = try std.fmt.allocPrint(self.allocator, "response header failed: {s}", .{@errorName(err)}) };
+        };
+        const response_body = readHttpResponseBodyAlloc(self.allocator, &response) catch |err| {
+            return .{ .error_detail = try std.fmt.allocPrint(self.allocator, "response read failed: {s}", .{@errorName(err)}) };
+        };
+        defer self.allocator.free(response_body);
+
+        if (response.head.status != .ok) {
+            return .{ .error_detail = try formatHttpErrorDetail(self.allocator, response.head.status, response_body) };
+        }
+
+        const caption = parseVisionCaptionFromChatCompletionsAlloc(self.allocator, response_body) catch |err| {
+            return .{ .error_detail = try std.fmt.allocPrint(self.allocator, "invalid vision response: {s}", .{@errorName(err)}) };
+        };
+        if (caption == null) {
+            return .{ .error_detail = try self.allocator.dupe(u8, "vision response missing caption text") };
+        }
+        return .{ .caption = caption.? };
+    }
+
     fn appendCommandDrainOutput(self: *App, writer: *std.Io.Writer, drained: SessionDrainResult) !void {
         _ = self;
         if (drained.stdout.len > 0) {
@@ -1892,7 +2297,7 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /quit  input: use @path, pickers: Ctrl-N/P + Enter, assistant tools: <READ>, <LIST_DIR>, <READ_FILE>, <GREP_FILES>, <PROJECT_SEARCH>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>, <WEB_SEARCH>");
+            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /paste-image /quit  input: use @path, Ctrl-V paste image, pickers: Ctrl-N/P + Enter, assistant tools: <READ>, <LIST_DIR>, <READ_FILE>, <GREP_FILES>, <PROJECT_SEARCH>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>, <WEB_SEARCH>, <VIEW_IMAGE>");
             return;
         }
 
@@ -1989,6 +2394,11 @@ const App = struct {
             }
 
             try self.setNoticeFmt("file index has {d} files. Use /files refresh after file changes.", .{self.file_index.items.len});
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "paste-image")) {
+            try self.pasteClipboardImageIntoInput();
             return;
         }
 
@@ -2277,7 +2687,7 @@ const App = struct {
         else if (self.file_picker_open)
             "ctrl-n/p or up/down, enter/tab insert, esc close"
         else if (self.mode == .insert)
-            "enter esc /"
+            "enter esc / ctrl-v"
         else
             "i j/k H/L / q";
         const context_summary = try self.contextUsageSummary(conversation);
@@ -3156,6 +3566,7 @@ fn streamTaskTitle(task: StreamTask) []const u8 {
         .running_exec_command => "Running EXEC_COMMAND",
         .running_write_stdin => "Running WRITE_STDIN",
         .running_web_search => "Running WEB_SEARCH",
+        .running_view_image => "Running VIEW_IMAGE",
     };
 }
 
@@ -3453,6 +3864,7 @@ const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "title", .description = "rename conversation" },
     .{ .name = "theme", .description = "set theme (codex/plain/forest)" },
     .{ .name = "ui", .description = "set ui mode (compact/comfy)" },
+    .{ .name = "paste-image", .description = "paste clipboard image into @path" },
     .{ .name = "quit", .description = "exit app", .insert_trailing_space = false },
     .{ .name = "q", .description = "exit app", .insert_trailing_space = false },
 };
@@ -3507,6 +3919,7 @@ const AssistantToolCall = union(enum) {
     exec_command: []const u8,
     write_stdin: []const u8,
     web_search: []const u8,
+    view_image: []const u8,
 };
 
 fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
@@ -3530,6 +3943,9 @@ fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
     }
     if (parseWebSearchToolPayload(text)) |payload| {
         return .{ .web_search = payload };
+    }
+    if (parseViewImageToolPayload(text)) |payload| {
+        return .{ .view_image = payload };
     }
     if (parseReadToolCommand(text)) |command| {
         return .{ .read = command };
@@ -3708,6 +4124,26 @@ fn parseWebSearchToolPayload(text: []const u8) ?[]const u8 {
     return null;
 }
 
+fn parseViewImageToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<VIEW_IMAGE>")) {
+        const rest = trimmed["<VIEW_IMAGE>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</VIEW_IMAGE>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```view_image")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    return null;
+}
+
 fn parseApplyPatchToolPayload(text: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return null;
@@ -3844,6 +4280,35 @@ fn parseWebSearchInput(allocator: std.mem.Allocator, payload: []const u8) !WebSe
     return .{
         .query = try allocator.dupe(u8, std.mem.trim(u8, query, " \t\r\n")),
         .limit = limit,
+    };
+}
+
+fn parseViewImageInput(allocator: std.mem.Allocator, payload: []const u8) !ViewImageInput {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidToolPayload;
+
+    if (trimmed[0] != '{') {
+        return .{
+            .path = try allocator.dupe(u8, trimMatchingOuterQuotes(trimmed)),
+        };
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidToolPayload,
+    };
+
+    const path_value = object.get("path") orelse object.get("file") orelse return error.InvalidToolPayload;
+    const path_text = switch (path_value) {
+        .string => |text| text,
+        else => return error.InvalidToolPayload,
+    };
+
+    return .{
+        .path = try allocator.dupe(u8, trimMatchingOuterQuotes(std.mem.trim(u8, path_text, " \t\r\n"))),
     };
 }
 
@@ -4357,15 +4822,7 @@ fn rewriteInputWithSelectedAtPath(
 ) !RewriteResult {
     const token = currentAtTokenRange(input, cursor) orelse return error.MissingAtToken;
 
-    const quoted = blk: {
-        if (!containsWhitespace(path)) break :blk false;
-        if (std.mem.indexOfScalar(u8, path, '"') == null) break :blk true;
-        break :blk false;
-    };
-    const inserted_token = if (quoted)
-        try std.fmt.allocPrint(allocator, "@\"{s}\"", .{path})
-    else
-        try std.fmt.allocPrint(allocator, "@{s}", .{path});
+    const inserted_token = try atPathTokenForInsert(allocator, path);
     defer allocator.free(inserted_token);
 
     const suffix = std.mem.trimLeft(u8, input[token.end..], " \t");
@@ -4381,6 +4838,61 @@ fn rewriteInputWithSelectedAtPath(
         .text = out,
         .cursor = token.start + inserted_token.len + 1,
     };
+}
+
+fn insertAtPathTokenAtCursor(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    cursor: usize,
+    path: []const u8,
+) !RewriteResult {
+    const safe_cursor = @min(cursor, input.len);
+    const inserted_token = try atPathTokenForInsert(allocator, path);
+    defer allocator.free(inserted_token);
+
+    const needs_leading_space = safe_cursor > 0 and !std.ascii.isWhitespace(input[safe_cursor - 1]);
+    const needs_trailing_space = safe_cursor < input.len and !std.ascii.isWhitespace(input[safe_cursor]);
+    const extra: usize = (if (needs_leading_space) @as(usize, 1) else 0) + (if (needs_trailing_space) @as(usize, 1) else 0);
+    const new_len = input.len + inserted_token.len + extra;
+    var out = try allocator.alloc(u8, new_len);
+
+    var write_index: usize = 0;
+    @memcpy(out[write_index .. write_index + safe_cursor], input[0..safe_cursor]);
+    write_index += safe_cursor;
+
+    if (needs_leading_space) {
+        out[write_index] = ' ';
+        write_index += 1;
+    }
+
+    @memcpy(out[write_index .. write_index + inserted_token.len], inserted_token);
+    write_index += inserted_token.len;
+
+    if (needs_trailing_space) {
+        out[write_index] = ' ';
+        write_index += 1;
+    }
+
+    @memcpy(out[write_index .. write_index + (input.len - safe_cursor)], input[safe_cursor..]);
+    write_index += input.len - safe_cursor;
+    std.debug.assert(write_index == new_len);
+
+    return .{
+        .text = out,
+        .cursor = safe_cursor + (if (needs_leading_space) @as(usize, 1) else 0) + inserted_token.len + (if (needs_trailing_space) @as(usize, 1) else 0),
+    };
+}
+
+fn atPathTokenForInsert(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const quoted = blk: {
+        if (!containsWhitespace(path)) break :blk false;
+        if (std.mem.indexOfScalar(u8, path, '"') == null) break :blk true;
+        break :blk false;
+    };
+    return if (quoted)
+        std.fmt.allocPrint(allocator, "@\"{s}\"", .{path})
+    else
+        std.fmt.allocPrint(allocator, "@{s}", .{path});
 }
 
 fn containsWhitespace(text: []const u8) bool {
@@ -4424,6 +4936,23 @@ fn buildFileInjectionPayload(allocator: std.mem.Allocator, prompt: []const u8) !
             continue;
         }
 
+        const image_info = inspectImageFile(allocator, path, false) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+        if (image_info) |info| {
+            included_count += 1;
+            try body_writer.writer.print(
+                "<image path=\"{s}\" mime=\"{s}\" format=\"{s}\" bytes=\"{d}\"",
+                .{ path, info.mime, info.format, info.bytes },
+            );
+            if (info.width != null and info.height != null) {
+                try body_writer.writer.print(" width=\"{d}\" height=\"{d}\"", .{ info.width.?, info.height.? });
+            }
+            try body_writer.writer.writeAll(" />\n");
+            continue;
+        }
+
         const file_content = readFileForInjection(allocator, path) catch {
             skipped_count += 1;
             continue;
@@ -4463,7 +4992,7 @@ fn buildFileInjectionPayload(allocator: std.mem.Allocator, prompt: []const u8) !
         .{ FILE_INJECT_HEADER, included_count, references.items.len, skipped_count },
     );
     try payload_writer.writer.writeAll(
-        "The user referenced these files with @path. Treat this as project context.\n",
+        "The user referenced these files with @path. Treat this as project context. For <image .../> entries use <VIEW_IMAGE> to inspect metadata.\n",
     );
     try payload_writer.writer.writeAll(body);
 
@@ -4534,6 +5063,554 @@ fn readFileForInjection(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var file = try openFileForPath(path, .{});
     defer file.close();
     return file.readToEndAlloc(allocator, FILE_INJECT_MAX_FILE_BYTES);
+}
+
+fn inspectImageFile(allocator: std.mem.Allocator, path: []const u8, include_sha256: bool) !?ImageFileInfo {
+    var file = openFileForPath(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+
+    const stat = try file.stat();
+    const bytes = stat.size;
+    if (bytes == 0) return null;
+    if (bytes > IMAGE_TOOL_MAX_FILE_BYTES) return error.FileTooBig;
+
+    const header_cap: usize = @intCast(@min(bytes, @as(u64, 512 * 1024)));
+    var header = try allocator.alloc(u8, header_cap);
+    defer allocator.free(header);
+    const header_len = try file.readAll(header);
+    if (header_len == 0) return null;
+
+    const header_info = parseImageHeader(header[0..header_len]) orelse return null;
+
+    var result: ImageFileInfo = .{
+        .bytes = bytes,
+        .format = header_info.format,
+        .mime = header_info.mime,
+        .width = header_info.width,
+        .height = header_info.height,
+        .sha256_hex = null,
+    };
+
+    if (include_sha256) {
+        result.sha256_hex = try sha256FileHex(allocator, path);
+    }
+
+    return result;
+}
+
+const ParsedImageHeader = struct {
+    format: []const u8,
+    mime: []const u8,
+    width: ?u32 = null,
+    height: ?u32 = null,
+};
+
+fn parseImageHeader(bytes: []const u8) ?ParsedImageHeader {
+    if (parsePngHeader(bytes)) |parsed| return parsed;
+    if (parseJpegHeader(bytes)) |parsed| return parsed;
+    if (parseGifHeader(bytes)) |parsed| return parsed;
+    if (parseBmpHeader(bytes)) |parsed| return parsed;
+    if (parseWebpHeader(bytes)) |parsed| return parsed;
+    return null;
+}
+
+fn parsePngHeader(bytes: []const u8) ?ParsedImageHeader {
+    if (bytes.len < 24) return null;
+    const png_signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    if (!std.mem.eql(u8, bytes[0..8], png_signature[0..])) return null;
+    const width = readU32Be(bytes[16..20]);
+    const height = readU32Be(bytes[20..24]);
+    return .{
+        .format = "png",
+        .mime = "image/png",
+        .width = width,
+        .height = height,
+    };
+}
+
+fn parseGifHeader(bytes: []const u8) ?ParsedImageHeader {
+    if (bytes.len < 10) return null;
+    const sig = bytes[0..6];
+    if (!std.mem.eql(u8, sig, "GIF87a") and !std.mem.eql(u8, sig, "GIF89a")) return null;
+    const width = readU16Le(bytes[6..8]);
+    const height = readU16Le(bytes[8..10]);
+    return .{
+        .format = "gif",
+        .mime = "image/gif",
+        .width = width,
+        .height = height,
+    };
+}
+
+fn parseBmpHeader(bytes: []const u8) ?ParsedImageHeader {
+    if (bytes.len < 26) return null;
+    if (!std.mem.eql(u8, bytes[0..2], "BM")) return null;
+
+    const width_i32 = @as(i32, @bitCast(readU32Le(bytes[18..22])));
+    const height_i32 = @as(i32, @bitCast(readU32Le(bytes[22..26])));
+    const width: u32 = if (width_i32 < 0) @as(u32, @intCast(-width_i32)) else @as(u32, @intCast(width_i32));
+    const height: u32 = if (height_i32 < 0) @as(u32, @intCast(-height_i32)) else @as(u32, @intCast(height_i32));
+
+    return .{
+        .format = "bmp",
+        .mime = "image/bmp",
+        .width = width,
+        .height = height,
+    };
+}
+
+fn parseJpegHeader(bytes: []const u8) ?ParsedImageHeader {
+    if (bytes.len < 4) return null;
+    if (bytes[0] != 0xff or bytes[1] != 0xd8) return null;
+
+    var index: usize = 2;
+    while (index + 3 < bytes.len) {
+        if (bytes[index] != 0xff) {
+            index += 1;
+            continue;
+        }
+
+        while (index < bytes.len and bytes[index] == 0xff) : (index += 1) {}
+        if (index >= bytes.len) break;
+
+        const marker = bytes[index];
+        index += 1;
+
+        if (marker == 0xd8 or marker == 0xd9) continue;
+        if (marker == 0x01 or (marker >= 0xd0 and marker <= 0xd7)) continue;
+        if (index + 1 >= bytes.len) break;
+
+        const segment_len = readU16Be(bytes[index .. index + 2]);
+        if (segment_len < 2) break;
+        if (index + segment_len > bytes.len) break;
+
+        if (isJpegStartOfFrameMarker(marker) and segment_len >= 7) {
+            const height = readU16Be(bytes[index + 3 .. index + 5]);
+            const width = readU16Be(bytes[index + 5 .. index + 7]);
+            return .{
+                .format = "jpeg",
+                .mime = "image/jpeg",
+                .width = width,
+                .height = height,
+            };
+        }
+
+        index += segment_len;
+    }
+
+    return .{
+        .format = "jpeg",
+        .mime = "image/jpeg",
+    };
+}
+
+fn parseWebpHeader(bytes: []const u8) ?ParsedImageHeader {
+    if (bytes.len < 16) return null;
+    if (!std.mem.eql(u8, bytes[0..4], "RIFF")) return null;
+    if (!std.mem.eql(u8, bytes[8..12], "WEBP")) return null;
+
+    var index: usize = 12;
+    while (index + 8 <= bytes.len) {
+        const chunk_tag = bytes[index .. index + 4];
+        const chunk_size = readU32Le(bytes[index + 4 .. index + 8]);
+        const payload_start = index + 8;
+        if (payload_start > bytes.len) break;
+        const chunk_bytes = @as(usize, @intCast(chunk_size));
+        if (payload_start + chunk_bytes > bytes.len) break;
+        const payload = bytes[payload_start .. payload_start + chunk_bytes];
+
+        if (std.mem.eql(u8, chunk_tag, "VP8X") and payload.len >= 10) {
+            const width_minus_one = readU24Le(payload[4..7]);
+            const height_minus_one = readU24Le(payload[7..10]);
+            return .{
+                .format = "webp",
+                .mime = "image/webp",
+                .width = width_minus_one + 1,
+                .height = height_minus_one + 1,
+            };
+        }
+
+        if (std.mem.eql(u8, chunk_tag, "VP8 ") and payload.len >= 10) {
+            if (!(payload[3] == 0x9d and payload[4] == 0x01 and payload[5] == 0x2a)) {
+                return .{ .format = "webp", .mime = "image/webp" };
+            }
+            const width = readU16Le(payload[6..8]) & 0x3fff;
+            const height = readU16Le(payload[8..10]) & 0x3fff;
+            return .{
+                .format = "webp",
+                .mime = "image/webp",
+                .width = width,
+                .height = height,
+            };
+        }
+
+        if (std.mem.eql(u8, chunk_tag, "VP8L") and payload.len >= 5 and payload[0] == 0x2f) {
+            const width = 1 + @as(u32, payload[1]) + (@as(u32, payload[2] & 0x3f) << 8);
+            const height = 1 + (@as(u32, payload[2] >> 6) | (@as(u32, payload[3]) << 2) | (@as(u32, payload[4] & 0x0f) << 10));
+            return .{
+                .format = "webp",
+                .mime = "image/webp",
+                .width = width,
+                .height = height,
+            };
+        }
+
+        const padded_chunk_bytes = chunk_bytes + (chunk_bytes & 1);
+        index = payload_start + padded_chunk_bytes;
+    }
+
+    return .{
+        .format = "webp",
+        .mime = "image/webp",
+    };
+}
+
+fn sha256FileHex(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var file = try openFileForPath(path, .{});
+    defer file.close();
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [8192]u8 = undefined;
+    while (true) {
+        const read_len = try file.read(buffer[0..]);
+        if (read_len == 0) break;
+        hasher.update(buffer[0..read_len]);
+    }
+
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &digest_hex);
+}
+
+fn isJpegStartOfFrameMarker(marker: u8) bool {
+    return switch (marker) {
+        0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf => true,
+        else => false,
+    };
+}
+
+fn readU16Le(bytes: []const u8) u16 {
+    std.debug.assert(bytes.len >= 2);
+    return @as(u16, bytes[0]) | (@as(u16, bytes[1]) << 8);
+}
+
+fn readU16Be(bytes: []const u8) u16 {
+    std.debug.assert(bytes.len >= 2);
+    return (@as(u16, bytes[0]) << 8) | @as(u16, bytes[1]);
+}
+
+fn readU24Le(bytes: []const u8) u32 {
+    std.debug.assert(bytes.len >= 3);
+    return @as(u32, bytes[0]) | (@as(u32, bytes[1]) << 8) | (@as(u32, bytes[2]) << 16);
+}
+
+fn readU32Le(bytes: []const u8) u32 {
+    std.debug.assert(bytes.len >= 4);
+    return @as(u32, bytes[0]) | (@as(u32, bytes[1]) << 8) | (@as(u32, bytes[2]) << 16) | (@as(u32, bytes[3]) << 24);
+}
+
+fn readU32Be(bytes: []const u8) u32 {
+    std.debug.assert(bytes.len >= 4);
+    return (@as(u32, bytes[0]) << 24) | (@as(u32, bytes[1]) << 16) | (@as(u32, bytes[2]) << 8) | @as(u32, bytes[3]);
+}
+
+fn captureClipboardImage(allocator: std.mem.Allocator) !ClipboardImageCapture {
+    if (try captureClipboardImageWayland(allocator)) |capture| return capture;
+    if (try captureClipboardImageX11(allocator)) |capture| return capture;
+    return error.ClipboardImageUnavailable;
+}
+
+fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCapture {
+    const types_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "wl-paste", "--list-types" },
+        .cwd = ".",
+        .max_output_bytes = 16 * 1024,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(types_result.stdout);
+    defer allocator.free(types_result.stderr);
+
+    switch (types_result.term) {
+        .Exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+
+    const mime = selectClipboardImageMime(types_result.stdout) orelse return null;
+
+    const image_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "wl-paste", "--no-newline", "--type", mime },
+        .cwd = ".",
+        .max_output_bytes = CLIPBOARD_IMAGE_MAX_BYTES,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(image_result.stderr);
+
+    switch (image_result.term) {
+        .Exited => |code| if (code != 0) {
+            allocator.free(image_result.stdout);
+            return null;
+        },
+        else => {
+            allocator.free(image_result.stdout);
+            return null;
+        },
+    }
+
+    if (image_result.stdout.len == 0) {
+        allocator.free(image_result.stdout);
+        return null;
+    }
+
+    return .{
+        .bytes = image_result.stdout,
+        .mime = mime,
+    };
+}
+
+fn captureClipboardImageX11(allocator: std.mem.Allocator) !?ClipboardImageCapture {
+    const targets_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "xclip", "-selection", "clipboard", "-t", "TARGETS", "-o" },
+        .cwd = ".",
+        .max_output_bytes = 16 * 1024,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(targets_result.stdout);
+    defer allocator.free(targets_result.stderr);
+
+    switch (targets_result.term) {
+        .Exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+
+    const mime = selectClipboardImageMime(targets_result.stdout) orelse return null;
+
+    const image_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "xclip", "-selection", "clipboard", "-t", mime, "-o" },
+        .cwd = ".",
+        .max_output_bytes = CLIPBOARD_IMAGE_MAX_BYTES,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(image_result.stderr);
+
+    switch (image_result.term) {
+        .Exited => |code| if (code != 0) {
+            allocator.free(image_result.stdout);
+            return null;
+        },
+        else => {
+            allocator.free(image_result.stdout);
+            return null;
+        },
+    }
+
+    if (image_result.stdout.len == 0) {
+        allocator.free(image_result.stdout);
+        return null;
+    }
+
+    return .{
+        .bytes = image_result.stdout,
+        .mime = mime,
+    };
+}
+
+fn selectClipboardImageMime(types_output: []const u8) ?[]const u8 {
+    const candidates = [_][]const u8{
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "image/bmp",
+    };
+
+    for (candidates) |mime| {
+        if (containsAsciiIgnoreCase(types_output, mime)) return mime;
+    }
+    return null;
+}
+
+fn extensionForImageMime(mime: []const u8) []const u8 {
+    if (std.mem.eql(u8, mime, "image/png")) return "png";
+    if (std.mem.eql(u8, mime, "image/jpeg")) return "jpg";
+    if (std.mem.eql(u8, mime, "image/webp")) return "webp";
+    if (std.mem.eql(u8, mime, "image/gif")) return "gif";
+    if (std.mem.eql(u8, mime, "image/bmp")) return "bmp";
+    return "img";
+}
+
+fn isOpenAiCompatibleProviderId(provider_id: []const u8) bool {
+    return std.mem.eql(u8, provider_id, "openai") or
+        std.mem.eql(u8, provider_id, "openrouter") or
+        std.mem.eql(u8, provider_id, "opencode") or
+        std.mem.eql(u8, provider_id, "zenmux");
+}
+
+fn defaultBaseUrlForProviderId(provider_id: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider_id, "openai")) return "https://api.openai.com/v1";
+    if (std.mem.eql(u8, provider_id, "openrouter")) return "https://openrouter.ai/api/v1";
+    if (std.mem.eql(u8, provider_id, "opencode")) return "https://opencode.ai/zen/v1";
+    if (std.mem.eql(u8, provider_id, "zenmux")) return "https://zenmux.ai/api/v1";
+    return null;
+}
+
+fn defaultVisionModelForProvider(provider_id: []const u8) []const u8 {
+    if (std.mem.eql(u8, provider_id, "openai")) return "gpt-4.1-mini";
+    if (std.mem.eql(u8, provider_id, "openrouter")) return "openai/gpt-4.1-mini";
+    if (std.mem.eql(u8, provider_id, "opencode")) return "openai/gpt-4.1-mini";
+    if (std.mem.eql(u8, provider_id, "zenmux")) return "openai/gpt-4.1-mini";
+    return "";
+}
+
+fn trimTrailingSlashLocal(text: []const u8) []const u8 {
+    if (text.len == 0) return text;
+    if (text[text.len - 1] == '/') return text[0 .. text.len - 1];
+    return text;
+}
+
+fn loadImageAsDataUrl(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    mime: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    var file = try openFileForPath(path, .{});
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(allocator, max_bytes);
+    defer allocator.free(bytes);
+    if (bytes.len == max_bytes) {
+        const stat = try file.stat();
+        if (stat.size > max_bytes) return error.FileTooBig;
+    }
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+
+    return std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ mime, encoded });
+}
+
+fn readHttpResponseBodyAlloc(allocator: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
+    var transfer_buffer: [8192]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    var decompress_buffer: [64 * 1024]u8 = undefined;
+    var reader = response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
+
+    var body_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer body_writer.deinit();
+
+    _ = reader.streamRemaining(&body_writer.writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+        else => return err,
+    };
+
+    return body_writer.toOwnedSlice();
+}
+
+fn formatHttpErrorDetail(
+    allocator: std.mem.Allocator,
+    status: std.http.Status,
+    body: []const u8,
+) ![]u8 {
+    var sanitized: [220]u8 = undefined;
+    const preview = sanitizePreview(body, &sanitized);
+    return std.fmt.allocPrint(allocator, "status={s} body={s}", .{ @tagName(status), preview });
+}
+
+fn sanitizePreview(input: []const u8, out: []u8) []const u8 {
+    if (out.len == 0) return "";
+    var written: usize = 0;
+    for (input) |ch| {
+        if (written >= out.len) break;
+        out[written] = if (std.ascii.isPrint(ch) and ch != '\n' and ch != '\r' and ch != '\t') ch else ' ';
+        written += 1;
+    }
+    return std.mem.trim(u8, out[0..written], " ");
+}
+
+fn parseVisionCaptionFromChatCompletionsAlloc(
+    allocator: std.mem.Allocator,
+    response_body: []const u8,
+) !?[]u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_body, .{});
+    defer parsed.deinit();
+
+    const choices_value = jsonValueObjectField(parsed.value, "choices") orelse return null;
+    const first_choice = jsonValueFirstArrayItem(choices_value) orelse return null;
+    const message_value = jsonValueObjectField(first_choice, "message") orelse return null;
+    const content_value = jsonValueObjectField(message_value, "content") orelse return null;
+
+    switch (content_value) {
+        .string => |text| {
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            if (trimmed.len == 0) return null;
+            return @as(?[]u8, try allocator.dupe(u8, trimmed));
+        },
+        .array => |items| {
+            var writer: std.Io.Writer.Allocating = .init(allocator);
+            defer writer.deinit();
+            var has_text = false;
+
+            for (items.items) |item| {
+                const item_type = if (jsonValueObjectField(item, "type")) |value| switch (value) {
+                    .string => |text| text,
+                    else => "",
+                } else "";
+
+                if (std.mem.eql(u8, item_type, "text")) {
+                    const text_value = jsonValueObjectField(item, "text") orelse continue;
+                    const text = switch (text_value) {
+                        .string => |s| s,
+                        else => continue,
+                    };
+                    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+                    if (trimmed.len == 0) continue;
+                    if (has_text) try writer.writer.writeByte('\n');
+                    try writer.writer.writeAll(trimmed);
+                    has_text = true;
+                }
+            }
+
+            const built = try writer.toOwnedSlice();
+            if (built.len == 0) {
+                allocator.free(built);
+                return null;
+            }
+            return @as(?[]u8, built);
+        },
+        else => return null,
+    }
+}
+
+fn jsonValueObjectField(value: std.json.Value, key: []const u8) ?std.json.Value {
+    return switch (value) {
+        .object => |object| object.get(key),
+        else => null,
+    };
+}
+
+fn jsonValueFirstArrayItem(value: std.json.Value) ?std.json.Value {
+    return switch (value) {
+        .array => |array| if (array.items.len > 0) array.items[0] else null,
+        else => null,
+    };
 }
 
 fn openDirForPath(path: []const u8, flags: std.fs.Dir.OpenOptions) !std.fs.Dir {
@@ -4747,6 +5824,18 @@ test "parseWebSearchToolPayload extracts xml and fenced formats" {
     try std.testing.expect(parseWebSearchToolPayload("no tool") == null);
 }
 
+test "parseViewImageToolPayload extracts xml and fenced formats" {
+    try std.testing.expectEqualStrings(
+        "{\"path\":\"assets/screenshot.png\"}",
+        parseViewImageToolPayload("<VIEW_IMAGE>\n{\"path\":\"assets/screenshot.png\"}\n</VIEW_IMAGE>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"path\":\"/tmp/cap.jpg\"}",
+        parseViewImageToolPayload("```view_image\n{\"path\":\"/tmp/cap.jpg\"}\n```").?,
+    );
+    try std.testing.expect(parseViewImageToolPayload("no tool") == null);
+}
+
 test "parseExecCommandInput parses json and plain command" {
     const allocator = std.testing.allocator;
 
@@ -4790,6 +5879,21 @@ test "parseWebSearchInput parses json and plain query" {
     defer allocator.free(plain_input.query);
     try std.testing.expectEqualStrings("zig async await", plain_input.query);
     try std.testing.expectEqual(@as(u8, WEB_SEARCH_DEFAULT_RESULTS), plain_input.limit);
+}
+
+test "parseViewImageInput parses json and plain path" {
+    const allocator = std.testing.allocator;
+
+    const json_input = try parseViewImageInput(
+        allocator,
+        "{\"path\":\"assets/image.png\"}",
+    );
+    defer allocator.free(json_input.path);
+    try std.testing.expectEqualStrings("assets/image.png", json_input.path);
+
+    const plain_input = try parseViewImageInput(allocator, "'/tmp/shot.webp'");
+    defer allocator.free(plain_input.path);
+    try std.testing.expectEqualStrings("/tmp/shot.webp", plain_input.path);
 }
 
 test "parseListDirInput parses json and plain payloads" {
@@ -4891,6 +5995,32 @@ test "parseDuckDuckGoHtmlResults extracts titles and urls" {
     try std.testing.expectEqualStrings("https://ziglang.org/learn", results[1].url);
 }
 
+test "parseVisionCaptionFromChatCompletionsAlloc parses string content" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"id":"chatcmpl-x","choices":[{"index":0,"message":{"role":"assistant","content":"This is a UI screenshot with an error banner."}}]}
+    ;
+
+    const caption = try parseVisionCaptionFromChatCompletionsAlloc(allocator, body);
+    defer if (caption) |text| allocator.free(text);
+
+    try std.testing.expect(caption != null);
+    try std.testing.expectEqualStrings("This is a UI screenshot with an error banner.", caption.?);
+}
+
+test "parseVisionCaptionFromChatCompletionsAlloc parses content array text parts" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"choices":[{"message":{"content":[{"type":"text","text":"Line one"},{"type":"text","text":"Line two"}]}}]}
+    ;
+
+    const caption = try parseVisionCaptionFromChatCompletionsAlloc(allocator, body);
+    defer if (caption) |text| allocator.free(text);
+
+    try std.testing.expect(caption != null);
+    try std.testing.expectEqualStrings("Line one\nLine two", caption.?);
+}
+
 test "parseApplyPatchToolPayload extracts codex patch formats" {
     const xml_payload =
         "<APPLY_PATCH>\n" ++
@@ -4949,7 +6079,7 @@ test "diffLineColor classifies add/remove/meta lines" {
     try std.testing.expectEqualStrings("", diffLineColor("normal line", palette));
 }
 
-test "parseAssistantToolCall detects discovery/edit/exec/web tools" {
+test "parseAssistantToolCall detects discovery/edit/exec/web/image tools" {
     const read_tool = parseAssistantToolCall("<READ>ls</READ>").?;
     switch (read_tool) {
         .read => |command| try std.testing.expectEqualStrings("ls", command),
@@ -5003,6 +6133,12 @@ test "parseAssistantToolCall detects discovery/edit/exec/web tools" {
     const web_search_call = parseAssistantToolCall("<WEB_SEARCH>{\"query\":\"zig fmt\"}</WEB_SEARCH>").?;
     switch (web_search_call) {
         .web_search => |payload| try std.testing.expectEqualStrings("{\"query\":\"zig fmt\"}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const view_image_call = parseAssistantToolCall("<VIEW_IMAGE>{\"path\":\"image.png\"}</VIEW_IMAGE>").?;
+    switch (view_image_call) {
+        .view_image => |payload| try std.testing.expectEqualStrings("{\"path\":\"image.png\"}", payload),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -5111,6 +6247,15 @@ test "rewriteInputWithSelectedAtPath quotes path with spaces" {
     try std.testing.expectEqualStrings("check @\"docs/My File.md\" ", rewritten.text);
 }
 
+test "insertAtPathTokenAtCursor inserts token when no @ context exists" {
+    const allocator = std.testing.allocator;
+    const rewritten = try insertAtPathTokenAtCursor(allocator, "hello world", 5, "tmp/img.png");
+    defer allocator.free(rewritten.text);
+
+    try std.testing.expectEqualStrings("hello @tmp/img.png world", rewritten.text);
+    try std.testing.expectEqual(@as(usize, 18), rewritten.cursor);
+}
+
 test "computeInputCursorPlacement anchors cursor to input marker" {
     const placement = computeInputCursorPlacement(
         120,
@@ -5165,6 +6310,77 @@ test "buildFileInjectionPayload includes readable files and reports counts" {
     try std.testing.expect(result.payload != null);
     try std.testing.expect(std.mem.indexOf(u8, result.payload.?, "<file path=") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.payload.?, "hello inject") != null);
+}
+
+test "buildFileInjectionPayload includes image metadata for @image path" {
+    const allocator = std.testing.allocator;
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const abs_dir = try temp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs_dir);
+
+    const image_path = try std.fs.path.join(allocator, &.{ abs_dir, "sample.png" });
+    defer allocator.free(image_path);
+
+    var image_file = try std.fs.createFileAbsolute(image_path, .{ .truncate = true });
+    defer image_file.close();
+    const png_header = [_]u8{
+        0x89, 'P',  'N',  'G',  '\r', '\n', 0x1a, '\n',
+        0x00, 0x00, 0x00, 0x0d, 'I',  'H',  'D',  'R',
+        0x00, 0x00, 0x00, 0x02, // width=2
+        0x00, 0x00, 0x00, 0x03, // height=3
+    };
+    try image_file.writeAll(png_header[0..]);
+
+    const prompt = try std.fmt.allocPrint(allocator, "look @{s}", .{image_path});
+    defer allocator.free(prompt);
+
+    const result = try buildFileInjectionPayload(allocator, prompt);
+    defer if (result.payload) |payload| allocator.free(payload);
+
+    try std.testing.expectEqual(@as(usize, 1), result.referenced_count);
+    try std.testing.expectEqual(@as(usize, 1), result.included_count);
+    try std.testing.expectEqual(@as(usize, 0), result.skipped_count);
+    try std.testing.expect(result.payload != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.payload.?, "<image path=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.payload.?, "mime=\"image/png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.payload.?, "width=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.payload.?, "height=\"3\"") != null);
+}
+
+test "inspectImageFile parses png metadata and sha256" {
+    const allocator = std.testing.allocator;
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const abs_dir = try temp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs_dir);
+
+    const image_path = try std.fs.path.join(allocator, &.{ abs_dir, "inspect.png" });
+    defer allocator.free(image_path);
+
+    var image_file = try std.fs.createFileAbsolute(image_path, .{ .truncate = true });
+    defer image_file.close();
+    const png_header = [_]u8{
+        0x89, 'P',  'N',  'G',  '\r', '\n', 0x1a, '\n',
+        0x00, 0x00, 0x00, 0x0d, 'I',  'H',  'D',  'R',
+        0x00, 0x00, 0x00, 0x08, // width=8
+        0x00, 0x00, 0x00, 0x09, // height=9
+        0x08, 0x02, 0x00, 0x00,
+        0x00,
+    };
+    try image_file.writeAll(png_header[0..]);
+
+    var info = (try inspectImageFile(allocator, image_path, true)).?;
+    defer info.deinit(allocator);
+
+    try std.testing.expectEqualStrings("png", info.format);
+    try std.testing.expectEqualStrings("image/png", info.mime);
+    try std.testing.expectEqual(@as(u32, 8), info.width.?);
+    try std.testing.expectEqual(@as(u32, 9), info.height.?);
+    try std.testing.expect(info.sha256_hex != null);
+    try std.testing.expectEqual(@as(usize, 64), info.sha256_hex.?.len);
 }
 
 test "formatTokenCount trims trailing .0 for compact context display" {

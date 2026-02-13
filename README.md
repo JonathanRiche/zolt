@@ -30,10 +30,11 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 - `/model` popup picker
 - `@` file popup picker
 - `@path` file content injection into prompt context
+- Clipboard image paste into `@path` references (`Ctrl-V` or `/paste-image`)
 - Tool loop with discovery/edit/exec primitives:
   - `READ` (allowlisted shell read commands)
   - `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`
-  - `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`
+  - `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`, `VIEW_IMAGE`
 
 ## Requirements
 
@@ -107,6 +108,7 @@ Commands:
 - `i` enter insert mode
 - `esc` return to normal mode
 - `enter` send
+- `ctrl-v` paste image from clipboard into input as `@path`
 - `q` quit (normal mode)
 
 ### Picker UX
@@ -130,12 +132,15 @@ Commands:
 - `/theme [codex|plain|forest]`
 - `/ui [compact|comfy]`
 - `/quit`
+- `/paste-image`
 
 ### File Mentions
 
 When you type `@path`, Zolt can:
 - autocomplete via file picker
 - inject referenced file contents into prompt context on send
+
+For referenced image files, Zolt injects image metadata (path/mime/size/dimensions) instead of raw binary bytes.
 
 Quoted paths are supported for spaces:
 - `@"docs/My File.md"`
