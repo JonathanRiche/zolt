@@ -13,6 +13,7 @@ It focuses on a fast single-pane workflow:
 - switch providers/models quickly
 - keep multi-conversation history
 - use picker-style UX for `/` commands, `/model`, and `@` file references
+- render Markdown responses clearly in-chat (headings, lists, quotes, code fences, inline code)
 
 ## Why Zolt
 
@@ -23,6 +24,7 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 
 - Single-pane chat UI with vim-like modes (`normal` / `insert`)
 - Streaming responses
+- Markdown-aware chat rendering (headings, lists, block quotes, fenced code, inline code)
 - Multiple saved conversations (persisted to disk)
 - Codex-style conversation preview title from first prompt (for untitled/new chats)
 - Provider + model selection from `models.dev` cache
@@ -55,6 +57,13 @@ zig build
 
 ```bash
 zig build run
+```
+
+Pass CLI flags through Zig with `--`:
+
+```bash
+zig build run -- -h
+zig build run -- -s <conversation-id>
 ```
 
 CLI helpers:
@@ -145,6 +154,7 @@ Commands:
 
 Global / stream-time:
 - `Ctrl-Z` suspend Zolt (resume with shell `fg`)
+- `Ctrl-C` quit Zolt immediately
 - While streaming: `Esc Esc` interrupts generation
 - `PgUp` / `PgDn` scroll chat history (works in both normal and insert modes)
 - `Ctrl-P` opens command palette quick actions
@@ -194,6 +204,7 @@ Picker triggers:
 - `/theme [codex|plain|forest]`
 - `/ui [compact|comfy]`
 - `/quit`
+- `/q` (alias of `/quit`)
 - `/paste-image`
 
 ### File Mentions
@@ -214,6 +225,8 @@ Default XDG paths:
 
 - state: `~/.local/share/zig-ai/workspaces/<scope>.json`
 - models cache: `~/.cache/zig-ai/models.json`
+
+Note: the storage directory name is currently `zig-ai` (legacy) even though the binary/app name is `zolt`.
 
 `<scope>` is derived from your git root when available (or current directory otherwise),
 so conversations are automatically scoped per project/workspace.
