@@ -44,6 +44,12 @@ const StreamTask = enum {
     running_view_image,
 };
 
+const CommandPickerKind = enum {
+    slash_commands,
+    quick_actions,
+    conversation_switch,
+};
+
 const TerminalMetrics = struct {
     width: usize,
     lines: usize,
@@ -204,6 +210,8 @@ const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
 const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const KEY_UP_ARROW: u8 = 243;
+const KEY_DOWN_ARROW: u8 = 244;
 const KEY_PAGE_UP: u8 = 245;
 const KEY_PAGE_DOWN: u8 = 246;
 const TOOL_SYSTEM_PROMPT =
@@ -374,8 +382,8 @@ fn mapEscapeSequenceToKey() !?u8 {
     if (third_read == 0) return null;
 
     switch (third[0]) {
-        'A' => return 16, // Up arrow -> Ctrl-P semantics
-        'B' => return 14, // Down arrow -> Ctrl-N semantics
+        'A' => return KEY_UP_ARROW,
+        'B' => return KEY_DOWN_ARROW,
         '5', '6' => {
             if (second[0] != '[') return null;
             if (!try stdinHasPendingByte(2)) return null;
@@ -418,6 +426,7 @@ const App = struct {
     model_picker_index: usize = 0,
     model_picker_scroll: usize = 0,
     command_picker_open: bool = false,
+    command_picker_kind: CommandPickerKind = .slash_commands,
     command_picker_index: usize = 0,
     command_picker_scroll: usize = 0,
     file_picker_open: bool = false,
@@ -502,6 +511,9 @@ const App = struct {
             'L' => {
                 self.shiftConversationStrip(1);
             },
+            16 => {
+                try self.openCommandPalette();
+            },
             '/' => {
                 self.mode = .insert;
                 if (self.input_buffer.items.len == 0) {
@@ -575,22 +587,18 @@ const App = struct {
                 }
             },
             14 => {
-                if (self.model_picker_open) {
-                    self.moveModelPickerSelection(1);
-                } else if (self.command_picker_open) {
-                    self.moveCommandPickerSelection(1);
-                } else if (self.file_picker_open) {
-                    self.moveFilePickerSelection(1);
-                }
+                _ = self.moveActivePickerSelection(1);
             },
             16 => {
-                if (self.model_picker_open) {
-                    self.moveModelPickerSelection(-1);
-                } else if (self.command_picker_open) {
-                    self.moveCommandPickerSelection(-1);
-                } else if (self.file_picker_open) {
-                    self.moveFilePickerSelection(-1);
+                if (!self.moveActivePickerSelection(-1)) {
+                    try self.openCommandPalette();
                 }
+            },
+            KEY_DOWN_ARROW => {
+                _ = self.moveActivePickerSelection(1);
+            },
+            KEY_UP_ARROW => {
+                _ = self.moveActivePickerSelection(-1);
             },
             22 => {
                 try self.pasteClipboardImageIntoInput();
@@ -626,6 +634,99 @@ const App = struct {
         return @max(@as(usize, 4), metrics.lines - top_lines - bottom_lines);
     }
 
+    fn openCommandPalette(self: *App) !void {
+        self.mode = .insert;
+        try self.setInputBufferTo(">");
+        self.command_picker_open = false;
+        self.command_picker_index = 0;
+        self.command_picker_scroll = 0;
+        self.command_picker_kind = .quick_actions;
+        self.syncPickersFromInput();
+        try self.setNotice("Opened command palette (type to filter)");
+    }
+
+    fn openConversationSwitchPicker(self: *App) !void {
+        self.mode = .insert;
+        try self.setInputBufferTo("/switch ");
+        self.command_picker_open = false;
+        self.command_picker_index = 0;
+        self.command_picker_scroll = 0;
+        self.command_picker_kind = .conversation_switch;
+        self.syncPickersFromInput();
+        try self.setNotice("Select a conversation to switch");
+    }
+
+    fn setInputBufferTo(self: *App, text: []const u8) !void {
+        self.input_buffer.clearRetainingCapacity();
+        try self.input_buffer.appendSlice(self.allocator, text);
+        self.input_cursor = self.input_buffer.items.len;
+    }
+
+    fn shouldAutoTitleCurrentConversation(self: *App) bool {
+        const conversation = self.app_state.currentConversationConst();
+        if (conversation.messages.items.len != 0) return false;
+        if (std.mem.eql(u8, conversation.title, "New conversation")) return true;
+        return std.mem.startsWith(u8, conversation.title, "Conversation ");
+    }
+
+    fn deriveConversationTitleFromPrompt(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+        const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
+        if (trimmed.len == 0) return allocator.dupe(u8, "New conversation");
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+
+        var previous_was_space = false;
+        var char_count: usize = 0;
+        var truncated_by_limit = false;
+        for (trimmed) |byte| {
+            const is_space = byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
+            if (is_space) {
+                if (out.items.len == 0 or previous_was_space) continue;
+                try out.append(allocator, ' ');
+                previous_was_space = true;
+                continue;
+            }
+
+            if (char_count >= 60) {
+                truncated_by_limit = true;
+                break;
+            }
+            try out.append(allocator, byte);
+            previous_was_space = false;
+            char_count += 1;
+        }
+
+        while (out.items.len > 0 and out.items[out.items.len - 1] == ' ') {
+            _ = out.pop();
+        }
+
+        if (out.items.len == 0) return allocator.dupe(u8, "New conversation");
+        if (truncated_by_limit and out.items.len >= 3) {
+            out.items[out.items.len - 1] = '.';
+            out.items[out.items.len - 2] = '.';
+            out.items[out.items.len - 3] = '.';
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn moveActivePickerSelection(self: *App, delta: i32) bool {
+        if (self.model_picker_open) {
+            self.moveModelPickerSelection(delta);
+            return true;
+        }
+        if (self.command_picker_open) {
+            self.moveCommandPickerSelection(delta);
+            return true;
+        }
+        if (self.file_picker_open) {
+            self.moveFilePickerSelection(delta);
+            return true;
+        }
+        return false;
+    }
+
     fn submitInput(self: *App) !void {
         const trimmed = std.mem.trim(u8, self.input_buffer.items, " \t\r\n");
         const line = try self.allocator.dupe(u8, trimmed);
@@ -635,6 +736,7 @@ const App = struct {
         self.input_cursor = 0;
         self.model_picker_open = false;
         self.command_picker_open = false;
+        self.command_picker_kind = .slash_commands;
         self.file_picker_open = false;
 
         if (line.len == 0) return;
@@ -651,6 +753,14 @@ const App = struct {
     fn handlePrompt(self: *App, prompt: []const u8) !void {
         const inject_result = try buildFileInjectionPayload(self.allocator, prompt);
         defer if (inject_result.payload) |payload| self.allocator.free(payload);
+
+        if (self.shouldAutoTitleCurrentConversation()) {
+            const title = try deriveConversationTitleFromPrompt(self.allocator, prompt);
+            defer self.allocator.free(title);
+            if (title.len > 0) {
+                try self.app_state.setConversationTitle(self.allocator, title);
+            }
+        }
 
         try self.app_state.appendMessage(self.allocator, .user, prompt);
         if (inject_result.payload) |payload| {
@@ -2354,7 +2464,12 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch <id> /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /paste-image /quit  input: use @path, Ctrl-V paste image, pickers: Ctrl-N/P + Enter, assistant tools: <READ>, <LIST_DIR>, <READ_FILE>, <GREP_FILES>, <PROJECT_SEARCH>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>, <WEB_SEARCH>, <VIEW_IMAGE>");
+            try self.setNotice("Commands: /help /commands /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch [id] /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /paste-image /quit  input: use @path, Ctrl-V paste image, Ctrl-P command palette, pickers: Ctrl-N/P or Up/Down + Enter, assistant tools: <READ>, <LIST_DIR>, <READ_FILE>, <GREP_FILES>, <PROJECT_SEARCH>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>, <WEB_SEARCH>, <VIEW_IMAGE>");
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "commands")) {
+            try self.openCommandPalette();
             return;
         }
 
@@ -2493,7 +2608,7 @@ const App = struct {
 
         if (std.mem.eql(u8, command, "switch")) {
             const conversation_id = parts.next() orelse {
-                try self.setNotice("Usage: /switch <conversation-id>");
+                try self.openConversationSwitchPicker();
                 return;
             };
 
@@ -2740,13 +2855,18 @@ const App = struct {
         else if (self.model_picker_open)
             "ctrl-n/p or up/down, enter/tab select, esc close"
         else if (self.command_picker_open)
-            "ctrl-n/p or up/down, enter/tab insert, esc close"
+            if (self.command_picker_kind == .quick_actions)
+                "ctrl-n/p or up/down, enter/tab run, esc close"
+            else if (self.command_picker_kind == .conversation_switch)
+                "ctrl-n/p or up/down, enter/tab switch, esc close"
+            else
+                "ctrl-n/p or up/down, enter/tab insert, esc close"
         else if (self.file_picker_open)
             "ctrl-n/p or up/down, enter/tab insert, esc close"
         else if (self.mode == .insert)
-            "enter esc / ctrl-v pgup/pgdn"
+            "enter esc / ctrl-p ctrl-v pgup/pgdn"
         else
-            "i j/k pgup/pgdn H/L / q";
+            "i j/k pgup/pgdn H/L / ctrl-p q";
         const context_summary = try self.contextUsageSummary(conversation);
         defer if (context_summary) |summary| self.allocator.free(summary);
         const status_text = if (context_summary) |summary|
@@ -2910,6 +3030,7 @@ const App = struct {
         self.syncModelPickerFromInput();
         if (self.model_picker_open) {
             self.command_picker_open = false;
+            self.command_picker_kind = .slash_commands;
             self.command_picker_index = 0;
             self.command_picker_scroll = 0;
             self.file_picker_open = false;
@@ -2953,21 +3074,48 @@ const App = struct {
         if (self.model_picker_index >= total) self.model_picker_index = total - 1;
     }
 
+    fn commandPickerQueryForKind(self: *App, kind: CommandPickerKind) ?[]const u8 {
+        return switch (kind) {
+            .slash_commands => parseSlashCommandPickerQuery(self.input_buffer.items, self.input_cursor),
+            .quick_actions => parseQuickActionPickerQuery(self.input_buffer.items, self.input_cursor),
+            .conversation_switch => parseConversationSwitchPickerQuery(self.input_buffer.items, self.input_cursor),
+        };
+    }
+
     fn syncCommandPickerFromInput(self: *App) void {
-        const query = parseCommandPickerQuery(self.input_buffer.items, self.input_cursor) orelse {
+        const maybe_kind_query: ?struct { kind: CommandPickerKind, query: []const u8 } = blk: {
+            if (parseConversationSwitchPickerQuery(self.input_buffer.items, self.input_cursor)) |query| {
+                break :blk .{ .kind = .conversation_switch, .query = query };
+            }
+            if (parseQuickActionPickerQuery(self.input_buffer.items, self.input_cursor)) |query| {
+                break :blk .{ .kind = .quick_actions, .query = query };
+            }
+            if (parseSlashCommandPickerQuery(self.input_buffer.items, self.input_cursor)) |query| {
+                break :blk .{ .kind = .slash_commands, .query = query };
+            }
+            break :blk null;
+        };
+
+        const kind_query = maybe_kind_query orelse {
             self.command_picker_open = false;
+            self.command_picker_kind = .slash_commands;
             self.command_picker_index = 0;
             self.command_picker_scroll = 0;
             return;
         };
 
+        if (!self.command_picker_open or self.command_picker_kind != kind_query.kind) {
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
+        }
         if (!self.command_picker_open) {
             self.command_picker_index = 0;
             self.command_picker_scroll = 0;
         }
         self.command_picker_open = true;
+        self.command_picker_kind = kind_query.kind;
 
-        const total = self.commandPickerMatchCount(query);
+        const total = self.commandPickerMatchCount(kind_query.query);
         if (total == 0) {
             self.command_picker_index = 0;
             self.command_picker_scroll = 0;
@@ -3109,7 +3257,7 @@ const App = struct {
     fn commandPickerLineCount(self: *App, terminal_lines: usize) usize {
         if (!self.command_picker_open) return 0;
 
-        const query = parseCommandPickerQuery(self.input_buffer.items, self.input_cursor) orelse return 0;
+        const query = self.commandPickerQueryForKind(self.command_picker_kind) orelse return 0;
         const total = self.commandPickerMatchCount(query);
         const max_rows = self.commandPickerMaxRows(terminal_lines);
         const shown_rows = if (total == 0) @as(usize, 1) else @min(total, max_rows);
@@ -3203,10 +3351,24 @@ const App = struct {
         return count;
     }
 
-    fn commandPickerMatchCount(_: *App, query: []const u8) usize {
+    fn commandPickerMatchCount(self: *App, query: []const u8) usize {
         var count: usize = 0;
-        for (BUILTIN_COMMANDS) |entry| {
-            if (commandMatchesQuery(entry, query)) count += 1;
+        switch (self.command_picker_kind) {
+            .slash_commands => {
+                for (BUILTIN_COMMANDS) |entry| {
+                    if (commandMatchesQuery(entry, query)) count += 1;
+                }
+            },
+            .quick_actions => {
+                for (QUICK_ACTIONS) |entry| {
+                    if (quickActionMatchesQuery(entry, query)) count += 1;
+                }
+            },
+            .conversation_switch => {
+                for (self.app_state.conversations.items) |*conversation| {
+                    if (conversationMatchesQuery(conversation, query)) count += 1;
+                }
+            },
         }
         return count;
     }
@@ -3221,11 +3383,32 @@ const App = struct {
         return null;
     }
 
-    fn commandPickerNthMatch(_: *App, query: []const u8, target_index: usize) ?BuiltinCommandEntry {
+    fn commandPickerNthMatch(self: *App, query: []const u8, target_index: usize) ?BuiltinCommandEntry {
         var seen: usize = 0;
         for (BUILTIN_COMMANDS) |entry| {
             if (!commandMatchesQuery(entry, query)) continue;
             if (seen == target_index) return entry;
+            seen += 1;
+        }
+        _ = self;
+        return null;
+    }
+
+    fn quickActionPickerNthMatch(_: *App, query: []const u8, target_index: usize) ?QuickActionEntry {
+        var seen: usize = 0;
+        for (QUICK_ACTIONS) |entry| {
+            if (!quickActionMatchesQuery(entry, query)) continue;
+            if (seen == target_index) return entry;
+            seen += 1;
+        }
+        return null;
+    }
+
+    fn conversationPickerNthMatch(self: *App, query: []const u8, target_index: usize) ?*const Conversation {
+        var seen: usize = 0;
+        for (self.app_state.conversations.items) |*conversation| {
+            if (!conversationMatchesQuery(conversation, query)) continue;
+            if (seen == target_index) return conversation;
             seen += 1;
         }
         return null;
@@ -3248,7 +3431,7 @@ const App = struct {
     }
 
     fn moveCommandPickerSelection(self: *App, delta: i32) void {
-        const query = parseCommandPickerQuery(self.input_buffer.items, self.input_cursor) orelse return;
+        const query = self.commandPickerQueryForKind(self.command_picker_kind) orelse return;
         const total = self.commandPickerMatchCount(query);
         if (total == 0) {
             self.command_picker_index = 0;
@@ -3282,29 +3465,109 @@ const App = struct {
     }
 
     fn acceptCommandPickerSelection(self: *App) !void {
-        const query = parseCommandPickerQuery(self.input_buffer.items, self.input_cursor) orelse return;
+        const query = self.commandPickerQueryForKind(self.command_picker_kind) orelse return;
         const total = self.commandPickerMatchCount(query);
         if (total == 0) {
-            try self.setNotice("No slash command matches current query");
+            if (self.command_picker_kind == .quick_actions) {
+                try self.setNotice("No quick action matches current query");
+            } else if (self.command_picker_kind == .conversation_switch) {
+                try self.setNotice("No conversation matches current query");
+            } else {
+                try self.setNotice("No slash command matches current query");
+            }
             return;
         }
 
         if (self.command_picker_index >= total) self.command_picker_index = total - 1;
-        const selected = self.commandPickerNthMatch(query, self.command_picker_index) orelse return;
+        if (self.command_picker_kind == .quick_actions) {
+            const selected = self.quickActionPickerNthMatch(query, self.command_picker_index) orelse return;
+            self.command_picker_open = false;
+            self.command_picker_kind = .slash_commands;
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
+            self.input_buffer.clearRetainingCapacity();
+            self.input_cursor = 0;
+            try self.executeQuickAction(selected);
+        } else if (self.command_picker_kind == .conversation_switch) {
+            const selected = self.conversationPickerNthMatch(query, self.command_picker_index) orelse return;
+            _ = self.app_state.switchConversation(selected.id);
+            self.scroll_lines = 0;
+            self.ensureCurrentConversationVisibleInStrip();
+            try self.app_state.saveToPath(self.allocator, self.paths.state_path);
 
-        self.input_buffer.clearRetainingCapacity();
-        try self.input_buffer.appendSlice(self.allocator, "/");
-        try self.input_buffer.appendSlice(self.allocator, selected.name);
-        if (selected.insert_trailing_space) {
-            try self.input_buffer.append(self.allocator, ' ');
+            self.input_buffer.clearRetainingCapacity();
+            self.input_cursor = 0;
+            self.command_picker_open = false;
+            self.command_picker_kind = .slash_commands;
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
+            try self.setNoticeFmt("Switched to conversation: {s}", .{selected.id});
+        } else {
+            const selected = self.commandPickerNthMatch(query, self.command_picker_index) orelse return;
+
+            self.input_buffer.clearRetainingCapacity();
+            try self.input_buffer.appendSlice(self.allocator, "/");
+            try self.input_buffer.appendSlice(self.allocator, selected.name);
+            if (selected.insert_trailing_space) {
+                try self.input_buffer.append(self.allocator, ' ');
+            }
+            self.input_cursor = self.input_buffer.items.len;
+            self.command_picker_open = false;
+            self.command_picker_kind = .slash_commands;
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
+
+            try self.setNoticeFmt("Inserted /{s}", .{selected.name});
+            self.syncPickersFromInput();
         }
-        self.input_cursor = self.input_buffer.items.len;
-        self.command_picker_open = false;
-        self.command_picker_index = 0;
-        self.command_picker_scroll = 0;
+    }
 
-        try self.setNoticeFmt("Inserted /{s}", .{selected.name});
-        self.syncPickersFromInput();
+    fn executeQuickAction(self: *App, action: QuickActionEntry) !void {
+        switch (action.id) {
+            .new_chat => {
+                try self.handleCommand("/new");
+            },
+            .open_conversation_switch => {
+                try self.openConversationSwitchPicker();
+            },
+            .open_model_picker => {
+                try self.setInputBufferTo("/model ");
+                self.syncPickersFromInput();
+                try self.setNotice("Opened model picker");
+            },
+            .open_provider_command => {
+                try self.setInputBufferTo("/provider ");
+                self.syncPickersFromInput();
+                try self.setNotice("Inserted /provider");
+            },
+            .refresh_models_cache => {
+                try self.handleCommand("/models refresh");
+            },
+            .refresh_file_index => {
+                try self.handleCommand("/files refresh");
+            },
+            .toggle_ui_density => {
+                if (self.compact_mode) {
+                    try self.handleCommand("/ui comfy");
+                } else {
+                    try self.handleCommand("/ui compact");
+                }
+            },
+            .toggle_theme => {
+                self.theme = switch (self.theme) {
+                    .codex => .plain,
+                    .plain => .forest,
+                    .forest => .codex,
+                };
+                try self.setNoticeFmt("Theme set to {s}", .{@tagName(self.theme)});
+            },
+            .list_conversations => {
+                try self.handleCommand("/list");
+            },
+            .show_help => {
+                try self.handleCommand("/help");
+            },
+        }
     }
 
     fn insertSelectedFilePathAtCursor(self: *App, path: []const u8) !void {
@@ -3370,7 +3633,7 @@ const App = struct {
     }
 
     fn renderCommandPicker(self: *App, writer: *std.Io.Writer, width: usize, terminal_lines: usize, palette: Palette) !void {
-        const query = parseCommandPickerQuery(self.input_buffer.items, self.input_cursor) orelse return;
+        const query = self.commandPickerQueryForKind(self.command_picker_kind) orelse return;
         const total = self.commandPickerMatchCount(query);
         const max_rows = self.commandPickerMaxRows(terminal_lines);
         const shown_rows = if (total == 0) @as(usize, 1) else @min(total, max_rows);
@@ -3391,8 +3654,12 @@ const App = struct {
 
         const header_text = try std.fmt.allocPrint(
             self.allocator,
-            "command picker ({d}) query:{s}",
-            .{ total, if (query.len == 0) "*" else query },
+            "{s} ({d}) query:{s}",
+            .{
+                if (self.command_picker_kind == .conversation_switch) "conversation switch" else if (self.command_picker_kind == .quick_actions) "command palette" else "command picker",
+                total,
+                if (query.len == 0) "*" else query,
+            },
         );
         defer self.allocator.free(header_text);
         const header_line = try truncateLineAlloc(self.allocator, header_text, width);
@@ -3409,16 +3676,33 @@ const App = struct {
         const end_index = @min(self.command_picker_scroll + shown_rows, total);
         var index = self.command_picker_scroll;
         while (index < end_index) : (index += 1) {
-            const selected_entry = self.commandPickerNthMatch(query, index) orelse continue;
             const is_selected = index == self.command_picker_index;
             const marker = if (is_selected) ">" else " ";
             const row_color = if (is_selected) palette.accent else palette.dim;
-
-            const row_text = try std.fmt.allocPrint(
-                self.allocator,
-                "{s} /{s}  {s}",
-                .{ marker, selected_entry.name, selected_entry.description },
-            );
+            const row_text = if (self.command_picker_kind == .quick_actions) blk: {
+                const selected_entry = self.quickActionPickerNthMatch(query, index) orelse continue;
+                break :blk try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s} {s}  {s}",
+                    .{ marker, selected_entry.label, selected_entry.description },
+                );
+            } else if (self.command_picker_kind == .conversation_switch) blk: {
+                const conversation = self.conversationPickerNthMatch(query, index) orelse continue;
+                const current_marker = if (self.app_state.current_index < self.app_state.conversations.items.len and
+                    std.mem.eql(u8, self.app_state.currentConversationConst().id, conversation.id)) "*" else " ";
+                break :blk try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}{s} {s}  {s}",
+                    .{ marker, current_marker, conversation.id, conversation.title },
+                );
+            } else blk: {
+                const selected_entry = self.commandPickerNthMatch(query, index) orelse continue;
+                break :blk try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s} /{s}  {s}",
+                    .{ marker, selected_entry.name, selected_entry.description },
+                );
+            };
             defer self.allocator.free(row_text);
             const row_line = try truncateLineAlloc(self.allocator, row_text, width);
             defer self.allocator.free(row_line);
@@ -3936,15 +4220,36 @@ const BuiltinCommandEntry = struct {
     insert_trailing_space: bool = true,
 };
 
+const QuickActionId = enum {
+    new_chat,
+    open_conversation_switch,
+    open_model_picker,
+    open_provider_command,
+    refresh_models_cache,
+    refresh_file_index,
+    toggle_ui_density,
+    toggle_theme,
+    list_conversations,
+    show_help,
+};
+
+const QuickActionEntry = struct {
+    id: QuickActionId,
+    label: []const u8,
+    description: []const u8,
+    keywords: []const u8 = "",
+};
+
 const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "help", .description = "show command help", .insert_trailing_space = false },
+    .{ .name = "commands", .description = "open quick action palette", .insert_trailing_space = false },
     .{ .name = "provider", .description = "set/show provider id" },
     .{ .name = "model", .description = "pick or set model id" },
     .{ .name = "models", .description = "list models cache / refresh" },
     .{ .name = "files", .description = "show file index / refresh" },
     .{ .name = "new", .description = "create conversation" },
     .{ .name = "list", .description = "list conversations", .insert_trailing_space = false },
-    .{ .name = "switch", .description = "switch conversation id" },
+    .{ .name = "switch", .description = "switch conversation (picker or id)" },
     .{ .name = "title", .description = "rename conversation" },
     .{ .name = "theme", .description = "set theme (codex/plain/forest)" },
     .{ .name = "ui", .description = "set ui mode (compact/comfy)" },
@@ -3953,7 +4258,20 @@ const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "q", .description = "exit app", .insert_trailing_space = false },
 };
 
-fn parseCommandPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
+const QUICK_ACTIONS = [_]QuickActionEntry{
+    .{ .id = .new_chat, .label = "New chat", .description = "create a new conversation", .keywords = "conversation create /new" },
+    .{ .id = .open_conversation_switch, .label = "Switch conversation", .description = "open conversation switch picker", .keywords = "conversation switch /switch" },
+    .{ .id = .open_model_picker, .label = "Switch model", .description = "open /model picker", .keywords = "model provider" },
+    .{ .id = .open_provider_command, .label = "Switch provider", .description = "insert /provider command", .keywords = "provider" },
+    .{ .id = .refresh_models_cache, .label = "Refresh models cache", .description = "run /models refresh", .keywords = "models cache reload" },
+    .{ .id = .refresh_file_index, .label = "Refresh file index", .description = "run /files refresh", .keywords = "files index rg" },
+    .{ .id = .toggle_ui_density, .label = "Toggle UI density", .description = "switch compact/comfy UI", .keywords = "compact comfy ui" },
+    .{ .id = .toggle_theme, .label = "Toggle theme", .description = "cycle codex/plain/forest", .keywords = "theme colors" },
+    .{ .id = .list_conversations, .label = "List conversations", .description = "run /list", .keywords = "conversations list switch" },
+    .{ .id = .show_help, .label = "Show help", .description = "show command usage help", .keywords = "help commands" },
+};
+
+fn parseSlashCommandPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
     if (input.len == 0 or input[0] != '/') return null;
 
     const first_space = std.mem.indexOfAny(u8, input, " \t\r\n");
@@ -3965,9 +4283,40 @@ fn parseCommandPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
     return input[1..];
 }
 
+fn parseQuickActionPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
+    if (input.len == 0 or input[0] != '>') return null;
+    if (cursor == 0) return "";
+
+    const query_cursor = @min(cursor, input.len);
+    return std.mem.trimLeft(u8, input[1..query_cursor], " ");
+}
+
+fn parseConversationSwitchPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
+    if (!std.mem.startsWith(u8, input, "/switch")) return null;
+    if (input.len == 7) return "";
+    if (input.len > 7 and input[7] == ' ') {
+        const query_start: usize = 8;
+        const query_cursor = @max(query_start, @min(cursor, input.len));
+        return std.mem.trimLeft(u8, input[query_start..query_cursor], " ");
+    }
+    return null;
+}
+
 fn commandMatchesQuery(entry: BuiltinCommandEntry, query: []const u8) bool {
     if (query.len == 0) return true;
     return containsAsciiIgnoreCase(entry.name, query) or containsAsciiIgnoreCase(entry.description, query);
+}
+
+fn quickActionMatchesQuery(entry: QuickActionEntry, query: []const u8) bool {
+    if (query.len == 0) return true;
+    return containsAsciiIgnoreCase(entry.label, query) or
+        containsAsciiIgnoreCase(entry.description, query) or
+        containsAsciiIgnoreCase(entry.keywords, query);
+}
+
+fn conversationMatchesQuery(conversation: *const Conversation, query: []const u8) bool {
+    if (query.len == 0) return true;
+    return containsAsciiIgnoreCase(conversation.id, query) or containsAsciiIgnoreCase(conversation.title, query);
 }
 
 fn registerStreamInterruptByte(
@@ -6261,12 +6610,27 @@ test "parseAssistantToolCall detects discovery/edit/exec/web/image tools" {
     }
 }
 
-test "parseCommandPickerQuery handles slash token editing only" {
-    try std.testing.expectEqualStrings("mo", parseCommandPickerQuery("/mo", 3).?);
-    try std.testing.expectEqualStrings("", parseCommandPickerQuery("/", 1).?);
-    try std.testing.expectEqualStrings("model", parseCommandPickerQuery("/model test", 6).?);
-    try std.testing.expect(parseCommandPickerQuery("/model test", 8) == null);
-    try std.testing.expect(parseCommandPickerQuery("hello", 2) == null);
+test "parseSlashCommandPickerQuery handles slash token editing only" {
+    try std.testing.expectEqualStrings("mo", parseSlashCommandPickerQuery("/mo", 3).?);
+    try std.testing.expectEqualStrings("", parseSlashCommandPickerQuery("/", 1).?);
+    try std.testing.expectEqualStrings("model", parseSlashCommandPickerQuery("/model test", 6).?);
+    try std.testing.expect(parseSlashCommandPickerQuery("/model test", 8) == null);
+    try std.testing.expect(parseSlashCommandPickerQuery("hello", 2) == null);
+}
+
+test "parseQuickActionPickerQuery handles palette query" {
+    try std.testing.expectEqualStrings("", parseQuickActionPickerQuery(">", 1).?);
+    try std.testing.expectEqualStrings("mod", parseQuickActionPickerQuery(">mod", 4).?);
+    try std.testing.expectEqualStrings("theme", parseQuickActionPickerQuery(">  theme", 8).?);
+    try std.testing.expect(parseQuickActionPickerQuery("/model", 3) == null);
+}
+
+test "parseConversationSwitchPickerQuery handles /switch command query" {
+    try std.testing.expectEqualStrings("", parseConversationSwitchPickerQuery("/switch", 7).?);
+    try std.testing.expectEqualStrings("", parseConversationSwitchPickerQuery("/switch ", 8).?);
+    try std.testing.expectEqualStrings("abc", parseConversationSwitchPickerQuery("/switch abc", 11).?);
+    try std.testing.expectEqualStrings("ab", parseConversationSwitchPickerQuery("/switch abc", 10).?);
+    try std.testing.expect(parseConversationSwitchPickerQuery("/swit", 5) == null);
 }
 
 test "commandMatchesQuery matches name and description" {
@@ -6277,6 +6641,13 @@ test "commandMatchesQuery matches name and description" {
     try std.testing.expect(commandMatchesQuery(entry, "prov"));
     try std.testing.expect(commandMatchesQuery(entry, "show"));
     try std.testing.expect(!commandMatchesQuery(entry, "xyz"));
+}
+
+test "deriveConversationTitleFromPrompt trims and truncates" {
+    const allocator = std.testing.allocator;
+    const title = try App.deriveConversationTitleFromPrompt(allocator, "   this   is   a   test prompt title   ");
+    defer allocator.free(title);
+    try std.testing.expect(std.mem.startsWith(u8, title, "this is a test prompt title"));
 }
 
 test "registerStreamInterruptByte requires double esc within window" {

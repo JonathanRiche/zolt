@@ -36,7 +36,7 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 ## UX / Rendering (Later)
 - [x] syntax highlighting for patch diff preview/code blocks (beyond +/- colors)
 - [ ] customizable keybindings/hotkeys (configurable shortcuts)
-- [ ] command palette / quick actions (e.g., “New chat”, “Toggle plan”, “Open logs”)
+- [x] command palette / quick actions (e.g., “New chat”, “Toggle plan”, “Open logs”)
 - [ ] status bar indicators (model/provider, token usage, tool mode)
 - [ ] copy buttons for code blocks / tool outputs
 - [ ] streaming UX tweaks (partial tool output display, spinner states)

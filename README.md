@@ -24,6 +24,7 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 - Single-pane chat UI with vim-like modes (`normal` / `insert`)
 - Streaming responses
 - Multiple saved conversations (persisted to disk)
+- Automatic conversation title from first prompt (for untitled/new chats)
 - Provider + model selection from `models.dev` cache
 - Context window footer (`used/full` and `% left` when available)
 - Slash command popup (Codex-style picker)
@@ -54,6 +55,16 @@ zig build
 
 ```bash
 zig build run
+```
+
+CLI helpers:
+
+```bash
+zolt -h
+zolt --help
+zolt --version
+zolt -s <conversation-id>
+zolt --session <conversation-id>
 ```
 
 3. Install to `~/.local` (puts binary at `~/.local/bin/zolt`):
@@ -136,6 +147,7 @@ Global / stream-time:
 - `Ctrl-Z` suspend Zolt (resume with shell `fg`)
 - While streaming: `Esc Esc` interrupts generation
 - `PgUp` / `PgDn` scroll chat history (works in both normal and insert modes)
+- `Ctrl-P` opens command palette quick actions
 
 Normal mode:
 - `i` enter insert mode
@@ -148,6 +160,7 @@ Normal mode:
 - `x` delete character at cursor
 - `H` / `L` shift conversation strip left/right
 - `/` enter insert mode and start slash command input
+- `Ctrl-P` open command palette
 
 Insert mode:
 - `Esc` return to normal mode (or close active picker)
@@ -155,24 +168,28 @@ Insert mode:
 - `Tab` accept active picker selection
 - `Backspace` delete character before cursor
 - `Ctrl-V` paste image from clipboard into input as `@path`
+- `Ctrl-P` open command palette
 - `Ctrl-N` / `Ctrl-P` move picker selection down/up
 - `Up` / `Down` arrows move picker selection up/down
 
 Picker triggers:
 - `/` opens slash command picker
+- `/commands` opens command palette
+- `>` opens command palette
 - `/model` opens model picker
 - `@` opens file picker
 
 ### Slash Commands
 
 - `/help`
+- `/commands`
 - `/provider [id]`
 - `/model [id]`
 - `/models [refresh]`
 - `/files [refresh]`
 - `/new [title]`
 - `/list`
-- `/switch <id>`
+- `/switch [id]` (no id opens conversation picker)
 - `/title <text>`
 - `/theme [codex|plain|forest]`
 - `/ui [compact|comfy]`
