@@ -2746,6 +2746,7 @@ const App = struct {
             defer if (loading_placeholder) |text| self.allocator.free(text);
 
             try appendMessageBlock(
+                self.allocator,
                 &body_writer.writer,
                 message,
                 content_width,
@@ -3828,6 +3829,7 @@ fn roleColor(role: Role, palette: Palette) []const u8 {
 }
 
 fn appendMessageBlock(
+    allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     message: anytype,
     width: usize,
@@ -3856,13 +3858,15 @@ fn appendMessageBlock(
             palette.reset,
         );
     } else {
-        _ = try writeWrappedPrefixed(
+        _ = try writeWrappedPrefixedMarkdown(
+            allocator,
             writer,
             rendered_content,
             width,
             marker,
             continuation,
             color,
+            palette,
             palette.reset,
         );
     }
@@ -3947,7 +3951,10 @@ fn buildWorkingPlaceholder(
 fn shouldRenderDiffMode(message: anytype, text: []const u8) bool {
     if (text.len == 0) return false;
     if (std.mem.indexOf(u8, text, "*** Begin Patch") != null) return true;
-    if (std.mem.indexOf(u8, text, "```") != null) return true;
+    if (std.mem.indexOf(u8, text, "```diff") != null) return true;
+    if (std.mem.indexOf(u8, text, "```patch") != null) return true;
+    if (std.mem.indexOf(u8, text, "```udiff") != null) return true;
+    if (std.mem.indexOf(u8, text, "```gitdiff") != null) return true;
 
     if (message.role == .system and std.mem.startsWith(u8, text, "[apply-patch-result]")) {
         return std.mem.indexOf(u8, text, "diff_preview:") != null;
@@ -4066,6 +4073,293 @@ fn writeWrappedPrefixed(
     }
 
     return line_count;
+}
+
+const MarkdownLineKind = enum {
+    plain,
+    heading,
+    quote,
+    list,
+    code,
+    fence,
+};
+
+const MarkdownRenderState = struct {
+    in_fenced_block: bool = false,
+};
+
+const MarkdownPreparedLine = struct {
+    text: []u8,
+    kind: MarkdownLineKind,
+    wrap_on_words: bool = true,
+    supports_inline_code: bool = true,
+
+    fn deinit(self: *MarkdownPreparedLine, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
+};
+
+const InlineMarkdownState = struct {
+    in_code: bool = false,
+};
+
+fn writeWrappedPrefixedMarkdown(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    text: []const u8,
+    width: usize,
+    first_prefix: []const u8,
+    next_prefix: []const u8,
+    prefix_color: []const u8,
+    palette: Palette,
+    reset: []const u8,
+) !usize {
+    var line_count: usize = 0;
+    var first_line = true;
+    var markdown_state: MarkdownRenderState = .{};
+
+    var raw_lines = std.mem.splitScalar(u8, text, '\n');
+    while (raw_lines.next()) |raw_line| {
+        var prepared = try prepareMarkdownLineAlloc(allocator, raw_line, &markdown_state);
+        defer prepared.deinit(allocator);
+
+        const line_text = std.mem.trimRight(u8, prepared.text, " ");
+        if (line_text.len == 0) {
+            const prefix = if (first_line) first_prefix else next_prefix;
+            try writer.print("{s}{s}{s}\n", .{ prefix_color, prefix, reset });
+            first_line = false;
+            line_count += 1;
+            continue;
+        }
+
+        var inline_state: InlineMarkdownState = .{};
+        var start: usize = 0;
+        while (start < line_text.len) {
+            const prefix = if (first_line) first_prefix else next_prefix;
+            const prefix_len = prefix.len;
+            const wrap_width = @max(@as(usize, 1), width -| prefix_len);
+            const max_end = @min(start + wrap_width, line_text.len);
+
+            var end = max_end;
+            if (prepared.wrap_on_words and max_end < line_text.len) {
+                var cursor = max_end;
+                while (cursor > start and line_text[cursor - 1] != ' ') : (cursor -= 1) {}
+                if (cursor > start) end = cursor - 1;
+            }
+            if (end <= start) end = max_end;
+
+            var segment = line_text[start..end];
+            if (prepared.wrap_on_words) {
+                segment = std.mem.trimRight(u8, segment, " ");
+            }
+
+            try writer.print("{s}{s}{s}", .{ prefix_color, prefix, reset });
+            try writeMarkdownSegmentStyled(
+                writer,
+                segment,
+                prepared,
+                &inline_state,
+                palette,
+                reset,
+            );
+            try writer.writeByte('\n');
+
+            line_count += 1;
+            first_line = false;
+            start = end;
+            if (prepared.wrap_on_words) {
+                while (start < line_text.len and line_text[start] == ' ') : (start += 1) {}
+            }
+        }
+    }
+
+    return line_count;
+}
+
+fn prepareMarkdownLineAlloc(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    state: *MarkdownRenderState,
+) !MarkdownPreparedLine {
+    const trimmed_leading = std.mem.trimLeft(u8, line, " \t");
+
+    if (isCodeFenceLine(trimmed_leading)) {
+        if (state.in_fenced_block) {
+            state.in_fenced_block = false;
+            return .{
+                .text = try allocator.dupe(u8, "[/code]"),
+                .kind = .fence,
+                .supports_inline_code = false,
+            };
+        }
+
+        state.in_fenced_block = true;
+        const language = codeFenceLanguageToken(trimmed_leading);
+        if (language.len == 0) {
+            return .{
+                .text = try allocator.dupe(u8, "[code]"),
+                .kind = .fence,
+                .supports_inline_code = false,
+            };
+        }
+        return .{
+            .text = try std.fmt.allocPrint(allocator, "[code: {s}]", .{language}),
+            .kind = .fence,
+            .supports_inline_code = false,
+        };
+    }
+
+    if (state.in_fenced_block) {
+        return .{
+            .text = try allocator.dupe(u8, line),
+            .kind = .code,
+            .wrap_on_words = false,
+            .supports_inline_code = false,
+        };
+    }
+
+    const heading = parseMarkdownHeading(trimmed_leading);
+    if (heading) |content| {
+        return .{
+            .text = try allocator.dupe(u8, content),
+            .kind = .heading,
+        };
+    }
+
+    if (parseMarkdownQuote(trimmed_leading)) |content| {
+        const normalized = if (content.len == 0)
+            try allocator.dupe(u8, "|")
+        else
+            try std.fmt.allocPrint(allocator, "| {s}", .{content});
+        return .{
+            .text = normalized,
+            .kind = .quote,
+        };
+    }
+
+    if (parseMarkdownList(trimmed_leading)) |content| {
+        return .{
+            .text = try allocator.dupe(u8, content),
+            .kind = .list,
+        };
+    }
+
+    return .{
+        .text = try allocator.dupe(u8, line),
+        .kind = .plain,
+    };
+}
+
+fn writeMarkdownSegmentStyled(
+    writer: *std.Io.Writer,
+    segment: []const u8,
+    prepared: MarkdownPreparedLine,
+    inline_state: *InlineMarkdownState,
+    palette: Palette,
+    reset: []const u8,
+) !void {
+    if (segment.len == 0) return;
+
+    const style = markdownLineStyle(prepared.kind, palette);
+    if (!prepared.supports_inline_code) {
+        try writeStyledSegment(writer, segment, style, reset);
+        return;
+    }
+
+    var cursor: usize = 0;
+    while (cursor < segment.len) {
+        const next_tick_rel = std.mem.indexOfScalar(u8, segment[cursor..], '`');
+        if (next_tick_rel == null) {
+            const tail = segment[cursor..];
+            if (tail.len > 0) {
+                const run_style = if (inline_state.in_code) markdownInlineCodeStyle(palette) else style;
+                try writeStyledSegment(writer, tail, run_style, reset);
+            }
+            break;
+        }
+
+        const tick_index = cursor + next_tick_rel.?;
+        if (tick_index > cursor) {
+            const chunk = segment[cursor..tick_index];
+            const run_style = if (inline_state.in_code) markdownInlineCodeStyle(palette) else style;
+            try writeStyledSegment(writer, chunk, run_style, reset);
+        }
+
+        inline_state.in_code = !inline_state.in_code;
+        cursor = tick_index + 1;
+    }
+}
+
+const SegmentStyle = struct {
+    color: []const u8 = "",
+    bold: bool = false,
+    dim: bool = false,
+};
+
+fn markdownLineStyle(kind: MarkdownLineKind, palette: Palette) SegmentStyle {
+    return switch (kind) {
+        .plain => .{},
+        .heading => .{ .color = palette.header, .bold = true },
+        .quote => .{ .color = palette.dim, .dim = true },
+        .list => .{ .color = palette.accent },
+        .code => .{ .color = palette.accent },
+        .fence => .{ .color = palette.dim, .dim = true },
+    };
+}
+
+fn markdownInlineCodeStyle(palette: Palette) SegmentStyle {
+    return .{ .color = palette.accent, .bold = true };
+}
+
+fn writeStyledSegment(
+    writer: *std.Io.Writer,
+    segment: []const u8,
+    style: SegmentStyle,
+    reset: []const u8,
+) !void {
+    if (segment.len == 0) return;
+
+    const use_ansi = reset.len > 0;
+    if (!use_ansi) {
+        try writer.writeAll(segment);
+        return;
+    }
+
+    if (style.bold) try writer.writeAll("\x1b[1m");
+    if (style.dim) try writer.writeAll("\x1b[2m");
+    if (style.color.len > 0) try writer.writeAll(style.color);
+    try writer.writeAll(segment);
+    try writer.writeAll(reset);
+}
+
+fn parseMarkdownHeading(line: []const u8) ?[]const u8 {
+    if (line.len < 2) return null;
+
+    var index: usize = 0;
+    while (index < line.len and line[index] == '#') : (index += 1) {}
+    if (index == 0 or index > 6) return null;
+    if (index >= line.len or line[index] != ' ') return null;
+
+    return std.mem.trimLeft(u8, line[index + 1 ..], " \t");
+}
+
+fn parseMarkdownQuote(line: []const u8) ?[]const u8 {
+    if (line.len == 0 or line[0] != '>') return null;
+    return std.mem.trimLeft(u8, line[1..], " \t");
+}
+
+fn parseMarkdownList(line: []const u8) ?[]const u8 {
+    if (line.len < 2) return null;
+
+    if ((line[0] == '-' or line[0] == '*' or line[0] == '+') and line[1] == ' ') {
+        return line;
+    }
+
+    var index: usize = 0;
+    while (index < line.len and std.ascii.isDigit(line[index])) : (index += 1) {}
+    if (index == 0 or index + 1 >= line.len) return null;
+    if (line[index] != '.' or line[index + 1] != ' ') return null;
+    return line;
 }
 
 fn writeWrappedPrefixedDiff(
@@ -6644,6 +6938,36 @@ test "deriveConversationTitleFromPrompt preserves long prompt preview" {
     const title = try App.deriveConversationTitleFromPrompt(allocator, prompt);
     defer allocator.free(title);
     try std.testing.expectEqualStrings(prompt, title);
+}
+
+test "shouldRenderDiffMode ignores regular code fences and detects diff fences" {
+    const message = struct {
+        role: Role = .assistant,
+        content: []const u8 = "",
+    }{};
+
+    try std.testing.expect(!shouldRenderDiffMode(message, "```zig\nconst x = 1;\n```"));
+    try std.testing.expect(shouldRenderDiffMode(message, "```diff\n+ add\n```"));
+}
+
+test "prepareMarkdownLineAlloc handles heading and fenced code state" {
+    const allocator = std.testing.allocator;
+    var state: MarkdownRenderState = .{};
+
+    var heading = try prepareMarkdownLineAlloc(allocator, "## Heading", &state);
+    defer heading.deinit(allocator);
+    try std.testing.expectEqual(MarkdownLineKind.heading, heading.kind);
+    try std.testing.expectEqualStrings("Heading", heading.text);
+
+    var fence_open = try prepareMarkdownLineAlloc(allocator, "```zig", &state);
+    defer fence_open.deinit(allocator);
+    try std.testing.expectEqual(MarkdownLineKind.fence, fence_open.kind);
+    try std.testing.expectEqualStrings("[code: zig]", fence_open.text);
+
+    var code_line = try prepareMarkdownLineAlloc(allocator, "const x = 1;", &state);
+    defer code_line.deinit(allocator);
+    try std.testing.expectEqual(MarkdownLineKind.code, code_line.kind);
+    try std.testing.expect(!code_line.wrap_on_words);
 }
 
 test "registerStreamInterruptByte requires double esc within window" {
