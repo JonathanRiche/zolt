@@ -677,8 +677,6 @@ const App = struct {
         defer out.deinit(allocator);
 
         var previous_was_space = false;
-        var char_count: usize = 0;
-        var truncated_by_limit = false;
         for (trimmed) |byte| {
             const is_space = byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
             if (is_space) {
@@ -688,13 +686,8 @@ const App = struct {
                 continue;
             }
 
-            if (char_count >= 60) {
-                truncated_by_limit = true;
-                break;
-            }
             try out.append(allocator, byte);
             previous_was_space = false;
-            char_count += 1;
         }
 
         while (out.items.len > 0 and out.items[out.items.len - 1] == ' ') {
@@ -702,12 +695,6 @@ const App = struct {
         }
 
         if (out.items.len == 0) return allocator.dupe(u8, "New conversation");
-        if (truncated_by_limit and out.items.len >= 3) {
-            out.items[out.items.len - 1] = '.';
-            out.items[out.items.len - 2] = '.';
-            out.items[out.items.len - 3] = '.';
-        }
-
         return out.toOwnedSlice(allocator);
     }
 
@@ -6643,11 +6630,20 @@ test "commandMatchesQuery matches name and description" {
     try std.testing.expect(!commandMatchesQuery(entry, "xyz"));
 }
 
-test "deriveConversationTitleFromPrompt trims and truncates" {
+test "deriveConversationTitleFromPrompt trims and normalizes spaces" {
     const allocator = std.testing.allocator;
     const title = try App.deriveConversationTitleFromPrompt(allocator, "   this   is   a   test prompt title   ");
     defer allocator.free(title);
-    try std.testing.expect(std.mem.startsWith(u8, title, "this is a test prompt title"));
+    try std.testing.expectEqualStrings("this is a test prompt title", title);
+}
+
+test "deriveConversationTitleFromPrompt preserves long prompt preview" {
+    const allocator = std.testing.allocator;
+    const prompt =
+        "this is a deliberately long first prompt that should remain intact as the conversation preview title";
+    const title = try App.deriveConversationTitleFromPrompt(allocator, prompt);
+    defer allocator.free(title);
+    try std.testing.expectEqualStrings(prompt, title);
 }
 
 test "registerStreamInterruptByte requires double esc within window" {

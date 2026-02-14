@@ -137,7 +137,7 @@ pub const AppState = struct {
         };
         errdefer app_state.deinit(allocator);
 
-        _ = try app_state.createConversation(allocator, "Conversation 1");
+        _ = try app_state.createConversation(allocator, "New conversation");
         return app_state;
     }
 

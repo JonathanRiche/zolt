@@ -24,7 +24,7 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 - Single-pane chat UI with vim-like modes (`normal` / `insert`)
 - Streaming responses
 - Multiple saved conversations (persisted to disk)
-- Automatic conversation title from first prompt (for untitled/new chats)
+- Codex-style conversation preview title from first prompt (for untitled/new chats)
 - Provider + model selection from `models.dev` cache
 - Context window footer (`used/full` and `% left` when available)
 - Slash command popup (Codex-style picker)
