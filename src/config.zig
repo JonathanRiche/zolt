@@ -1,0 +1,237 @@
+//! Optional startup configuration loaded from JSONC.
+
+const std = @import("std");
+
+pub const Theme = enum {
+    codex,
+    plain,
+    forest,
+};
+
+pub const UiMode = enum {
+    compact,
+    comfy,
+};
+
+pub const Config = struct {
+    provider_id: ?[]u8 = null,
+    model_id: ?[]u8 = null,
+    theme: ?Theme = null,
+    ui_mode: ?UiMode = null,
+
+    pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+        if (self.provider_id) |provider_id| allocator.free(provider_id);
+        if (self.model_id) |model_id| allocator.free(model_id);
+    }
+};
+
+const RawConfig = struct {
+    provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    default_provider_id: ?[]const u8 = null,
+    default_model_id: ?[]const u8 = null,
+    selected_provider_id: ?[]const u8 = null,
+    selected_model_id: ?[]const u8 = null,
+    theme: ?[]const u8 = null,
+    ui: ?[]const u8 = null,
+    ui_mode: ?[]const u8 = null,
+    compact_mode: ?bool = null,
+};
+
+pub fn loadOptionalFromPath(allocator: std.mem.Allocator, path: []const u8) !?Config {
+    var file = openFileForPath(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(&read_buffer);
+    var content_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer content_writer.deinit();
+
+    _ = try reader.interface.streamRemaining(&content_writer.writer);
+    const content = try content_writer.toOwnedSlice();
+    defer allocator.free(content);
+
+    return @as(?Config, try parseConfigJsonc(allocator, content));
+}
+
+fn parseConfigJsonc(allocator: std.mem.Allocator, text: []const u8) !Config {
+    const stripped = try stripJsonCommentsAlloc(allocator, text);
+    defer allocator.free(stripped);
+
+    const parsed = try std.json.parseFromSlice(RawConfig, allocator, stripped, .{
+        .ignore_unknown_fields = true,
+        .duplicate_field_behavior = .use_last,
+    });
+    defer parsed.deinit();
+
+    return configFromRaw(allocator, parsed.value);
+}
+
+fn configFromRaw(allocator: std.mem.Allocator, raw: RawConfig) !Config {
+    var config: Config = .{};
+    errdefer config.deinit(allocator);
+
+    const provider_source = raw.provider orelse raw.default_provider_id orelse raw.selected_provider_id;
+    const model_source = raw.model orelse raw.default_model_id orelse raw.selected_model_id;
+
+    config.provider_id = try dupeTrimmedIfNotEmpty(allocator, provider_source);
+    config.model_id = try dupeTrimmedIfNotEmpty(allocator, model_source);
+
+    if (raw.theme) |theme_name| {
+        const parsed_theme = parseThemeName(theme_name) orelse return error.InvalidThemeName;
+        config.theme = parsed_theme;
+    }
+
+    if (raw.ui orelse raw.ui_mode) |ui_name| {
+        const parsed_ui = parseUiModeName(ui_name) orelse return error.InvalidUiMode;
+        config.ui_mode = parsed_ui;
+    } else if (raw.compact_mode) |compact_mode| {
+        config.ui_mode = if (compact_mode) .compact else .comfy;
+    }
+
+    return config;
+}
+
+fn dupeTrimmedIfNotEmpty(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    const source = value orelse return null;
+    const trimmed = std.mem.trim(u8, source, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return @as(?[]u8, try allocator.dupe(u8, trimmed));
+}
+
+fn parseThemeName(input: []const u8) ?Theme {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "codex")) return .codex;
+    if (std.ascii.eqlIgnoreCase(trimmed, "plain")) return .plain;
+    if (std.ascii.eqlIgnoreCase(trimmed, "forest")) return .forest;
+    return null;
+}
+
+fn parseUiModeName(input: []const u8) ?UiMode {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "compact")) return .compact;
+    if (std.ascii.eqlIgnoreCase(trimmed, "comfy")) return .comfy;
+    return null;
+}
+
+fn stripJsonCommentsAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    var in_string = false;
+    var escaped = false;
+    var in_line_comment = false;
+    var in_block_comment = false;
+
+    var index: usize = 0;
+    while (index < input.len) : (index += 1) {
+        const byte = input[index];
+        const next = if (index + 1 < input.len) input[index + 1] else 0;
+
+        if (in_line_comment) {
+            if (byte == '\n') {
+                in_line_comment = false;
+                try output.append(allocator, byte);
+            }
+            continue;
+        }
+
+        if (in_block_comment) {
+            if (byte == '*' and next == '/') {
+                in_block_comment = false;
+                index += 1;
+                continue;
+            }
+            if (byte == '\n') {
+                try output.append(allocator, byte);
+            }
+            continue;
+        }
+
+        if (in_string) {
+            try output.append(allocator, byte);
+            if (escaped) {
+                escaped = false;
+            } else if (byte == '\\') {
+                escaped = true;
+            } else if (byte == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (byte == '"') {
+            in_string = true;
+            try output.append(allocator, byte);
+            continue;
+        }
+
+        if (byte == '/' and next == '/') {
+            in_line_comment = true;
+            index += 1;
+            continue;
+        }
+
+        if (byte == '/' and next == '*') {
+            in_block_comment = true;
+            index += 1;
+            continue;
+        }
+
+        try output.append(allocator, byte);
+    }
+
+    if (in_block_comment) return error.UnterminatedBlockComment;
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn openFileForPath(path: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.openFileAbsolute(path, flags);
+    }
+    return std.fs.cwd().openFile(path, flags);
+}
+
+test "parse jsonc config with comments and aliases" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  // startup defaults
+        \\  "default_provider_id": "openai",
+        \\  "selected_model_id": "gpt-4.1",
+        \\  "theme": "plain",
+        \\  /* legacy bool form */
+        \\  "compact_mode": false
+        \\}
+    ;
+
+    var config = try parseConfigJsonc(allocator, input);
+    defer config.deinit(allocator);
+
+    try std.testing.expectEqualStrings("openai", config.provider_id.?);
+    try std.testing.expectEqualStrings("gpt-4.1", config.model_id.?);
+    try std.testing.expect(config.theme.? == .plain);
+    try std.testing.expect(config.ui_mode.? == .comfy);
+}
+
+test "stripJsonCommentsAlloc preserves comment-like text inside strings" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  "message": "literal // not a comment and /* not block */",
+        \\  // real comment
+        \\  "ui": "compact"
+        \\}
+    ;
+
+    const stripped = try stripJsonCommentsAlloc(allocator, input);
+    defer allocator.free(stripped);
+
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "literal // not a comment") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "\"ui\": \"compact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "real comment") == null);
+}

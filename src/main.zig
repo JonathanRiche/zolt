@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const app_config = @import("config.zig");
 const models = @import("models.zig");
 const Paths = @import("paths.zig").Paths;
 const AppState = @import("state.zig").AppState;
@@ -50,8 +51,37 @@ pub fn main() !void {
     };
     defer paths.deinit(allocator);
 
+    var config = app_config.loadOptionalFromPath(allocator, paths.config_path) catch |err| blk: {
+        std.log.warn("failed to load config ({s}): {s}", .{ paths.config_path, @errorName(err) });
+        break :blk null;
+    };
+    defer if (config) |*cfg| cfg.deinit(allocator);
+
     var app_state = try AppState.loadOrCreate(allocator, paths.state_path);
     defer app_state.deinit(allocator);
+
+    var startup_options: tui.StartupOptions = .{};
+    if (config) |cfg| {
+        if (cfg.provider_id) |provider_id| {
+            try app_state.setSelectedProvider(allocator, provider_id);
+        }
+        if (cfg.model_id) |model_id| {
+            try app_state.setSelectedModel(allocator, model_id);
+        }
+        if (cfg.theme) |theme| {
+            startup_options.theme = switch (theme) {
+                .codex => .codex,
+                .plain => .plain,
+                .forest => .forest,
+            };
+        }
+        if (cfg.ui_mode) |ui_mode| {
+            startup_options.compact_mode = switch (ui_mode) {
+                .compact => true,
+                .comfy => false,
+            };
+        }
+    }
 
     var catalog = blk: {
         const loaded = models.loadOrRefresh(allocator, paths.models_cache_path) catch |err| {
@@ -67,7 +97,7 @@ pub fn main() !void {
     };
     defer catalog.deinit(allocator);
 
-    tui.run(allocator, &paths, &app_state, &catalog) catch |err| switch (err) {
+    tui.run(allocator, &paths, &app_state, &catalog, startup_options) catch |err| switch (err) {
         error.NotATerminal => {
             var output_buffer: [1024]u8 = undefined;
             var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
@@ -115,5 +145,6 @@ test {
     _ = @import("state.zig");
     _ = @import("models.zig");
     _ = @import("provider_client.zig");
+    _ = @import("config.zig");
     _ = @import("tui.zig");
 }

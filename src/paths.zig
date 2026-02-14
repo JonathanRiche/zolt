@@ -8,6 +8,7 @@ pub const Paths = struct {
     cache_dir: []u8,
     state_path: []u8,
     models_cache_path: []u8,
+    config_path: []u8,
 
     pub fn init(allocator: std.mem.Allocator) !Paths {
         const data_home = try xdgHome(allocator, "XDG_DATA_HOME", ".local/share");
@@ -34,11 +35,15 @@ pub const Paths = struct {
         const models_cache_path = try std.fs.path.join(allocator, &.{ cache_dir, "models.json" });
         errdefer allocator.free(models_cache_path);
 
+        const config_path = try defaultConfigPath(allocator);
+        errdefer allocator.free(config_path);
+
         return .{
             .data_dir = data_dir,
             .cache_dir = cache_dir,
             .state_path = state_path,
             .models_cache_path = models_cache_path,
+            .config_path = config_path,
         };
     }
 
@@ -64,11 +69,15 @@ pub const Paths = struct {
         const models_cache_path = try std.fs.path.join(allocator, &.{ cache_dir, "models.json" });
         errdefer allocator.free(models_cache_path);
 
+        const config_path = try defaultConfigPath(allocator);
+        errdefer allocator.free(config_path);
+
         return .{
             .data_dir = data_dir,
             .cache_dir = cache_dir,
             .state_path = state_path,
             .models_cache_path = models_cache_path,
+            .config_path = config_path,
         };
     }
 
@@ -77,6 +86,7 @@ pub const Paths = struct {
         allocator.free(self.cache_dir);
         allocator.free(self.state_path);
         allocator.free(self.models_cache_path);
+        allocator.free(self.config_path);
     }
 
     pub fn ensureDirs(self: *const Paths) !void {
@@ -103,6 +113,12 @@ pub const Paths = struct {
         defer allocator.free(home);
 
         return std.fs.path.join(allocator, &.{ home, home_suffix });
+    }
+
+    fn defaultConfigPath(allocator: std.mem.Allocator) ![]u8 {
+        const config_home = try xdgHome(allocator, "XDG_CONFIG_HOME", ".config");
+        defer allocator.free(config_home);
+        return std.fs.path.join(allocator, &.{ config_home, "zolt", "config.jsonc" });
     }
 
     fn resolveWorkspaceScopeRoot(allocator: std.mem.Allocator) ![]u8 {

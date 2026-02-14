@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zolt.local/schema/config.schema.json",
+  "title": "Zolt Config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional JSON Schema URI for editor autocomplete/validation."
+    },
+    "provider": {
+      "type": "string",
+      "description": "Default provider id for startup."
+    },
+    "model": {
+      "type": "string",
+      "description": "Default model id for startup."
+    },
+    "default_provider_id": {
+      "type": "string",
+      "description": "Alias for provider."
+    },
+    "default_model_id": {
+      "type": "string",
+      "description": "Alias for model."
+    },
+    "selected_provider_id": {
+      "type": "string",
+      "description": "Alias for provider."
+    },
+    "selected_model_id": {
+      "type": "string",
+      "description": "Alias for model."
+    },
+    "theme": {
+      "type": "string",
+      "enum": ["codex", "plain", "forest"],
+      "description": "Startup theme."
+    },
+    "ui": {
+      "type": "string",
+      "enum": ["compact", "comfy"],
+      "description": "Startup UI mode."
+    },
+    "ui_mode": {
+      "type": "string",
+      "enum": ["compact", "comfy"],
+      "description": "Alias for ui."
+    },
+    "compact_mode": {
+      "type": "boolean",
+      "description": "Legacy alias for ui/ui_mode: true=compact, false=comfy."
+    }
+  }
+}

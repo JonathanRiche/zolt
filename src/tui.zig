@@ -17,10 +17,15 @@ const Mode = enum {
     insert,
 };
 
-const Theme = enum {
+pub const Theme = enum {
     codex,
     plain,
     forest,
+};
+
+pub const StartupOptions = struct {
+    theme: ?Theme = null,
+    compact_mode: ?bool = null,
 };
 
 const StreamTask = enum {
@@ -284,6 +289,7 @@ pub fn run(
     paths: *const Paths,
     app_state: *AppState,
     catalog: *models.Catalog,
+    startup_options: StartupOptions,
 ) !void {
     var app: App = .{
         .allocator = allocator,
@@ -293,6 +299,12 @@ pub fn run(
         .notice = try allocator.dupe(u8, "Press i for insert mode. Type /help for commands."),
     };
     defer app.deinit();
+    if (startup_options.theme) |theme| {
+        app.theme = theme;
+    }
+    if (startup_options.compact_mode) |compact_mode| {
+        app.compact_mode = compact_mode;
+    }
     app.refreshFileIndex() catch {};
     app.ensureCurrentConversationVisibleInStrip();
 

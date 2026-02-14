@@ -88,6 +88,33 @@ Common keys:
 
 Use `/provider <id>` to switch provider, then `/model` to pick models.
 
+## Config File (JSONC)
+
+Zolt looks for an optional config file at:
+
+- `$XDG_CONFIG_HOME/zolt/config.jsonc`
+- fallback: `~/.config/zolt/config.jsonc`
+
+Supported keys:
+
+- `provider` (alias: `default_provider_id`, `selected_provider_id`)
+- `model` (alias: `default_model_id`, `selected_model_id`)
+- `theme`: `codex` | `plain` | `forest`
+- `ui` (alias: `ui_mode`): `compact` | `comfy`
+- `compact_mode`: `true`/`false` (legacy alias for `ui`)
+
+Example:
+
+```jsonc
+{
+  // startup defaults
+  "provider": "openai",
+  "model": "gpt-4.1",
+  "theme": "codex",
+  "ui": "compact"
+}
+```
+
 ## Models and Cache (`models.dev`)
 
 Zolt pulls provider/model data from:
