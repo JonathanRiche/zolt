@@ -676,13 +676,13 @@ const App = struct {
 
     fn openConversationSwitchPicker(self: *App) !void {
         self.mode = .insert;
-        try self.setInputBufferTo("/switch ");
+        try self.setInputBufferTo("/sessions ");
         self.command_picker_open = false;
         self.command_picker_index = 0;
         self.command_picker_scroll = 0;
         self.command_picker_kind = .conversation_switch;
         self.syncPickersFromInput();
-        try self.setNotice("Select a conversation to switch");
+        try self.setNotice("Select a conversation session");
     }
 
     fn setInputBufferTo(self: *App, text: []const u8) !void {
@@ -2480,7 +2480,7 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /commands /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /switch [id] /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /paste-image /quit  input: use @path, Ctrl-V paste image, Ctrl-P command palette, pickers: Ctrl-N/P or Up/Down + Enter, assistant tools: <READ>, <LIST_DIR>, <READ_FILE>, <GREP_FILES>, <PROJECT_SEARCH>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>, <WEB_SEARCH>, <VIEW_IMAGE>");
+            try self.setNotice("Commands: /help /commands /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /sessions [id] /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /paste-image /quit  input: use @path, Ctrl-V paste image, Ctrl-P command palette, pickers: Ctrl-N/P or Up/Down + Enter, assistant tools: <READ>, <LIST_DIR>, <READ_FILE>, <GREP_FILES>, <PROJECT_SEARCH>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>, <WEB_SEARCH>, <VIEW_IMAGE>");
             return;
         }
 
@@ -2610,10 +2610,18 @@ const App = struct {
             defer line_writer.deinit();
 
             try line_writer.writer.writeAll("Conversations: ");
-            const limit = @min(self.app_state.conversations.items.len, 6);
-            for (self.app_state.conversations.items[0..limit], 0..) |conversation, index| {
+            var ordered = try collectConversationSwitchMatchOrder(
+                self.allocator,
+                self.app_state.conversations.items,
+                "",
+            );
+            defer ordered.deinit(self.allocator);
+
+            const limit = @min(ordered.items.len, 6);
+            for (ordered.items[0..limit], 0..) |conversation_index, index| {
+                const conversation = self.app_state.conversations.items[conversation_index];
                 if (index > 0) try line_writer.writer.writeAll(" | ");
-                const current_mark = if (index == self.app_state.current_index) "*" else "";
+                const current_mark = if (conversation_index == self.app_state.current_index) "*" else "";
                 try line_writer.writer.print("{s}{s}:{s}", .{ current_mark, conversation.id, conversation.title });
             }
 
@@ -2622,7 +2630,7 @@ const App = struct {
             return;
         }
 
-        if (std.mem.eql(u8, command, "switch")) {
+        if (std.mem.eql(u8, command, "sessions") or std.mem.eql(u8, command, "switch")) {
             const conversation_id = parts.next() orelse {
                 try self.openConversationSwitchPicker();
                 return;
@@ -2942,7 +2950,10 @@ const App = struct {
         defer strip_writer.deinit();
 
         const conversations = self.app_state.conversations.items;
-        const total = conversations.len;
+        var ordered_indices = try collectConversationSwitchMatchOrder(self.allocator, conversations, "");
+        defer ordered_indices.deinit(self.allocator);
+
+        const total = ordered_indices.items.len;
         if (total == 0) return self.allocator.dupe(u8, "convs: none");
 
         const window_size: usize = 6;
@@ -2951,11 +2962,20 @@ const App = struct {
         const max_items: usize = @min(total - start_index, window_size);
         const end_index = @min(start_index + max_items, total);
 
-        try strip_writer.writer.print("convs({d}/{d}):", .{ self.app_state.current_index + 1, total });
+        var current_rank: usize = 0;
+        for (ordered_indices.items, 0..) |conversation_index, rank| {
+            if (conversation_index == self.app_state.current_index) {
+                current_rank = rank;
+                break;
+            }
+        }
+
+        try strip_writer.writer.print("convs({d}/{d}):", .{ current_rank + 1, total });
         if (start_index > 0) try strip_writer.writer.writeAll(" ..");
 
-        for (conversations[start_index..end_index], start_index..) |conv, index| {
-            const marker = if (index == self.app_state.current_index) "*" else "";
+        for (ordered_indices.items[start_index..end_index], start_index..) |conversation_index, index| {
+            const conv = conversations[conversation_index];
+            const marker = if (conversation_index == self.app_state.current_index) "*" else "";
             const short_id = conv.id[0..@min(conv.id.len, 6)];
             const title_limit: usize = 14;
 
@@ -3000,12 +3020,20 @@ const App = struct {
 
         const window_size: usize = 6;
         const max_start = if (total > window_size) total - window_size else 0;
-        const current = self.app_state.current_index;
+        const conversations = self.app_state.conversations.items;
+        const current_index = self.app_state.current_index;
+        var current_rank: usize = 0;
+        for (conversations, 0..) |_, index| {
+            if (index == current_index) continue;
+            if (conversationSortComesBefore(conversations, index, current_index)) {
+                current_rank += 1;
+            }
+        }
 
-        if (current < self.conv_strip_start) {
-            self.conv_strip_start = current;
-        } else if (current >= self.conv_strip_start + window_size) {
-            self.conv_strip_start = current - window_size + 1;
+        if (current_rank < self.conv_strip_start) {
+            self.conv_strip_start = current_rank;
+        } else if (current_rank >= self.conv_strip_start + window_size) {
+            self.conv_strip_start = current_rank - window_size + 1;
         }
 
         if (self.conv_strip_start > max_start) self.conv_strip_start = max_start;
@@ -3421,16 +3449,6 @@ const App = struct {
         return null;
     }
 
-    fn conversationPickerNthMatch(self: *App, query: []const u8, target_index: usize) ?*const Conversation {
-        var seen: usize = 0;
-        for (self.app_state.conversations.items) |*conversation| {
-            if (!conversationMatchesQuery(conversation, query)) continue;
-            if (seen == target_index) return conversation;
-            seen += 1;
-        }
-        return null;
-    }
-
     fn moveFilePickerSelection(self: *App, delta: i32) void {
         const query = currentAtTokenQuery(self.input_buffer.items, self.input_cursor) orelse return;
         const total = self.filePickerMatchCount(query);
@@ -3506,7 +3524,17 @@ const App = struct {
             self.input_cursor = 0;
             try self.executeQuickAction(selected);
         } else if (self.command_picker_kind == .conversation_switch) {
-            const selected = self.conversationPickerNthMatch(query, self.command_picker_index) orelse return;
+            var ordered_matches = try collectConversationSwitchMatchOrder(
+                self.allocator,
+                self.app_state.conversations.items,
+                query,
+            );
+            defer ordered_matches.deinit(self.allocator);
+            if (ordered_matches.items.len == 0) return;
+            if (self.command_picker_index >= ordered_matches.items.len) {
+                self.command_picker_index = ordered_matches.items.len - 1;
+            }
+            const selected = &self.app_state.conversations.items[ordered_matches.items[self.command_picker_index]];
             _ = self.app_state.switchConversation(selected.id);
             self.scroll_lines = 0;
             self.ensureCurrentConversationVisibleInStrip();
@@ -3651,7 +3679,19 @@ const App = struct {
 
     fn renderCommandPicker(self: *App, writer: *std.Io.Writer, width: usize, terminal_lines: usize, palette: Palette) !void {
         const query = self.commandPickerQueryForKind(self.command_picker_kind) orelse return;
-        const total = self.commandPickerMatchCount(query);
+        var ordered_conversation_matches: std.ArrayList(usize) = .empty;
+        defer ordered_conversation_matches.deinit(self.allocator);
+        const total = switch (self.command_picker_kind) {
+            .conversation_switch => blk: {
+                ordered_conversation_matches = try collectConversationSwitchMatchOrder(
+                    self.allocator,
+                    self.app_state.conversations.items,
+                    query,
+                );
+                break :blk ordered_conversation_matches.items.len;
+            },
+            else => self.commandPickerMatchCount(query),
+        };
         const max_rows = self.commandPickerMaxRows(terminal_lines);
         const shown_rows = if (total == 0) @as(usize, 1) else @min(total, max_rows);
 
@@ -3673,7 +3713,7 @@ const App = struct {
             self.allocator,
             "{s} ({d}) query:{s}",
             .{
-                if (self.command_picker_kind == .conversation_switch) "conversation switch" else if (self.command_picker_kind == .quick_actions) "command palette" else "command picker",
+                if (self.command_picker_kind == .conversation_switch) "conversation sessions" else if (self.command_picker_kind == .quick_actions) "command palette" else "command picker",
                 total,
                 if (query.len == 0) "*" else query,
             },
@@ -3704,7 +3744,7 @@ const App = struct {
                     .{ marker, selected_entry.label, selected_entry.description },
                 );
             } else if (self.command_picker_kind == .conversation_switch) blk: {
-                const conversation = self.conversationPickerNthMatch(query, index) orelse continue;
+                const conversation = &self.app_state.conversations.items[ordered_conversation_matches.items[index]];
                 const current_marker = if (self.app_state.current_index < self.app_state.conversations.items.len and
                     std.mem.eql(u8, self.app_state.currentConversationConst().id, conversation.id)) "*" else " ";
                 break :blk try std.fmt.allocPrint(
@@ -4559,7 +4599,7 @@ const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "files", .description = "show file index / refresh" },
     .{ .name = "new", .description = "create conversation" },
     .{ .name = "list", .description = "list conversations", .insert_trailing_space = false },
-    .{ .name = "switch", .description = "switch conversation (picker or id)" },
+    .{ .name = "sessions", .description = "switch conversation session (picker or id)" },
     .{ .name = "title", .description = "rename conversation" },
     .{ .name = "theme", .description = "set theme (codex/plain/forest)" },
     .{ .name = "ui", .description = "set ui mode (compact/comfy)" },
@@ -4570,7 +4610,7 @@ const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
 
 const QUICK_ACTIONS = [_]QuickActionEntry{
     .{ .id = .new_chat, .label = "New chat", .description = "create a new conversation", .keywords = "conversation create /new" },
-    .{ .id = .open_conversation_switch, .label = "Switch conversation", .description = "open conversation switch picker", .keywords = "conversation switch /switch" },
+    .{ .id = .open_conversation_switch, .label = "Switch session", .description = "open conversation sessions picker", .keywords = "conversation sessions /sessions /switch" },
     .{ .id = .open_model_picker, .label = "Switch model", .description = "open /model picker", .keywords = "model provider" },
     .{ .id = .open_provider_command, .label = "Switch provider", .description = "insert /provider command", .keywords = "provider" },
     .{ .id = .refresh_models_cache, .label = "Refresh models cache", .description = "run /models refresh", .keywords = "models cache reload" },
@@ -4602,12 +4642,23 @@ fn parseQuickActionPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
 }
 
 fn parseConversationSwitchPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
-    if (!std.mem.startsWith(u8, input, "/switch")) return null;
-    if (input.len == 7) return "";
-    if (input.len > 7 and input[7] == ' ') {
-        const query_start: usize = 8;
-        const query_cursor = @max(query_start, @min(cursor, input.len));
-        return std.mem.trimLeft(u8, input[query_start..query_cursor], " ");
+    if (std.mem.startsWith(u8, input, "/sessions")) {
+        if (input.len == 9) return "";
+        if (input.len > 9 and input[9] == ' ') {
+            const query_start: usize = 10;
+            const query_cursor = @max(query_start, @min(cursor, input.len));
+            return std.mem.trimLeft(u8, input[query_start..query_cursor], " ");
+        }
+        return null;
+    }
+
+    if (std.mem.startsWith(u8, input, "/switch")) {
+        if (input.len == 7) return "";
+        if (input.len > 7 and input[7] == ' ') {
+            const query_start: usize = 8;
+            const query_cursor = @max(query_start, @min(cursor, input.len));
+            return std.mem.trimLeft(u8, input[query_start..query_cursor], " ");
+        }
     }
     return null;
 }
@@ -4627,6 +4678,39 @@ fn quickActionMatchesQuery(entry: QuickActionEntry, query: []const u8) bool {
 fn conversationMatchesQuery(conversation: *const Conversation, query: []const u8) bool {
     if (query.len == 0) return true;
     return containsAsciiIgnoreCase(conversation.id, query) or containsAsciiIgnoreCase(conversation.title, query);
+}
+
+fn conversationSortComesBefore(conversations: []const Conversation, lhs_index: usize, rhs_index: usize) bool {
+    const lhs = &conversations[lhs_index];
+    const rhs = &conversations[rhs_index];
+
+    if (lhs.updated_ms != rhs.updated_ms) return lhs.updated_ms > rhs.updated_ms;
+    if (lhs.created_ms != rhs.created_ms) return lhs.created_ms > rhs.created_ms;
+    return lhs_index > rhs_index;
+}
+
+fn collectConversationSwitchMatchOrder(
+    allocator: std.mem.Allocator,
+    conversations: []const Conversation,
+    query: []const u8,
+) !std.ArrayList(usize) {
+    var ordered: std.ArrayList(usize) = .empty;
+    errdefer ordered.deinit(allocator);
+
+    for (conversations, 0..) |*conversation, index| {
+        if (!conversationMatchesQuery(conversation, query)) continue;
+
+        var insert_at = ordered.items.len;
+        for (ordered.items, 0..) |existing_index, existing_position| {
+            if (conversationSortComesBefore(conversations, index, existing_index)) {
+                insert_at = existing_position;
+                break;
+            }
+        }
+        try ordered.insert(allocator, insert_at, index);
+    }
+
+    return ordered;
 }
 
 fn registerStreamInterruptByte(
@@ -6935,12 +7019,79 @@ test "parseQuickActionPickerQuery handles palette query" {
     try std.testing.expect(parseQuickActionPickerQuery("/model", 3) == null);
 }
 
-test "parseConversationSwitchPickerQuery handles /switch command query" {
+test "parseConversationSwitchPickerQuery handles /sessions and /switch queries" {
+    try std.testing.expectEqualStrings("", parseConversationSwitchPickerQuery("/sessions", 9).?);
+    try std.testing.expectEqualStrings("", parseConversationSwitchPickerQuery("/sessions ", 10).?);
+    try std.testing.expectEqualStrings("abc", parseConversationSwitchPickerQuery("/sessions abc", 13).?);
+    try std.testing.expectEqualStrings("ab", parseConversationSwitchPickerQuery("/sessions abc", 12).?);
     try std.testing.expectEqualStrings("", parseConversationSwitchPickerQuery("/switch", 7).?);
-    try std.testing.expectEqualStrings("", parseConversationSwitchPickerQuery("/switch ", 8).?);
     try std.testing.expectEqualStrings("abc", parseConversationSwitchPickerQuery("/switch abc", 11).?);
-    try std.testing.expectEqualStrings("ab", parseConversationSwitchPickerQuery("/switch abc", 10).?);
+    try std.testing.expect(parseConversationSwitchPickerQuery("/session", 8) == null);
     try std.testing.expect(parseConversationSwitchPickerQuery("/swit", 5) == null);
+}
+
+test "collectConversationSwitchMatchOrder sorts newest conversations first" {
+    const allocator = std.testing.allocator;
+    var conversations = [_]Conversation{
+        .{
+            .id = @constCast("a1"),
+            .title = @constCast("alpha"),
+            .created_ms = 100,
+            .updated_ms = 100,
+        },
+        .{
+            .id = @constCast("b2"),
+            .title = @constCast("beta"),
+            .created_ms = 200,
+            .updated_ms = 900,
+        },
+        .{
+            .id = @constCast("c3"),
+            .title = @constCast("charlie"),
+            .created_ms = 300,
+            .updated_ms = 500,
+        },
+    };
+
+    var ordered = try collectConversationSwitchMatchOrder(allocator, conversations[0..], "");
+    defer ordered.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), ordered.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered.items[0]);
+    try std.testing.expectEqual(@as(usize, 2), ordered.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), ordered.items[2]);
+}
+
+test "collectConversationSwitchMatchOrder uses created time then index as tie-breakers" {
+    const allocator = std.testing.allocator;
+    var conversations = [_]Conversation{
+        .{
+            .id = @constCast("a1"),
+            .title = @constCast("new title"),
+            .created_ms = 100,
+            .updated_ms = 1_000,
+        },
+        .{
+            .id = @constCast("b2"),
+            .title = @constCast("newer"),
+            .created_ms = 200,
+            .updated_ms = 1_000,
+        },
+        .{
+            .id = @constCast("c3"),
+            .title = @constCast("newest"),
+            .created_ms = 200,
+            .updated_ms = 1_000,
+        },
+    };
+
+    var ordered = try collectConversationSwitchMatchOrder(allocator, conversations[0..], "new");
+    defer ordered.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), ordered.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ordered.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), ordered.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), ordered.items[2]);
 }
 
 test "commandMatchesQuery matches name and description" {
