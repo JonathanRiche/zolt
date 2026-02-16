@@ -1,6 +1,7 @@
 //! Optional startup configuration loaded from JSONC.
 
 const std = @import("std");
+const keybindings = @import("keybindings.zig");
 
 pub const Theme = enum {
     codex,
@@ -18,6 +19,7 @@ pub const Config = struct {
     model_id: ?[]u8 = null,
     theme: ?Theme = null,
     ui_mode: ?UiMode = null,
+    keybindings: ?keybindings.Keybindings = null,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.provider_id) |provider_id| allocator.free(provider_id);
@@ -36,6 +38,38 @@ const RawConfig = struct {
     ui: ?[]const u8 = null,
     ui_mode: ?[]const u8 = null,
     compact_mode: ?bool = null,
+    keybindings: ?RawKeybindings = null,
+    hotkeys: ?RawKeybindings = null,
+};
+
+const RawKeybindings = struct {
+    normal: ?RawNormalKeybindings = null,
+    insert: ?RawInsertKeybindings = null,
+};
+
+const RawNormalKeybindings = struct {
+    quit: ?[]const u8 = null,
+    insert_mode: ?[]const u8 = null,
+    append_mode: ?[]const u8 = null,
+    cursor_left: ?[]const u8 = null,
+    cursor_right: ?[]const u8 = null,
+    delete_char: ?[]const u8 = null,
+    scroll_up: ?[]const u8 = null,
+    scroll_down: ?[]const u8 = null,
+    strip_left: ?[]const u8 = null,
+    strip_right: ?[]const u8 = null,
+    command_palette: ?[]const u8 = null,
+    slash_command: ?[]const u8 = null,
+};
+
+const RawInsertKeybindings = struct {
+    escape: ?[]const u8 = null,
+    backspace: ?[]const u8 = null,
+    submit: ?[]const u8 = null,
+    accept_picker: ?[]const u8 = null,
+    picker_prev_or_palette: ?[]const u8 = null,
+    picker_next: ?[]const u8 = null,
+    paste_image: ?[]const u8 = null,
 };
 
 pub fn loadOptionalFromPath(allocator: std.mem.Allocator, path: []const u8) !?Config {
@@ -92,7 +126,42 @@ fn configFromRaw(allocator: std.mem.Allocator, raw: RawConfig) !Config {
         config.ui_mode = if (compact_mode) .compact else .comfy;
     }
 
+    if (raw.keybindings orelse raw.hotkeys) |raw_keybindings| {
+        config.keybindings = try parseKeybindings(raw_keybindings);
+    }
+
     return config;
+}
+
+fn parseKeybindings(raw: RawKeybindings) !keybindings.Keybindings {
+    var parsed: keybindings.Keybindings = .{};
+
+    if (raw.normal) |normal| {
+        if (normal.quit) |value| parsed.normal.quit = try keybindings.parseKeyByte(value);
+        if (normal.insert_mode) |value| parsed.normal.insert_mode = try keybindings.parseKeyByte(value);
+        if (normal.append_mode) |value| parsed.normal.append_mode = try keybindings.parseKeyByte(value);
+        if (normal.cursor_left) |value| parsed.normal.cursor_left = try keybindings.parseKeyByte(value);
+        if (normal.cursor_right) |value| parsed.normal.cursor_right = try keybindings.parseKeyByte(value);
+        if (normal.delete_char) |value| parsed.normal.delete_char = try keybindings.parseKeyByte(value);
+        if (normal.scroll_up) |value| parsed.normal.scroll_up = try keybindings.parseKeyByte(value);
+        if (normal.scroll_down) |value| parsed.normal.scroll_down = try keybindings.parseKeyByte(value);
+        if (normal.strip_left) |value| parsed.normal.strip_left = try keybindings.parseKeyByte(value);
+        if (normal.strip_right) |value| parsed.normal.strip_right = try keybindings.parseKeyByte(value);
+        if (normal.command_palette) |value| parsed.normal.command_palette = try keybindings.parseKeyByte(value);
+        if (normal.slash_command) |value| parsed.normal.slash_command = try keybindings.parseKeyByte(value);
+    }
+
+    if (raw.insert) |insert| {
+        if (insert.escape) |value| parsed.insert.escape = try keybindings.parseKeyByte(value);
+        if (insert.backspace) |value| parsed.insert.backspace = try keybindings.parseKeyByte(value);
+        if (insert.submit) |value| parsed.insert.submit = try keybindings.parseKeyByte(value);
+        if (insert.accept_picker) |value| parsed.insert.accept_picker = try keybindings.parseKeyByte(value);
+        if (insert.picker_prev_or_palette) |value| parsed.insert.picker_prev_or_palette = try keybindings.parseKeyByte(value);
+        if (insert.picker_next) |value| parsed.insert.picker_next = try keybindings.parseKeyByte(value);
+        if (insert.paste_image) |value| parsed.insert.paste_image = try keybindings.parseKeyByte(value);
+    }
+
+    return parsed;
 }
 
 fn dupeTrimmedIfNotEmpty(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
@@ -234,4 +303,31 @@ test "stripJsonCommentsAlloc preserves comment-like text inside strings" {
     try std.testing.expect(std.mem.indexOf(u8, stripped, "literal // not a comment") != null);
     try std.testing.expect(std.mem.indexOf(u8, stripped, "\"ui\": \"compact\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stripped, "real comment") == null);
+}
+
+test "parse jsonc keybindings overrides" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  "keybindings": {
+        \\    "normal": {
+        \\      "quit": "x",
+        \\      "command_palette": "ctrl-o"
+        \\    },
+        \\    "insert": {
+        \\      "picker_next": "ctrl-j",
+        \\      "paste_image": "ctrl-y"
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var config = try parseConfigJsonc(allocator, input);
+    defer config.deinit(allocator);
+
+    const bindings = config.keybindings.?;
+    try std.testing.expectEqual(@as(u8, 'x'), bindings.normal.quit);
+    try std.testing.expectEqual(@as(u8, 15), bindings.normal.command_palette);
+    try std.testing.expectEqual(@as(u8, 10), bindings.insert.picker_next);
+    try std.testing.expectEqual(@as(u8, 25), bindings.insert.paste_image);
 }

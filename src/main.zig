@@ -110,6 +110,9 @@ pub fn main() !void {
                 .comfy => false,
             };
         }
+        if (cfg.keybindings) |bindings| {
+            startup_options.keybindings = bindings;
+        }
     }
 
     var catalog = blk: {
@@ -371,5 +374,6 @@ test {
     _ = @import("models.zig");
     _ = @import("provider_client.zig");
     _ = @import("config.zig");
+    _ = @import("keybindings.zig");
     _ = @import("tui.zig");
 }

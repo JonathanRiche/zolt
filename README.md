@@ -122,6 +122,7 @@ Supported keys:
 - `theme`: `codex` | `plain` | `forest`
 - `ui` (alias: `ui_mode`): `compact` | `comfy`
 - `compact_mode`: `true`/`false` (legacy alias for `ui`)
+- `keybindings` (alias: `hotkeys`): optional key overrides for normal/insert mode
 
 Example:
 
@@ -131,9 +132,24 @@ Example:
   "provider": "openai",
   "model": "gpt-4.1",
   "theme": "codex",
-  "ui": "compact"
+  "ui": "compact",
+  "keybindings": {
+    "normal": {
+      "quit": "x",
+      "command_palette": "ctrl-o"
+    },
+    "insert": {
+      "picker_next": "ctrl-j",
+      "paste_image": "ctrl-y"
+    }
+  }
 }
 ```
+
+Accepted key values for `keybindings`:
+- single character, like `"q"` or `"H"`
+- control combos `"ctrl-a"` through `"ctrl-z"`
+- named keys: `"esc"`, `"enter"`, `"tab"`, `"backspace"`, `"space"`, `"up"`, `"down"`, `"pgup"`, `"pgdn"`
 
 ## Models and Cache (`models.dev`)
 

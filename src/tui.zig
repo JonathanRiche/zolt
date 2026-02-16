@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const keybindings = @import("keybindings.zig");
 const models = @import("models.zig");
 const patch_tool = @import("patch_tool.zig");
 const provider_client = @import("provider_client.zig");
@@ -11,6 +12,7 @@ const AppState = @import("state.zig").AppState;
 const Conversation = @import("state.zig").Conversation;
 const Role = @import("state.zig").Role;
 const TokenUsage = @import("state.zig").TokenUsage;
+const Keybindings = keybindings.Keybindings;
 
 const Mode = enum {
     normal,
@@ -26,6 +28,7 @@ pub const Theme = enum {
 pub const StartupOptions = struct {
     theme: ?Theme = null,
     compact_mode: ?bool = null,
+    keybindings: ?Keybindings = null,
 };
 
 const StreamTask = enum {
@@ -210,10 +213,10 @@ const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
 const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
-const KEY_UP_ARROW: u8 = 243;
-const KEY_DOWN_ARROW: u8 = 244;
-const KEY_PAGE_UP: u8 = 245;
-const KEY_PAGE_DOWN: u8 = 246;
+const KEY_UP_ARROW: u8 = keybindings.KEY_UP_ARROW;
+const KEY_DOWN_ARROW: u8 = keybindings.KEY_DOWN_ARROW;
+const KEY_PAGE_UP: u8 = keybindings.KEY_PAGE_UP;
+const KEY_PAGE_DOWN: u8 = keybindings.KEY_PAGE_DOWN;
 const TOOL_SYSTEM_PROMPT =
     "You can use ten local tools.\n" ++
     "When you need to inspect files, reply with ONLY:\n" ++
@@ -312,6 +315,9 @@ pub fn run(
     }
     if (startup_options.compact_mode) |compact_mode| {
         app.compact_mode = compact_mode;
+    }
+    if (startup_options.keybindings) |bindings| {
+        app.keybindings = bindings;
     }
     app.refreshFileIndex() catch {};
     app.ensureCurrentConversationVisibleInStrip();
@@ -437,6 +443,7 @@ const App = struct {
     next_command_session_id: u32 = 1,
     compact_mode: bool = true,
     theme: Theme = .codex,
+    keybindings: Keybindings = .{},
     stream_interrupt_esc_count: u8 = 0,
     stream_interrupt_last_esc_ms: i64 = 0,
     stream_interrupt_hint_shown: bool = false,
@@ -473,136 +480,151 @@ const App = struct {
     }
 
     fn handleNormalByte(self: *App, key_byte: u8) !void {
+        if (key_byte == self.keybindings.normal.quit) {
+            self.should_exit = true;
+            return;
+        }
+        if (key_byte == self.keybindings.normal.insert_mode) {
+            self.mode = .insert;
+            self.syncPickersFromInput();
+            return;
+        }
+        if (key_byte == self.keybindings.normal.append_mode) {
+            if (self.input_cursor < self.input_buffer.items.len) self.input_cursor += 1;
+            self.mode = .insert;
+            self.syncPickersFromInput();
+            return;
+        }
+        if (key_byte == self.keybindings.normal.cursor_left) {
+            if (self.input_cursor > 0) self.input_cursor -= 1;
+            return;
+        }
+        if (key_byte == self.keybindings.normal.cursor_right) {
+            if (self.input_cursor < self.input_buffer.items.len) self.input_cursor += 1;
+            return;
+        }
+        if (key_byte == self.keybindings.normal.delete_char) {
+            if (self.input_cursor < self.input_buffer.items.len) _ = self.input_buffer.orderedRemove(self.input_cursor);
+            return;
+        }
+        if (key_byte == self.keybindings.normal.scroll_up) {
+            self.scroll_lines +|= 1;
+            return;
+        }
+        if (key_byte == self.keybindings.normal.scroll_down) {
+            if (self.scroll_lines > 0) self.scroll_lines -= 1;
+            return;
+        }
+        if (key_byte == self.keybindings.normal.strip_left) {
+            self.shiftConversationStrip(-1);
+            return;
+        }
+        if (key_byte == self.keybindings.normal.strip_right) {
+            self.shiftConversationStrip(1);
+            return;
+        }
+        if (key_byte == self.keybindings.normal.command_palette) {
+            try self.openCommandPalette();
+            return;
+        }
+        if (key_byte == self.keybindings.normal.slash_command) {
+            self.mode = .insert;
+            if (self.input_buffer.items.len == 0) {
+                try self.input_buffer.append(self.allocator, '/');
+                self.input_cursor = 1;
+            }
+            self.syncPickersFromInput();
+            return;
+        }
+
         switch (key_byte) {
-            'q' => self.should_exit = true,
-            'i' => {
-                self.mode = .insert;
-                self.syncPickersFromInput();
-            },
-            'a' => {
-                if (self.input_cursor < self.input_buffer.items.len) self.input_cursor += 1;
-                self.mode = .insert;
-                self.syncPickersFromInput();
-            },
-            'h' => {
-                if (self.input_cursor > 0) self.input_cursor -= 1;
-            },
-            'l' => {
-                if (self.input_cursor < self.input_buffer.items.len) self.input_cursor += 1;
-            },
-            'x' => {
-                if (self.input_cursor < self.input_buffer.items.len) _ = self.input_buffer.orderedRemove(self.input_cursor);
-            },
-            'k' => {
-                self.scroll_lines +|= 1;
-            },
-            'j' => {
-                if (self.scroll_lines > 0) self.scroll_lines -= 1;
-            },
-            KEY_PAGE_UP => {
-                self.scrollPageUp();
-            },
-            KEY_PAGE_DOWN => {
-                self.scrollPageDown();
-            },
-            'H' => {
-                self.shiftConversationStrip(-1);
-            },
-            'L' => {
-                self.shiftConversationStrip(1);
-            },
-            16 => {
-                try self.openCommandPalette();
-            },
-            '/' => {
-                self.mode = .insert;
-                if (self.input_buffer.items.len == 0) {
-                    try self.input_buffer.append(self.allocator, '/');
-                    self.input_cursor = 1;
-                }
-                self.syncPickersFromInput();
-            },
+            KEY_PAGE_UP => self.scrollPageUp(),
+            KEY_PAGE_DOWN => self.scrollPageDown(),
             27 => self.mode = .normal,
             else => {},
         }
     }
 
     fn handleInsertByte(self: *App, key_byte: u8) !void {
+        if (key_byte == self.keybindings.insert.escape) {
+            if (self.model_picker_open) {
+                self.model_picker_open = false;
+                return;
+            }
+            if (self.command_picker_open) {
+                self.command_picker_open = false;
+                return;
+            }
+            if (self.file_picker_open) {
+                self.file_picker_open = false;
+                return;
+            }
+            self.mode = .normal;
+            return;
+        }
+
+        if (key_byte == self.keybindings.insert.backspace) {
+            if (self.input_cursor > 0) {
+                self.input_cursor -= 1;
+                _ = self.input_buffer.orderedRemove(self.input_cursor);
+            }
+            self.syncPickersFromInput();
+            return;
+        }
+
+        if (keyMatchesSubmit(self.keybindings.insert.submit, key_byte)) {
+            if (self.model_picker_open) {
+                try self.acceptModelPickerSelection();
+                return;
+            }
+            if (self.command_picker_open) {
+                try self.acceptCommandPickerSelection();
+                return;
+            }
+            if (self.file_picker_open) {
+                try self.acceptFilePickerSelection();
+                return;
+            }
+            try self.submitInput();
+            return;
+        }
+
+        if (key_byte == self.keybindings.insert.accept_picker) {
+            if (self.model_picker_open) {
+                try self.acceptModelPickerSelection();
+                return;
+            }
+            if (self.command_picker_open) {
+                try self.acceptCommandPickerSelection();
+                return;
+            }
+            if (self.file_picker_open) {
+                try self.acceptFilePickerSelection();
+                return;
+            }
+            return;
+        }
+
+        if (key_byte == self.keybindings.insert.picker_next) {
+            _ = self.moveActivePickerSelection(1);
+            return;
+        }
+        if (key_byte == self.keybindings.insert.picker_prev_or_palette) {
+            if (!self.moveActivePickerSelection(-1)) {
+                try self.openCommandPalette();
+            }
+            return;
+        }
+        if (key_byte == self.keybindings.insert.paste_image) {
+            try self.pasteClipboardImageIntoInput();
+            return;
+        }
+
         switch (key_byte) {
-            KEY_PAGE_UP => {
-                self.scrollPageUp();
-            },
-            KEY_PAGE_DOWN => {
-                self.scrollPageDown();
-            },
-            27 => {
-                if (self.model_picker_open) {
-                    self.model_picker_open = false;
-                    return;
-                }
-                if (self.command_picker_open) {
-                    self.command_picker_open = false;
-                    return;
-                }
-                if (self.file_picker_open) {
-                    self.file_picker_open = false;
-                    return;
-                }
-                self.mode = .normal;
-            },
-            127 => {
-                if (self.input_cursor > 0) {
-                    self.input_cursor -= 1;
-                    _ = self.input_buffer.orderedRemove(self.input_cursor);
-                }
-                self.syncPickersFromInput();
-            },
-            '\r', '\n' => {
-                if (self.model_picker_open) {
-                    try self.acceptModelPickerSelection();
-                    return;
-                }
-                if (self.command_picker_open) {
-                    try self.acceptCommandPickerSelection();
-                    return;
-                }
-                if (self.file_picker_open) {
-                    try self.acceptFilePickerSelection();
-                    return;
-                }
-                try self.submitInput();
-            },
-            '\t' => {
-                if (self.model_picker_open) {
-                    try self.acceptModelPickerSelection();
-                    return;
-                }
-                if (self.command_picker_open) {
-                    try self.acceptCommandPickerSelection();
-                    return;
-                }
-                if (self.file_picker_open) {
-                    try self.acceptFilePickerSelection();
-                    return;
-                }
-            },
-            14 => {
-                _ = self.moveActivePickerSelection(1);
-            },
-            16 => {
-                if (!self.moveActivePickerSelection(-1)) {
-                    try self.openCommandPalette();
-                }
-            },
-            KEY_DOWN_ARROW => {
-                _ = self.moveActivePickerSelection(1);
-            },
-            KEY_UP_ARROW => {
-                _ = self.moveActivePickerSelection(-1);
-            },
-            22 => {
-                try self.pasteClipboardImageIntoInput();
-            },
+            KEY_PAGE_UP => self.scrollPageUp(),
+            KEY_PAGE_DOWN => self.scrollPageDown(),
+            KEY_DOWN_ARROW => _ = self.moveActivePickerSelection(1),
+            KEY_UP_ARROW => _ = self.moveActivePickerSelection(-1),
             else => {
                 if (key_byte >= 32 and key_byte <= 126) {
                     try self.input_buffer.insert(self.allocator, self.input_cursor, key_byte);
@@ -611,6 +633,13 @@ const App = struct {
                 }
             },
         }
+    }
+
+    fn keyMatchesSubmit(submit_key: u8, key_byte: u8) bool {
+        if (submit_key == '\n' or submit_key == '\r') {
+            return key_byte == '\n' or key_byte == '\r';
+        }
+        return key_byte == submit_key;
     }
 
     fn scrollPageUp(self: *App) void {

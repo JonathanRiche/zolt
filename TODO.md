@@ -24,6 +24,11 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [ ] `list_mcp_resource_templates`
 - [ ] `read_mcp_resource`
 - [ ] define MCP auth/permissions/scoping (per-workspace?)
+- [ ] add tool permission model (read/exec/apply_patch/web_search/MCP scopes)
+- [ ] gate tool execution with allow-once/always/deny prompt
+- [ ] `/permissions` command to view/toggle tool permissions
+- [ ] persist permission decisions per workspace/session
+- [ ] add `zolt run "<prompt>"` CLI mode (non-interactive single prompt)
 - [x] `web_search` (optional mode)
 - [x] `view_image` (local screenshots/assets)
 
@@ -35,7 +40,7 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 
 ## UX / Rendering (Later)
 - [x] syntax highlighting for patch diff preview/code blocks (beyond +/- colors)
-- [ ] customizable keybindings/hotkeys (configurable shortcuts)
+- [x] customizable keybindings/hotkeys (configurable shortcuts)
 - [x] command palette / quick actions (e.g., “New chat”, “Toggle plan”, “Open logs”)
 - [ ] status bar indicators (model/provider, token usage, tool mode)
 - [ ] copy buttons for code blocks / tool outputs
@@ -49,4 +54,4 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [ ] add optional verbose logging or crash report log file path
 - [ ] document state file schema/location for users who want to inspect/backup
 - [ ] add deterministic test harness for tool invocations / golden outputs
-- [ ] document keybindings and customization in README
+- [x] document keybindings and customization in README
