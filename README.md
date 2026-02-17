@@ -214,7 +214,6 @@ Picker triggers:
 - `/models [refresh]`
 - `/files [refresh]`
 - `/new [title]`
-- `/list`
 - `/sessions [id]` (no id opens conversation picker)
 - `/title <text>`
 - `/theme [codex|plain|forest]`

@@ -657,7 +657,7 @@ const App = struct {
 
     fn chatViewportHeight(self: *App) usize {
         const metrics = self.terminalMetrics();
-        const top_lines: usize = if (self.compact_mode) 3 else 4;
+        const top_lines: usize = if (self.compact_mode) 2 else 4;
         const picker_lines = self.pickerLineCount(metrics.lines);
         const bottom_lines: usize = 3 + picker_lines;
         return @max(@as(usize, 4), metrics.lines - top_lines - bottom_lines);
@@ -2480,7 +2480,7 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /commands /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /list /sessions [id] /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /paste-image /quit  input: use @path, Ctrl-V paste image, Ctrl-P command palette, pickers: Ctrl-N/P or Up/Down + Enter, assistant tools: <READ>, <LIST_DIR>, <READ_FILE>, <GREP_FILES>, <PROJECT_SEARCH>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>, <WEB_SEARCH>, <VIEW_IMAGE>");
+            try self.setNotice("Commands: /help /commands /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /sessions [id] /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /paste-image /quit  input: use @path, Ctrl-V paste image, Ctrl-P command palette, pickers: Ctrl-N/P or Up/Down + Enter, assistant tools: <READ>, <LIST_DIR>, <READ_FILE>, <GREP_FILES>, <PROJECT_SEARCH>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>, <WEB_SEARCH>, <VIEW_IMAGE>");
             return;
         }
 
@@ -2602,45 +2602,6 @@ const App = struct {
             self.ensureCurrentConversationVisibleInStrip();
             try self.app_state.saveToPath(self.allocator, self.paths.state_path);
             try self.setNoticeFmt("Created conversation: {s}", .{self.app_state.currentConversationConst().id});
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "list")) {
-            var line_writer: std.Io.Writer.Allocating = .init(self.allocator);
-            defer line_writer.deinit();
-            const now_ms = std.time.milliTimestamp();
-
-            try line_writer.writer.writeAll("Conversations: ");
-            var ordered = try collectConversationSwitchMatchOrder(
-                self.allocator,
-                self.app_state.conversations.items,
-                self.app_state.current_index,
-                "",
-                false,
-            );
-            defer ordered.deinit(self.allocator);
-
-            const limit = @min(ordered.items.len, 6);
-            for (ordered.items[0..limit], 0..) |conversation_index, index| {
-                const conversation = self.app_state.conversations.items[conversation_index];
-                const age = conversationRelativeAge(now_ms, conversationTimestampMs(&conversation));
-                if (index > 0) try line_writer.writer.writeAll(" | ");
-                const current_mark = if (conversation_index == self.app_state.current_index) "*" else "";
-                if (age.just_now) {
-                    try line_writer.writer.print("{s}{s}:{s} (now)", .{ current_mark, conversation.id, conversation.title });
-                } else {
-                    try line_writer.writer.print("{s}{s}:{s} ({d}{s} ago)", .{
-                        current_mark,
-                        conversation.id,
-                        conversation.title,
-                        age.value,
-                        age.unit,
-                    });
-                }
-            }
-
-            const notice = try line_writer.toOwnedSlice();
-            try self.setNoticeOwned(notice);
             return;
         }
 
@@ -2771,7 +2732,7 @@ const App = struct {
         const width = metrics.width;
         const lines = metrics.lines;
         const content_width = if (width > 4) width - 4 else 56;
-        const top_lines: usize = if (self.compact_mode) 3 else 4;
+        const top_lines: usize = if (self.compact_mode) 2 else 4;
         const picker_lines = self.pickerLineCount(lines);
         const bottom_lines: usize = 3 + picker_lines;
         const viewport_height = @max(@as(usize, 4), lines - top_lines - bottom_lines);
@@ -2842,10 +2803,6 @@ const App = struct {
             const compact_line = try truncateLineAlloc(self.allocator, compact, width);
             defer self.allocator.free(compact_line);
             try screen_writer.writer.print("{s}{s}{s}\n", .{ palette.header, compact_line, palette.reset });
-
-            const conversation_strip = try self.buildConversationStrip(width);
-            defer self.allocator.free(conversation_strip);
-            try screen_writer.writer.print("{s}{s}{s}\n", .{ palette.dim, conversation_strip, palette.reset });
         } else {
             const title = try std.fmt.allocPrint(
                 self.allocator,
@@ -2905,7 +2862,7 @@ const App = struct {
         else if (self.mode == .insert)
             "enter esc / ctrl-p ctrl-v pgup/pgdn"
         else
-            "i j/k pgup/pgdn H/L / ctrl-p q";
+            "i j/k pgup/pgdn / ctrl-p q";
         const context_summary = try self.contextUsageSummary(conversation);
         defer if (context_summary) |summary| self.allocator.free(summary);
         const status_text = if (context_summary) |summary|
@@ -3646,9 +3603,6 @@ const App = struct {
                     .forest => .codex,
                 };
                 try self.setNoticeFmt("Theme set to {s}", .{@tagName(self.theme)});
-            },
-            .list_conversations => {
-                try self.handleCommand("/list");
             },
             .show_help => {
                 try self.handleCommand("/help");
@@ -4632,7 +4586,6 @@ const QuickActionId = enum {
     refresh_file_index,
     toggle_ui_density,
     toggle_theme,
-    list_conversations,
     show_help,
 };
 
@@ -4651,7 +4604,6 @@ const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "models", .description = "list models cache / refresh" },
     .{ .name = "files", .description = "show file index / refresh" },
     .{ .name = "new", .description = "create conversation" },
-    .{ .name = "list", .description = "list conversations", .insert_trailing_space = false },
     .{ .name = "sessions", .description = "switch conversation session (picker or id)" },
     .{ .name = "title", .description = "rename conversation" },
     .{ .name = "theme", .description = "set theme (codex/plain/forest)" },
@@ -4670,7 +4622,6 @@ const QUICK_ACTIONS = [_]QuickActionEntry{
     .{ .id = .refresh_file_index, .label = "Refresh file index", .description = "run /files refresh", .keywords = "files index rg" },
     .{ .id = .toggle_ui_density, .label = "Toggle UI density", .description = "switch compact/comfy UI", .keywords = "compact comfy ui" },
     .{ .id = .toggle_theme, .label = "Toggle theme", .description = "cycle codex/plain/forest", .keywords = "theme colors" },
-    .{ .id = .list_conversations, .label = "List conversations", .description = "run /list", .keywords = "conversations list switch" },
     .{ .id = .show_help, .label = "Show help", .description = "show command usage help", .keywords = "help commands" },
 };
 

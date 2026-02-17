@@ -225,7 +225,7 @@ fn writeSessionNotFoundToStderr(session_id: []const u8) !void {
     var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
     defer stderr_writer.interface.flush() catch {};
 
-    try stderr_writer.interface.print("session not found: {s}\nUse /list in zolt to view available conversation ids.\n", .{session_id});
+    try stderr_writer.interface.print("session not found: {s}\nUse /sessions in zolt to view available conversation ids.\n", .{session_id});
 }
 
 fn selectStartupConversationWithoutSession(allocator: std.mem.Allocator, app_state: *AppState) !void {
