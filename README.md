@@ -79,6 +79,22 @@ zolt run "<prompt>"
 zolt run --session <conversation-id> "<prompt>"
 ```
 
+### Run Mode (Non-Interactive)
+
+Use `zolt run` when another tool/script needs a one-shot answer on stdout (no TUI).
+
+```bash
+zolt run "<prompt>"
+zolt run --session <conversation-id> "<prompt>"
+zolt run -s <conversation-id> "<prompt>"
+```
+
+Notes:
+- `zolt run` uses the same model/provider selection as normal mode.
+- `--session` resumes that conversation context first, then appends your prompt.
+- Tool loop is enabled in run mode (`READ`, `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`, `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`, `VIEW_IMAGE`).
+- Output is the final assistant response text on stdout (tool call placeholders are not returned as final output).
+
 3. Install to `~/.local` (puts binary at `~/.local/bin/zolt`):
 
 ```bash

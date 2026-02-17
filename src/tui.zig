@@ -223,7 +223,10 @@ const TOOL_SYSTEM_PROMPT =
     "<READ>\n" ++
     "<command>\n" ++
     "</READ>\n" ++
-    "Allowed commands: rg, grep, ls, cat, find, head, tail, sed, wc, stat, pwd.\n" ++
+    "Allowed commands: rg, grep, ls, cat, find, head, tail, sed, wc, stat, pwd, and limited git read-only commands.\n" ++
+    "For git via READ, only these subcommands are allowed: status, diff, show, log, rev-parse, ls-files.\n" ++
+    "Do not claim you lack repository/file access unless a tool call fails.\n" ++
+    "If the user asks what changed/what they did/updates/history, inspect with READ first (for example: git status, git diff, git log --oneline -n 20).\n" ++
     "Prefer these structured discovery tools when possible:\n" ++
     "<LIST_DIR>\n" ++
     "{\"path\":\"src\",\"recursive\":false,\"max_entries\":200}\n" ++
@@ -1146,7 +1149,7 @@ const App = struct {
             return std.fmt.allocPrint(self.allocator, "[read-result]\ncommand: {s}\nerror: empty command", .{command_text});
         }
 
-        if (!isAllowedReadCommand(argv.items[0])) {
+        if (!isAllowedReadCommand(argv.items)) {
             return std.fmt.allocPrint(
                 self.allocator,
                 "[read-result]\ncommand: {s}\nerror: command not allowed ({s})",
@@ -2752,7 +2755,31 @@ const App = struct {
 
     fn latestAssistantResponseAlloc(self: *App) ![]u8 {
         const conversation = self.app_state.currentConversationConst();
+
+        // Prefer the latest non-tool assistant text for headless `zolt run` output.
         var index = conversation.messages.items.len;
+        while (index > 0) {
+            index -= 1;
+            const message = conversation.messages.items[index];
+            if (message.role != .assistant) continue;
+            const trimmed = std.mem.trim(u8, message.content, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            if (parseAssistantToolCall(trimmed) != null) continue;
+            return self.allocator.dupe(u8, message.content);
+        }
+
+        // Fallback to latest non-empty assistant text.
+        index = conversation.messages.items.len;
+        while (index > 0) {
+            index -= 1;
+            const message = conversation.messages.items[index];
+            if (message.role != .assistant) continue;
+            if (std.mem.trim(u8, message.content, " \t\r\n").len == 0) continue;
+            return self.allocator.dupe(u8, message.content);
+        }
+
+        // Last-resort fallback (may be empty tool placeholder on interrupted flows).
+        index = conversation.messages.items.len;
         while (index > 0) {
             index -= 1;
             const message = conversation.messages.items[index];
@@ -4995,6 +5022,16 @@ fn parseReadToolCommand(text: []const u8) ?[]const u8 {
         return std.mem.trim(u8, body[0..close_index], " \t\r\n");
     }
 
+    // Accept codex-style inline marker output:
+    // [tool] READ git status --short
+    if (std.mem.startsWith(u8, trimmed, "[tool]")) {
+        const after_marker = std.mem.trimLeft(u8, trimmed["[tool]".len..], " \t");
+        if (after_marker.len >= 4 and std.mem.startsWith(u8, after_marker, "READ")) {
+            const command = std.mem.trimLeft(u8, after_marker["READ".len..], " \t:");
+            if (command.len > 0) return command;
+        }
+    }
+
     return null;
 }
 
@@ -6616,9 +6653,15 @@ fn looksBinary(content: []const u8) bool {
     return control_count * 10 > sample_len;
 }
 
-fn isAllowedReadCommand(command: []const u8) bool {
+fn isAllowedReadCommand(argv: []const []const u8) bool {
+    if (argv.len == 0) return false;
+    const command = argv[0];
     if (command.len == 0) return false;
     if (std.mem.indexOfScalar(u8, command, '/')) |_| return false;
+
+    if (std.mem.eql(u8, command, "git")) {
+        return isAllowedReadGitCommand(argv[1..]);
+    }
 
     const allowlist = [_][]const u8{
         "rg",
@@ -6636,6 +6679,27 @@ fn isAllowedReadCommand(command: []const u8) bool {
 
     for (allowlist) |allowed| {
         if (std.mem.eql(u8, command, allowed)) return true;
+    }
+    return false;
+}
+
+fn isAllowedReadGitCommand(args: []const []const u8) bool {
+    if (args.len == 0) return false;
+    const subcommand = args[0];
+    if (subcommand.len == 0) return false;
+    if (subcommand[0] == '-') return false;
+
+    const allowlist = [_][]const u8{
+        "status",
+        "diff",
+        "show",
+        "log",
+        "rev-parse",
+        "ls-files",
+    };
+
+    for (allowlist) |allowed| {
+        if (std.mem.eql(u8, subcommand, allowed)) return true;
     }
     return false;
 }
@@ -7021,6 +7085,28 @@ test "isDiffFenceLanguage recognizes diff-like fences" {
     try std.testing.expect(!isDiffFenceLanguage(""));
 }
 
+test "isAllowedReadCommand allows safe read commands and read-only git subcommands" {
+    try std.testing.expect(isAllowedReadCommand(&.{ "rg", "TODO", "src" }));
+    try std.testing.expect(isAllowedReadCommand(&.{ "cat", "README.md" }));
+
+    try std.testing.expect(isAllowedReadCommand(&.{ "git", "status", "--short" }));
+    try std.testing.expect(isAllowedReadCommand(&.{ "git", "diff", "--", "TODO.md" }));
+    try std.testing.expect(isAllowedReadCommand(&.{ "git", "log", "--oneline", "-n", "20" }));
+    try std.testing.expect(isAllowedReadCommand(&.{ "git", "show", "HEAD~1" }));
+    try std.testing.expect(isAllowedReadCommand(&.{ "git", "rev-parse", "--show-toplevel" }));
+    try std.testing.expect(isAllowedReadCommand(&.{ "git", "ls-files" }));
+}
+
+test "isAllowedReadCommand rejects non-allowlisted and unsafe forms" {
+    try std.testing.expect(!isAllowedReadCommand(&.{}));
+    try std.testing.expect(!isAllowedReadCommand(&.{"/bin/ls"}));
+    try std.testing.expect(!isAllowedReadCommand(&.{ "echo", "hi" }));
+    try std.testing.expect(!isAllowedReadCommand(&.{"git"}));
+    try std.testing.expect(!isAllowedReadCommand(&.{ "git", "-c", "core.editor=vim", "status" }));
+    try std.testing.expect(!isAllowedReadCommand(&.{ "git", "commit", "-m", "x" }));
+    try std.testing.expect(!isAllowedReadCommand(&.{ "git", "push" }));
+}
+
 test "codeFenceLanguageToken extracts language from fence line" {
     try std.testing.expectEqualStrings("diff", codeFenceLanguageToken("```diff"));
     try std.testing.expectEqualStrings("zig", codeFenceLanguageToken("```  zig"));
@@ -7107,6 +7193,12 @@ test "parseAssistantToolCall detects discovery/edit/exec/web/image tools" {
     const view_image_call = parseAssistantToolCall("<VIEW_IMAGE>{\"path\":\"image.png\"}</VIEW_IMAGE>").?;
     switch (view_image_call) {
         .view_image => |payload| try std.testing.expectEqualStrings("{\"path\":\"image.png\"}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const bracket_read_call = parseAssistantToolCall("[tool] READ git log --oneline -n 5").?;
+    switch (bracket_read_call) {
+        .read => |command| try std.testing.expectEqualStrings("git log --oneline -n 5", command),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -7368,10 +7460,10 @@ test "registerStreamInterruptByte resets on non-esc and timeout" {
 }
 
 test "isAllowedReadCommand allowlist and slash rejection" {
-    try std.testing.expect(isAllowedReadCommand("rg"));
-    try std.testing.expect(isAllowedReadCommand("ls"));
-    try std.testing.expect(!isAllowedReadCommand("bash"));
-    try std.testing.expect(!isAllowedReadCommand("/usr/bin/rg"));
+    try std.testing.expect(isAllowedReadCommand(&.{"rg"}));
+    try std.testing.expect(isAllowedReadCommand(&.{"ls"}));
+    try std.testing.expect(!isAllowedReadCommand(&.{"bash"}));
+    try std.testing.expect(!isAllowedReadCommand(&.{"/usr/bin/rg"}));
 }
 
 test "collectAtFileReferences parses unique @path tokens" {
