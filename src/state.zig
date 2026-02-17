@@ -227,18 +227,40 @@ pub const AppState = struct {
         self.selected_model_id = replacement;
     }
 
+    fn shouldPersistConversation(conversation: *const Conversation) bool {
+        return conversation.messages.items.len > 0;
+    }
+
+    fn persistedCurrentConversationId(self: *const AppState) []const u8 {
+        if (self.current_index < self.conversations.items.len) {
+            const current = &self.conversations.items[self.current_index];
+            if (shouldPersistConversation(current)) return current.id;
+        }
+
+        for (self.conversations.items) |*conversation| {
+            if (shouldPersistConversation(conversation)) return conversation.id;
+        }
+
+        return "";
+    }
+
     pub fn jsonStringify(self: *const AppState, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("version");
         try jw.write(@as(u32, 1));
         try jw.objectField("current_conversation_id");
-        try jw.write(self.currentConversationConst().id);
+        try jw.write(self.persistedCurrentConversationId());
         try jw.objectField("selected_provider_id");
         try jw.write(self.selected_provider_id);
         try jw.objectField("selected_model_id");
         try jw.write(self.selected_model_id);
         try jw.objectField("conversations");
-        try jw.write(self.conversations.items);
+        try jw.beginArray();
+        for (self.conversations.items) |*conversation| {
+            if (!shouldPersistConversation(conversation)) continue;
+            try jw.write(conversation.*);
+        }
+        try jw.endArray();
         try jw.endObject();
     }
 
@@ -437,6 +459,84 @@ test "state save and load keeps conversations and messages" {
     try std.testing.expect(std.mem.eql(u8, loaded.currentConversationConst().id, second_id));
     try std.testing.expectEqual(@as(usize, 1), loaded.currentConversationConst().messages.items.len);
     try std.testing.expect(std.mem.eql(u8, loaded.currentConversationConst().messages.items[0].content, "second"));
+}
+
+test "save omits blank conversations and keeps current persisted conversation id" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator);
+    defer state.deinit(allocator);
+
+    try state.appendMessage(allocator, .user, "persisted");
+    const persisted_id = try allocator.dupe(u8, state.currentConversationConst().id);
+    defer allocator.free(persisted_id);
+
+    _ = try state.createConversation(allocator, "New conversation");
+    try std.testing.expectEqual(@as(usize, 0), state.currentConversationConst().messages.items.len);
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const abs_dir = try temp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs_dir);
+
+    const state_path = try std.fs.path.join(allocator, &.{ abs_dir, "state.json" });
+    defer allocator.free(state_path);
+
+    try state.saveToPath(allocator, state_path);
+
+    var file = try std.fs.openFileAbsolute(state_path, .{});
+    defer file.close();
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(&read_buffer);
+    var payload_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer payload_writer.deinit();
+    _ = try reader.interface.streamRemaining(&payload_writer.writer);
+    const payload = try payload_writer.toOwnedSlice();
+    defer allocator.free(payload);
+
+    const parsed = try std.json.parseFromSlice(PersistedState, allocator, payload, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.conversations.len);
+    try std.testing.expectEqualStrings(persisted_id, parsed.value.current_conversation_id);
+    try std.testing.expectEqualStrings(persisted_id, parsed.value.conversations[0].id);
+}
+
+test "save of only blank conversations persists empty list and empty current id" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator);
+    defer state.deinit(allocator);
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const abs_dir = try temp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs_dir);
+
+    const state_path = try std.fs.path.join(allocator, &.{ abs_dir, "state.json" });
+    defer allocator.free(state_path);
+
+    try state.saveToPath(allocator, state_path);
+
+    var file = try std.fs.openFileAbsolute(state_path, .{});
+    defer file.close();
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(&read_buffer);
+    var payload_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer payload_writer.deinit();
+    _ = try reader.interface.streamRemaining(&payload_writer.writer);
+    const payload = try payload_writer.toOwnedSlice();
+    defer allocator.free(payload);
+
+    const parsed = try std.json.parseFromSlice(PersistedState, allocator, payload, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.conversations.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.current_conversation_id.len);
 }
 
 test "switchConversation returns false for unknown id" {

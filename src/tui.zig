@@ -2613,7 +2613,9 @@ const App = struct {
             var ordered = try collectConversationSwitchMatchOrder(
                 self.allocator,
                 self.app_state.conversations.items,
+                self.app_state.current_index,
                 "",
+                false,
             );
             defer ordered.deinit(self.allocator);
 
@@ -2950,7 +2952,13 @@ const App = struct {
         defer strip_writer.deinit();
 
         const conversations = self.app_state.conversations.items;
-        var ordered_indices = try collectConversationSwitchMatchOrder(self.allocator, conversations, "");
+        var ordered_indices = try collectConversationSwitchMatchOrder(
+            self.allocator,
+            conversations,
+            self.app_state.current_index,
+            "",
+            false,
+        );
         defer ordered_indices.deinit(self.allocator);
 
         const total = ordered_indices.items.len;
@@ -2998,7 +3006,11 @@ const App = struct {
     }
 
     fn shiftConversationStrip(self: *App, delta: i32) void {
-        const total = self.app_state.conversations.items.len;
+        const total = countVisibleSessionConversations(
+            self.app_state.conversations.items,
+            self.app_state.current_index,
+            false,
+        );
         const window_size: usize = 6;
         const max_start = if (total > window_size) total - window_size else 0;
 
@@ -3012,7 +3024,11 @@ const App = struct {
     }
 
     fn ensureCurrentConversationVisibleInStrip(self: *App) void {
-        const total = self.app_state.conversations.items.len;
+        const total = countVisibleSessionConversations(
+            self.app_state.conversations.items,
+            self.app_state.current_index,
+            false,
+        );
         if (total == 0) {
             self.conv_strip_start = 0;
             return;
@@ -3021,11 +3037,16 @@ const App = struct {
         const window_size: usize = 6;
         const max_start = if (total > window_size) total - window_size else 0;
         const conversations = self.app_state.conversations.items;
-        const current_index = self.app_state.current_index;
         var current_rank: usize = 0;
         for (conversations, 0..) |_, index| {
-            if (index == current_index) continue;
-            if (conversationSortComesBefore(conversations, index, current_index)) {
+            if (!shouldIncludeConversationInSessionOrder(
+                conversations,
+                index,
+                self.app_state.current_index,
+                false,
+            )) continue;
+            if (index == self.app_state.current_index) continue;
+            if (conversationSortComesBefore(conversations, index, self.app_state.current_index)) {
                 current_rank += 1;
             }
         }
@@ -3410,7 +3431,13 @@ const App = struct {
                 }
             },
             .conversation_switch => {
-                for (self.app_state.conversations.items) |*conversation| {
+                for (self.app_state.conversations.items, 0..) |*conversation, index| {
+                    if (!shouldIncludeConversationInSessionOrder(
+                        self.app_state.conversations.items,
+                        index,
+                        self.app_state.current_index,
+                        false,
+                    )) continue;
                     if (conversationMatchesQuery(conversation, query)) count += 1;
                 }
             },
@@ -3527,7 +3554,9 @@ const App = struct {
             var ordered_matches = try collectConversationSwitchMatchOrder(
                 self.allocator,
                 self.app_state.conversations.items,
+                self.app_state.current_index,
                 query,
+                false,
             );
             defer ordered_matches.deinit(self.allocator);
             if (ordered_matches.items.len == 0) return;
@@ -3686,7 +3715,9 @@ const App = struct {
                 ordered_conversation_matches = try collectConversationSwitchMatchOrder(
                     self.allocator,
                     self.app_state.conversations.items,
+                    self.app_state.current_index,
                     query,
+                    false,
                 );
                 break :blk ordered_conversation_matches.items.len;
             },
@@ -4680,6 +4711,32 @@ fn conversationMatchesQuery(conversation: *const Conversation, query: []const u8
     return containsAsciiIgnoreCase(conversation.id, query) or containsAsciiIgnoreCase(conversation.title, query);
 }
 
+fn shouldIncludeConversationInSessionOrder(
+    conversations: []const Conversation,
+    index: usize,
+    current_index: usize,
+    include_blank_drafts: bool,
+) bool {
+    if (include_blank_drafts) return true;
+    const conversation = &conversations[index];
+    _ = current_index;
+    return conversation.messages.items.len > 0;
+}
+
+fn countVisibleSessionConversations(
+    conversations: []const Conversation,
+    current_index: usize,
+    include_blank_drafts: bool,
+) usize {
+    var count: usize = 0;
+    for (conversations, 0..) |_, index| {
+        if (shouldIncludeConversationInSessionOrder(conversations, index, current_index, include_blank_drafts)) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
 fn conversationSortComesBefore(conversations: []const Conversation, lhs_index: usize, rhs_index: usize) bool {
     const lhs = &conversations[lhs_index];
     const rhs = &conversations[rhs_index];
@@ -4692,12 +4749,15 @@ fn conversationSortComesBefore(conversations: []const Conversation, lhs_index: u
 fn collectConversationSwitchMatchOrder(
     allocator: std.mem.Allocator,
     conversations: []const Conversation,
+    current_index: usize,
     query: []const u8,
+    include_blank_drafts: bool,
 ) !std.ArrayList(usize) {
     var ordered: std.ArrayList(usize) = .empty;
     errdefer ordered.deinit(allocator);
 
     for (conversations, 0..) |*conversation, index| {
+        if (!shouldIncludeConversationInSessionOrder(conversations, index, current_index, include_blank_drafts)) continue;
         if (!conversationMatchesQuery(conversation, query)) continue;
 
         var insert_at = ordered.items.len;
@@ -7053,7 +7113,7 @@ test "collectConversationSwitchMatchOrder sorts newest conversations first" {
         },
     };
 
-    var ordered = try collectConversationSwitchMatchOrder(allocator, conversations[0..], "");
+    var ordered = try collectConversationSwitchMatchOrder(allocator, conversations[0..], 0, "", true);
     defer ordered.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 3), ordered.items.len);
@@ -7085,13 +7145,57 @@ test "collectConversationSwitchMatchOrder uses created time then index as tie-br
         },
     };
 
-    var ordered = try collectConversationSwitchMatchOrder(allocator, conversations[0..], "new");
+    var ordered = try collectConversationSwitchMatchOrder(allocator, conversations[0..], 0, "new", true);
     defer ordered.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 3), ordered.items.len);
     try std.testing.expectEqual(@as(usize, 2), ordered.items[0]);
     try std.testing.expectEqual(@as(usize, 1), ordered.items[1]);
     try std.testing.expectEqual(@as(usize, 0), ordered.items[2]);
+}
+
+test "collectConversationSwitchMatchOrder hides all blank drafts when disabled" {
+    const allocator = std.testing.allocator;
+    var conversations = [_]Conversation{
+        .{
+            .id = @constCast("a1"),
+            .title = @constCast("draft-current"),
+            .created_ms = 100,
+            .updated_ms = 100,
+        },
+        .{
+            .id = @constCast("b2"),
+            .title = @constCast("active"),
+            .created_ms = 200,
+            .updated_ms = 900,
+        },
+        .{
+            .id = @constCast("c3"),
+            .title = @constCast("draft-hidden"),
+            .created_ms = 300,
+            .updated_ms = 500,
+        },
+    };
+    defer {
+        for (conversations[0].messages.items) |*message| message.deinit(allocator);
+        conversations[0].messages.deinit(allocator);
+        for (conversations[1].messages.items) |*message| message.deinit(allocator);
+        conversations[1].messages.deinit(allocator);
+        for (conversations[2].messages.items) |*message| message.deinit(allocator);
+        conversations[2].messages.deinit(allocator);
+    }
+
+    try conversations[1].messages.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "hello"),
+        .timestamp_ms = 901,
+    });
+
+    var ordered = try collectConversationSwitchMatchOrder(allocator, conversations[0..], 0, "", false);
+    defer ordered.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), ordered.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ordered.items[0]);
 }
 
 test "commandMatchesQuery matches name and description" {
