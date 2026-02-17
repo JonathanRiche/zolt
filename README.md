@@ -200,6 +200,7 @@ Insert mode:
 
 Picker triggers:
 - `/` opens slash command picker
+- `/help` opens command palette
 - `/commands` opens command palette
 - `>` opens command palette
 - `/model` opens model picker
@@ -207,7 +208,7 @@ Picker triggers:
 
 ### Slash Commands
 
-- `/help`
+- `/help` (same as `/commands`)
 - `/commands`
 - `/provider [id]`
 - `/model [id]`

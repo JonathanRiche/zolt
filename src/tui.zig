@@ -2480,7 +2480,7 @@ const App = struct {
         };
 
         if (std.mem.eql(u8, command, "help")) {
-            try self.setNotice("Commands: /help /commands /provider [id] /model [id] /models [refresh] /files [refresh] /new [title] /sessions [id] /title <text> /theme [codex|plain|forest] /ui [compact|comfy] /paste-image /quit  input: use @path, Ctrl-V paste image, Ctrl-P command palette, pickers: Ctrl-N/P or Up/Down + Enter, assistant tools: <READ>, <LIST_DIR>, <READ_FILE>, <GREP_FILES>, <PROJECT_SEARCH>, <APPLY_PATCH>, <EXEC_COMMAND>, <WRITE_STDIN>, <WEB_SEARCH>, <VIEW_IMAGE>");
+            try self.openCommandPalette();
             return;
         }
 
@@ -4597,7 +4597,7 @@ const QuickActionEntry = struct {
 };
 
 const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
-    .{ .name = "help", .description = "show command help", .insert_trailing_space = false },
+    .{ .name = "help", .description = "open command palette", .insert_trailing_space = false },
     .{ .name = "commands", .description = "open quick action palette", .insert_trailing_space = false },
     .{ .name = "provider", .description = "set/show provider id" },
     .{ .name = "model", .description = "pick or set model id" },
@@ -4622,7 +4622,7 @@ const QUICK_ACTIONS = [_]QuickActionEntry{
     .{ .id = .refresh_file_index, .label = "Refresh file index", .description = "run /files refresh", .keywords = "files index rg" },
     .{ .id = .toggle_ui_density, .label = "Toggle UI density", .description = "switch compact/comfy UI", .keywords = "compact comfy ui" },
     .{ .id = .toggle_theme, .label = "Toggle theme", .description = "cycle codex/plain/forest", .keywords = "theme colors" },
-    .{ .id = .show_help, .label = "Show help", .description = "show command usage help", .keywords = "help commands" },
+    .{ .id = .show_help, .label = "Show help", .description = "open command palette", .keywords = "help commands palette" },
 };
 
 fn parseSlashCommandPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
