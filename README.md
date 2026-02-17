@@ -87,13 +87,22 @@ Use `zolt run` when another tool/script needs a one-shot answer on stdout (no TU
 zolt run "<prompt>"
 zolt run --session <conversation-id> "<prompt>"
 zolt run -s <conversation-id> "<prompt>"
+zolt run --output text "<prompt>"
+zolt run --output logs "<prompt>"
+zolt run --output json "<prompt>"
+zolt run --output json-stream "<prompt>"
 ```
 
 Notes:
 - `zolt run` uses the same model/provider selection as normal mode.
 - `--session` resumes that conversation context first, then appends your prompt.
+- `--output` controls formatting:
+  - `text`: final assistant response only (default)
+  - `logs`: tool call/result log lines + final response
+  - `json`: one JSON object with metadata, final response, and captured events
+  - `json-stream` (`ndjson`/`jsonl` alias): newline-delimited JSON events while running
 - Tool loop is enabled in run mode (`READ`, `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`, `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`, `VIEW_IMAGE`).
-- Output is the final assistant response text on stdout (tool call placeholders are not returned as final output).
+- In `text` mode, stdout is only the final assistant response (tool call placeholders are not returned as final output).
 
 3. Install to `~/.local` (puts binary at `~/.local/bin/zolt`):
 

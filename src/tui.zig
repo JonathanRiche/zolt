@@ -31,6 +31,18 @@ pub const StartupOptions = struct {
     keybindings: ?Keybindings = null,
 };
 
+pub const RunTaskEvent = union(enum) {
+    token: []const u8,
+    tool_call: []const u8,
+    tool_result: []const u8,
+    final: []const u8,
+};
+
+pub const RunTaskObserver = struct {
+    on_event: *const fn (context: ?*anyopaque, event: RunTaskEvent) anyerror!void,
+    context: ?*anyopaque = null,
+};
+
 const StreamTask = enum {
     idle,
     thinking,
@@ -369,6 +381,17 @@ pub fn runTaskPrompt(
     catalog: *models.Catalog,
     prompt: []const u8,
 ) ![]u8 {
+    return runTaskPromptWithObserver(allocator, paths, app_state, catalog, prompt, null);
+}
+
+pub fn runTaskPromptWithObserver(
+    allocator: std.mem.Allocator,
+    paths: *const Paths,
+    app_state: *AppState,
+    catalog: *models.Catalog,
+    prompt: []const u8,
+    run_observer: ?RunTaskObserver,
+) ![]u8 {
     const trimmed_prompt = std.mem.trim(u8, prompt, " \t\r\n");
     if (trimmed_prompt.len == 0) return allocator.dupe(u8, "");
 
@@ -378,6 +401,7 @@ pub fn runTaskPrompt(
         .app_state = app_state,
         .catalog = catalog,
         .headless = true,
+        .run_observer = run_observer,
         .notice = try allocator.dupe(u8, "Running non-interactive task..."),
     };
     defer app.deinit();
@@ -385,7 +409,10 @@ pub fn runTaskPrompt(
     app.ensureCurrentConversationVisibleInStrip();
 
     try app.handlePrompt(trimmed_prompt);
-    return app.latestAssistantResponseAlloc();
+    const final = try app.latestAssistantResponseAlloc();
+    errdefer allocator.free(final);
+    try app.emitRunTaskEvent(.{ .final = final });
+    return final;
 }
 
 fn suspendForJobControl(raw_mode: *RawMode, app: *App) !void {
@@ -482,6 +509,7 @@ const App = struct {
     stream_task: StreamTask = .idle,
     suspend_requested: bool = false,
     headless: bool = false,
+    run_observer: ?RunTaskObserver = null,
 
     notice: []u8,
 
@@ -495,6 +523,12 @@ const App = struct {
         for (self.file_index.items) |path| self.allocator.free(path);
         self.file_index.deinit(self.allocator);
         self.allocator.free(self.notice);
+    }
+
+    fn emitRunTaskEvent(self: *App, event: RunTaskEvent) !void {
+        if (!self.headless) return;
+        const observer = self.run_observer orelse return;
+        try observer.on_event(observer.context, event);
     }
 
     fn handleByte(self: *App, key_byte: u8) !void {
@@ -873,9 +907,11 @@ const App = struct {
                     const tool_note = try std.fmt.allocPrint(self.allocator, "[tool] READ {s}", .{read_command_owned});
                     defer self.allocator.free(tool_note);
                     try self.setLastAssistantMessage(tool_note);
+                    try self.emitRunTaskEvent(.{ .tool_call = tool_note });
 
                     const tool_result = try self.runReadToolCommand(read_command_owned);
                     defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNoticeFmt("Ran READ command: {s}", .{read_command_owned});
@@ -887,9 +923,11 @@ const App = struct {
                     defer self.allocator.free(payload_owned);
 
                     try self.setLastAssistantMessage("[tool] LIST_DIR");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] LIST_DIR" });
 
                     const tool_result = try self.runListDirToolPayload(payload_owned);
                     defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran LIST_DIR tool");
@@ -901,9 +939,11 @@ const App = struct {
                     defer self.allocator.free(payload_owned);
 
                     try self.setLastAssistantMessage("[tool] READ_FILE");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] READ_FILE" });
 
                     const tool_result = try self.runReadFileToolPayload(payload_owned);
                     defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran READ_FILE tool");
@@ -915,9 +955,11 @@ const App = struct {
                     defer self.allocator.free(payload_owned);
 
                     try self.setLastAssistantMessage("[tool] GREP_FILES");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] GREP_FILES" });
 
                     const tool_result = try self.runGrepFilesToolPayload(payload_owned);
                     defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran GREP_FILES tool");
@@ -929,9 +971,11 @@ const App = struct {
                     defer self.allocator.free(payload_owned);
 
                     try self.setLastAssistantMessage("[tool] PROJECT_SEARCH");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] PROJECT_SEARCH" });
 
                     const tool_result = try self.runProjectSearchToolPayload(payload_owned);
                     defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran PROJECT_SEARCH tool");
@@ -943,9 +987,11 @@ const App = struct {
                     defer self.allocator.free(patch_text_owned);
 
                     try self.setLastAssistantMessage("[tool] APPLY_PATCH");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] APPLY_PATCH" });
 
                     const tool_result = try self.runApplyPatchToolPatch(patch_text_owned);
                     defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran APPLY_PATCH tool");
@@ -957,9 +1003,11 @@ const App = struct {
                     defer self.allocator.free(exec_payload_owned);
 
                     try self.setLastAssistantMessage("[tool] EXEC_COMMAND");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] EXEC_COMMAND" });
 
                     const tool_result = try self.runExecCommandToolPayload(exec_payload_owned);
                     defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran EXEC_COMMAND tool");
@@ -971,9 +1019,11 @@ const App = struct {
                     defer self.allocator.free(write_payload_owned);
 
                     try self.setLastAssistantMessage("[tool] WRITE_STDIN");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] WRITE_STDIN" });
 
                     const tool_result = try self.runWriteStdinToolPayload(write_payload_owned);
                     defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran WRITE_STDIN tool");
@@ -985,9 +1035,11 @@ const App = struct {
                     defer self.allocator.free(web_search_payload_owned);
 
                     try self.setLastAssistantMessage("[tool] WEB_SEARCH");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] WEB_SEARCH" });
 
                     const tool_result = try self.runWebSearchToolPayload(web_search_payload_owned);
                     defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran WEB_SEARCH tool");
@@ -999,9 +1051,11 @@ const App = struct {
                     defer self.allocator.free(view_image_payload_owned);
 
                     try self.setLastAssistantMessage("[tool] VIEW_IMAGE");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] VIEW_IMAGE" });
 
                     const tool_result = try self.runViewImageToolPayload(view_image_payload_owned);
                     defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran VIEW_IMAGE tool");
@@ -2430,6 +2484,7 @@ const App = struct {
             return;
         }
         self.stream_task = .responding;
+        try self.emitRunTaskEvent(.{ .token = token });
         try self.appendToLastAssistantMessage(token);
         try self.render();
     }
