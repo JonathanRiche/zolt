@@ -3790,19 +3790,20 @@ const App = struct {
             } else if (self.command_picker_kind == .conversation_switch) blk: {
                 const conversation = &self.app_state.conversations.items[ordered_conversation_matches.items[index]];
                 const age = conversationRelativeAge(now_ms, conversationTimestampMs(conversation));
+                const age_label = try conversationAgeLabelAlloc(self.allocator, age);
+                defer self.allocator.free(age_label);
+                const title_max_width = sessionPickerTitleMaxWidth(width, conversation.id.len, age_label.len);
+                const title = if (title_max_width == 0)
+                    try self.allocator.dupe(u8, "")
+                else
+                    try truncateLineAlloc(self.allocator, conversation.title, title_max_width);
+                defer self.allocator.free(title);
                 const current_marker = if (self.app_state.current_index < self.app_state.conversations.items.len and
                     std.mem.eql(u8, self.app_state.currentConversationConst().id, conversation.id)) "*" else " ";
-                if (age.just_now) {
-                    break :blk try std.fmt.allocPrint(
-                        self.allocator,
-                        "{s}{s} {s}  {s}  now",
-                        .{ marker, current_marker, conversation.id, conversation.title },
-                    );
-                }
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{s}{s} {s}  {s}  {d}{s} ago",
-                    .{ marker, current_marker, conversation.id, conversation.title, age.value, age.unit },
+                    "{s}{s} {s}  {s}  {s}",
+                    .{ marker, current_marker, conversation.id, age_label, title },
                 );
             } else blk: {
                 const selected_entry = self.commandPickerNthMatch(query, index) orelse continue;
@@ -4749,6 +4750,18 @@ fn conversationRelativeAge(now_ms: i64, then_ms: i64) ConversationRelativeAge {
     if (delta_ms < 3_600_000) return .{ .value = @divFloor(delta_ms, 60_000), .unit = "m" };
     if (delta_ms < 86_400_000) return .{ .value = @divFloor(delta_ms, 3_600_000), .unit = "h" };
     return .{ .value = @divFloor(delta_ms, 86_400_000), .unit = "d" };
+}
+
+fn conversationAgeLabelAlloc(allocator: std.mem.Allocator, age: ConversationRelativeAge) ![]u8 {
+    if (age.just_now) return allocator.dupe(u8, "now");
+    return std.fmt.allocPrint(allocator, "{d}{s} ago", .{ age.value, age.unit });
+}
+
+fn sessionPickerTitleMaxWidth(width: usize, id_len: usize, age_label_len: usize) usize {
+    const base_len = 7 + id_len + age_label_len;
+    if (width <= base_len) return 0;
+    const available = width - base_len;
+    return @min(available, @as(usize, 56));
 }
 
 fn shouldIncludeConversationInSessionOrder(
@@ -7260,6 +7273,24 @@ test "conversationRelativeAge formats relative units" {
     const days = conversationRelativeAge(now_ms, now_ms - (3 * 86_400_000));
     try std.testing.expectEqual(@as(i64, 3), days.value);
     try std.testing.expectEqualStrings("d", days.unit);
+}
+
+test "conversationAgeLabelAlloc renders now and ago labels" {
+    const allocator = std.testing.allocator;
+
+    const now_label = try conversationAgeLabelAlloc(allocator, .{ .just_now = true });
+    defer allocator.free(now_label);
+    try std.testing.expectEqualStrings("now", now_label);
+
+    const ago_label = try conversationAgeLabelAlloc(allocator, .{ .value = 12, .unit = "m" });
+    defer allocator.free(ago_label);
+    try std.testing.expectEqualStrings("12m ago", ago_label);
+}
+
+test "sessionPickerTitleMaxWidth caps to available width" {
+    try std.testing.expectEqual(@as(usize, 0), sessionPickerTitleMaxWidth(20, 16, 6));
+    try std.testing.expectEqual(@as(usize, 35), sessionPickerTitleMaxWidth(64, 16, 6));
+    try std.testing.expectEqual(@as(usize, 56), sessionPickerTitleMaxWidth(200, 16, 6));
 }
 
 test "commandMatchesQuery matches name and description" {
