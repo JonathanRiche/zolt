@@ -359,6 +359,32 @@ pub fn run(
     }
 }
 
+pub fn runTaskPrompt(
+    allocator: std.mem.Allocator,
+    paths: *const Paths,
+    app_state: *AppState,
+    catalog: *models.Catalog,
+    prompt: []const u8,
+) ![]u8 {
+    const trimmed_prompt = std.mem.trim(u8, prompt, " \t\r\n");
+    if (trimmed_prompt.len == 0) return allocator.dupe(u8, "");
+
+    var app: App = .{
+        .allocator = allocator,
+        .paths = paths,
+        .app_state = app_state,
+        .catalog = catalog,
+        .headless = true,
+        .notice = try allocator.dupe(u8, "Running non-interactive task..."),
+    };
+    defer app.deinit();
+    app.refreshFileIndex() catch {};
+    app.ensureCurrentConversationVisibleInStrip();
+
+    try app.handlePrompt(trimmed_prompt);
+    return app.latestAssistantResponseAlloc();
+}
+
 fn suspendForJobControl(raw_mode: *RawMode, app: *App) !void {
     app.suspend_requested = false;
     app.stream_stop_for_suspend = false;
@@ -452,6 +478,7 @@ const App = struct {
     stream_started_ms: i64 = 0,
     stream_task: StreamTask = .idle,
     suspend_requested: bool = false,
+    headless: bool = false,
 
     notice: []u8,
 
@@ -2416,6 +2443,8 @@ const App = struct {
     }
 
     fn pollStreamInterrupt(self: *App) !bool {
+        if (self.headless) return false;
+
         while (try stdinHasPendingByte(0)) {
             var byte_buf: [1]u8 = undefined;
             const read_len = try std.posix.read(std.fs.File.stdin().handle, byte_buf[0..]);
@@ -2721,7 +2750,21 @@ const App = struct {
         try self.setNoticeOwned(text);
     }
 
+    fn latestAssistantResponseAlloc(self: *App) ![]u8 {
+        const conversation = self.app_state.currentConversationConst();
+        var index = conversation.messages.items.len;
+        while (index > 0) {
+            index -= 1;
+            const message = conversation.messages.items[index];
+            if (message.role != .assistant) continue;
+            return self.allocator.dupe(u8, message.content);
+        }
+        return self.allocator.dupe(u8, "");
+    }
+
     fn render(self: *App) !void {
+        if (self.headless) return;
+
         var screen_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer screen_writer.deinit();
 

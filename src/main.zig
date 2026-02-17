@@ -7,10 +7,6 @@ const app_config = @import("config.zig");
 const models = @import("models.zig");
 const Paths = @import("paths.zig").Paths;
 const AppState = @import("state.zig").AppState;
-const Conversation = @import("state.zig").Conversation;
-const Role = @import("state.zig").Role;
-const TokenUsage = @import("state.zig").TokenUsage;
-const provider_client = @import("provider_client.zig");
 const tui = @import("tui.zig");
 const APP_VERSION = "0.1.0-dev";
 
@@ -152,23 +148,18 @@ pub fn main() !void {
             try app_state.saveToPath(allocator, paths.state_path);
         },
         .run_task => |task_options| {
-            try runSinglePromptTask(allocator, &app_state, &catalog, task_options, paths.state_path);
+            try runSinglePromptTask(allocator, &paths, &app_state, &catalog, task_options);
         },
         else => unreachable,
     }
 }
 
-const RunTaskStreamContext = struct {
-    assistant_writer: std.Io.Writer.Allocating,
-    usage: TokenUsage = .{},
-};
-
 fn runSinglePromptTask(
     allocator: std.mem.Allocator,
+    paths: *const Paths,
     app_state: *AppState,
-    catalog: *const models.Catalog,
+    catalog: *models.Catalog,
     options: CliRunTaskOptions,
-    state_path: []const u8,
 ) !void {
     if (options.session_id) |session_id| {
         if (!app_state.switchConversation(session_id)) {
@@ -187,89 +178,9 @@ fn runSinglePromptTask(
         return;
     }
 
-    if (shouldAutoTitleCurrentConversation(app_state.currentConversationConst())) {
-        const title = try deriveConversationTitleFromPrompt(allocator, prompt);
-        defer allocator.free(title);
-        try app_state.setConversationTitle(allocator, title);
-    }
-
-    try app_state.appendMessage(allocator, .user, prompt);
-    var should_save = true;
-    defer if (should_save) app_state.saveToPath(allocator, state_path) catch {};
-
-    const provider_id = app_state.selected_provider_id;
-    const model_id = app_state.selected_model_id;
-    const api_key = try resolveApiKey(allocator, catalog, provider_id);
-    if (api_key == null) {
-        try writeMissingApiKeyToStderr(provider_id, firstEnvVarForProvider(catalog, provider_id));
-        return;
-    }
-    defer allocator.free(api_key.?);
-
-    const provider_info = catalog.findProviderConst(provider_id);
-    const base_url = if (provider_info) |info| info.api_base else null;
-
-    const stream_messages = try buildStreamMessagesFromConversation(allocator, app_state.currentConversationConst());
-    defer allocator.free(stream_messages);
-
-    var stream_context: RunTaskStreamContext = .{
-        .assistant_writer = .init(allocator),
-    };
-    defer stream_context.assistant_writer.deinit();
-
-    provider_client.streamChat(allocator, .{
-        .provider_id = provider_id,
-        .model_id = model_id,
-        .api_key = api_key.?,
-        .base_url = base_url,
-        .messages = stream_messages,
-    }, .{
-        .on_token = onRunTaskToken,
-        .on_usage = onRunTaskUsage,
-        .context = &stream_context,
-    }) catch |err| {
-        try writeRunTaskProviderErrorToStderr(err, provider_client.lastProviderErrorDetail());
-        return err;
-    };
-
-    const assistant_text = try stream_context.assistant_writer.toOwnedSlice();
+    const assistant_text = try tui.runTaskPrompt(allocator, paths, app_state, catalog, prompt);
     defer allocator.free(assistant_text);
-
-    if (assistant_text.len > 0) {
-        try app_state.appendMessage(allocator, .assistant, assistant_text);
-    }
-    if (!stream_context.usage.isZero()) {
-        app_state.appendTokenUsage(stream_context.usage, selectedModelContextWindow(catalog, provider_id, model_id));
-    }
-    try app_state.saveToPath(allocator, state_path);
-    should_save = false;
-
     try writeRunTaskOutputToStdout(assistant_text);
-}
-
-fn onRunTaskToken(context: ?*anyopaque, token: []const u8) anyerror!void {
-    if (token.len == 0) return;
-    const run_context: *RunTaskStreamContext = @ptrCast(@alignCast(context.?));
-    try run_context.assistant_writer.writer.writeAll(token);
-}
-
-fn onRunTaskUsage(context: ?*anyopaque, usage: TokenUsage) anyerror!void {
-    const run_context: *RunTaskStreamContext = @ptrCast(@alignCast(context.?));
-    run_context.usage.addAssign(usage);
-}
-
-fn buildStreamMessagesFromConversation(
-    allocator: std.mem.Allocator,
-    conversation: *const Conversation,
-) ![]provider_client.StreamMessage {
-    const messages = try allocator.alloc(provider_client.StreamMessage, conversation.messages.items.len);
-    for (conversation.messages.items, 0..) |message, index| {
-        messages[index] = .{
-            .role = message.role,
-            .content = message.content,
-        };
-    }
-    return messages;
 }
 
 fn joinPromptPartsAlloc(allocator: std.mem.Allocator, prompt_parts: []const []const u8) ![]u8 {
@@ -281,102 +192,6 @@ fn joinPromptPartsAlloc(allocator: std.mem.Allocator, prompt_parts: []const []co
         try writer.writer.writeAll(part);
     }
     return writer.toOwnedSlice();
-}
-
-fn shouldAutoTitleCurrentConversation(conversation: *const Conversation) bool {
-    if (conversation.messages.items.len != 0) return false;
-    if (std.mem.eql(u8, conversation.title, "New conversation")) return true;
-    return std.mem.startsWith(u8, conversation.title, "Conversation ");
-}
-
-fn deriveConversationTitleFromPrompt(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
-    const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
-    if (trimmed.len == 0) return allocator.dupe(u8, "New conversation");
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
-    var previous_was_space = false;
-    for (trimmed) |byte| {
-        const is_space = byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
-        if (is_space) {
-            if (!previous_was_space) {
-                try out.append(allocator, ' ');
-                previous_was_space = true;
-            }
-            continue;
-        }
-
-        if (out.items.len >= 96) break;
-        try out.append(allocator, byte);
-        previous_was_space = false;
-    }
-
-    if (out.items.len == 0) return allocator.dupe(u8, "New conversation");
-    if (out.items.len > 0 and out.items[out.items.len - 1] == ' ') {
-        _ = out.pop();
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn resolveApiKey(
-    allocator: std.mem.Allocator,
-    catalog: *const models.Catalog,
-    provider_id: []const u8,
-) !?[]u8 {
-    if (catalog.findProviderConst(provider_id)) |provider| {
-        if (provider.env_vars.items.len > 0) {
-            for (provider.env_vars.items) |env_var| {
-                const value = std.process.getEnvVarOwned(allocator, env_var) catch |err| switch (err) {
-                    error.EnvironmentVariableNotFound => null,
-                    else => return err,
-                };
-                if (value) |key| return key;
-            }
-        }
-    }
-
-    for (fallbackApiEnvVars(provider_id)) |env_var| {
-        const value = std.process.getEnvVarOwned(allocator, env_var) catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => null,
-            else => return err,
-        };
-        if (value) |key| return key;
-    }
-
-    return null;
-}
-
-fn firstEnvVarForProvider(catalog: *const models.Catalog, provider_id: []const u8) ?[]const u8 {
-    if (catalog.findProviderConst(provider_id)) |provider| {
-        if (provider.env_vars.items.len > 0) return provider.env_vars.items[0];
-    }
-
-    const fallback = fallbackApiEnvVars(provider_id);
-    if (fallback.len > 0) return fallback[0];
-    return null;
-}
-
-fn fallbackApiEnvVars(provider_id: []const u8) []const []const u8 {
-    if (std.mem.eql(u8, provider_id, "opencode")) return &.{"OPENCODE_API_KEY"};
-    if (std.mem.eql(u8, provider_id, "openai")) return &.{"OPENAI_API_KEY"};
-    if (std.mem.eql(u8, provider_id, "openrouter")) return &.{"OPENROUTER_API_KEY"};
-    if (std.mem.eql(u8, provider_id, "anthropic")) return &.{"ANTHROPIC_API_KEY"};
-    if (std.mem.eql(u8, provider_id, "google")) return &.{ "GOOGLE_GENERATIVE_AI_API_KEY", "GEMINI_API_KEY" };
-    if (std.mem.eql(u8, provider_id, "zenmux")) return &.{"ZENMUX_API_KEY"};
-    return &.{};
-}
-
-fn selectedModelContextWindow(
-    catalog: *const models.Catalog,
-    provider_id: []const u8,
-    model_id: []const u8,
-) ?i64 {
-    const provider = catalog.findProviderConst(provider_id) orelse return null;
-    for (provider.models.items) |model| {
-        if (std.mem.eql(u8, model.id, model_id)) return model.context_window;
-    }
-    return null;
 }
 
 fn writeRunTaskOutputToStdout(text: []const u8) !void {
@@ -395,36 +210,6 @@ fn writeRunTaskMissingPromptToStderr() !void {
     var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
     defer stderr_writer.interface.flush() catch {};
     try stderr_writer.interface.writeAll("missing prompt\nUsage: zolt run \"<prompt>\"\n");
-}
-
-fn writeMissingApiKeyToStderr(provider_id: []const u8, env_hint: ?[]const u8) !void {
-    var output_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
-    defer stderr_writer.interface.flush() catch {};
-
-    if (env_hint) |hint| {
-        try stderr_writer.interface.print(
-            "missing API key for provider {s}\nSet env var: {s}\n",
-            .{ provider_id, hint },
-        );
-    } else {
-        try stderr_writer.interface.print(
-            "missing API key for provider {s}\n",
-            .{provider_id},
-        );
-    }
-}
-
-fn writeRunTaskProviderErrorToStderr(err: anyerror, detail: ?[]const u8) !void {
-    var output_buffer: [2048]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
-    defer stderr_writer.interface.flush() catch {};
-
-    if (detail) |provider_detail| {
-        try stderr_writer.interface.print("provider request failed: {s}\n", .{provider_detail});
-        return;
-    }
-    try stderr_writer.interface.print("provider request failed: {s}\n", .{@errorName(err)});
 }
 
 fn parseCliAction(args: []const []const u8) CliAction {
