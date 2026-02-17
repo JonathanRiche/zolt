@@ -2608,6 +2608,7 @@ const App = struct {
         if (std.mem.eql(u8, command, "list")) {
             var line_writer: std.Io.Writer.Allocating = .init(self.allocator);
             defer line_writer.deinit();
+            const now_ms = std.time.milliTimestamp();
 
             try line_writer.writer.writeAll("Conversations: ");
             var ordered = try collectConversationSwitchMatchOrder(
@@ -2622,9 +2623,20 @@ const App = struct {
             const limit = @min(ordered.items.len, 6);
             for (ordered.items[0..limit], 0..) |conversation_index, index| {
                 const conversation = self.app_state.conversations.items[conversation_index];
+                const age = conversationRelativeAge(now_ms, conversationTimestampMs(&conversation));
                 if (index > 0) try line_writer.writer.writeAll(" | ");
                 const current_mark = if (conversation_index == self.app_state.current_index) "*" else "";
-                try line_writer.writer.print("{s}{s}:{s}", .{ current_mark, conversation.id, conversation.title });
+                if (age.just_now) {
+                    try line_writer.writer.print("{s}{s}:{s} (now)", .{ current_mark, conversation.id, conversation.title });
+                } else {
+                    try line_writer.writer.print("{s}{s}:{s} ({d}{s} ago)", .{
+                        current_mark,
+                        conversation.id,
+                        conversation.title,
+                        age.value,
+                        age.unit,
+                    });
+                }
             }
 
             const notice = try line_writer.toOwnedSlice();
@@ -3762,6 +3774,7 @@ const App = struct {
         }
 
         const end_index = @min(self.command_picker_scroll + shown_rows, total);
+        const now_ms = std.time.milliTimestamp();
         var index = self.command_picker_scroll;
         while (index < end_index) : (index += 1) {
             const is_selected = index == self.command_picker_index;
@@ -3776,12 +3789,20 @@ const App = struct {
                 );
             } else if (self.command_picker_kind == .conversation_switch) blk: {
                 const conversation = &self.app_state.conversations.items[ordered_conversation_matches.items[index]];
+                const age = conversationRelativeAge(now_ms, conversationTimestampMs(conversation));
                 const current_marker = if (self.app_state.current_index < self.app_state.conversations.items.len and
                     std.mem.eql(u8, self.app_state.currentConversationConst().id, conversation.id)) "*" else " ";
+                if (age.just_now) {
+                    break :blk try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}{s} {s}  {s}  now",
+                        .{ marker, current_marker, conversation.id, conversation.title },
+                    );
+                }
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{s}{s} {s}  {s}",
-                    .{ marker, current_marker, conversation.id, conversation.title },
+                    "{s}{s} {s}  {s}  {d}{s} ago",
+                    .{ marker, current_marker, conversation.id, conversation.title, age.value, age.unit },
                 );
             } else blk: {
                 const selected_entry = self.commandPickerNthMatch(query, index) orelse continue;
@@ -4709,6 +4730,25 @@ fn quickActionMatchesQuery(entry: QuickActionEntry, query: []const u8) bool {
 fn conversationMatchesQuery(conversation: *const Conversation, query: []const u8) bool {
     if (query.len == 0) return true;
     return containsAsciiIgnoreCase(conversation.id, query) or containsAsciiIgnoreCase(conversation.title, query);
+}
+
+const ConversationRelativeAge = struct {
+    value: i64 = 0,
+    unit: []const u8 = "s",
+    just_now: bool = false,
+};
+
+fn conversationTimestampMs(conversation: *const Conversation) i64 {
+    return @max(conversation.updated_ms, conversation.created_ms);
+}
+
+fn conversationRelativeAge(now_ms: i64, then_ms: i64) ConversationRelativeAge {
+    const delta_ms = @max(@as(i64, 0), now_ms - then_ms);
+    if (delta_ms < 5_000) return .{ .just_now = true };
+    if (delta_ms < 60_000) return .{ .value = @divFloor(delta_ms, 1_000), .unit = "s" };
+    if (delta_ms < 3_600_000) return .{ .value = @divFloor(delta_ms, 60_000), .unit = "m" };
+    if (delta_ms < 86_400_000) return .{ .value = @divFloor(delta_ms, 3_600_000), .unit = "h" };
+    return .{ .value = @divFloor(delta_ms, 86_400_000), .unit = "d" };
 }
 
 fn shouldIncludeConversationInSessionOrder(
@@ -7196,6 +7236,30 @@ test "collectConversationSwitchMatchOrder hides all blank drafts when disabled" 
 
     try std.testing.expectEqual(@as(usize, 1), ordered.items.len);
     try std.testing.expectEqual(@as(usize, 1), ordered.items[0]);
+}
+
+test "conversationRelativeAge formats relative units" {
+    const now_ms: i64 = 1_000_000;
+
+    const just_now = conversationRelativeAge(now_ms, now_ms - 2_000);
+    try std.testing.expect(just_now.just_now);
+
+    const seconds = conversationRelativeAge(now_ms, now_ms - 42_000);
+    try std.testing.expect(!seconds.just_now);
+    try std.testing.expectEqual(@as(i64, 42), seconds.value);
+    try std.testing.expectEqualStrings("s", seconds.unit);
+
+    const minutes = conversationRelativeAge(now_ms, now_ms - (12 * 60_000));
+    try std.testing.expectEqual(@as(i64, 12), minutes.value);
+    try std.testing.expectEqualStrings("m", minutes.unit);
+
+    const hours = conversationRelativeAge(now_ms, now_ms - (5 * 3_600_000));
+    try std.testing.expectEqual(@as(i64, 5), hours.value);
+    try std.testing.expectEqualStrings("h", hours.unit);
+
+    const days = conversationRelativeAge(now_ms, now_ms - (3 * 86_400_000));
+    try std.testing.expectEqual(@as(i64, 3), days.value);
+    try std.testing.expectEqualStrings("d", days.unit);
 }
 
 test "commandMatchesQuery matches name and description" {
