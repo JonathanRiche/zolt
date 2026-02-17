@@ -42,7 +42,7 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 ## Requirements
 
 - Zig `0.15.2` (or very close)
-- Interactive terminal (TTY)
+- Interactive terminal (TTY) for `zolt` chat mode
 - At least one provider API key in environment variables
 
 ## Quick Start
@@ -64,6 +64,7 @@ Pass CLI flags through Zig with `--`:
 ```bash
 zig build run -- -h
 zig build run -- -s <conversation-id>
+zig build run -- run "explain src/main.zig"
 ```
 
 CLI helpers:
@@ -74,6 +75,8 @@ zolt --help
 zolt --version
 zolt -s <conversation-id>
 zolt --session <conversation-id>
+zolt run "<prompt>"
+zolt run --session <conversation-id> "<prompt>"
 ```
 
 3. Install to `~/.local` (puts binary at `~/.local/bin/zolt`):

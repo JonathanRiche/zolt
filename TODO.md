@@ -28,7 +28,7 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [ ] gate tool execution with allow-once/always/deny prompt
 - [ ] `/permissions` command to view/toggle tool permissions
 - [ ] persist permission decisions per workspace/session
-- [ ] add `zolt run "<prompt>"` CLI mode (non-interactive single prompt)
+- [x] add `zolt run "<prompt>"` CLI mode (non-interactive single prompt)
 - [x] `web_search` (optional mode)
 - [x] `view_image` (local screenshots/assets)
 
