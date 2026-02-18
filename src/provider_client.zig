@@ -16,6 +16,8 @@ pub const StreamRequest = struct {
     model_id: []const u8,
     api_key: []const u8,
     base_url: ?[]const u8,
+    chatgpt_account_id: ?[]const u8 = null,
+    prefer_responses_api: bool = false,
     messages: []const StreamMessage,
 };
 
@@ -63,6 +65,13 @@ fn streamOpenAiCompatible(
     callbacks: StreamCallbacks,
 ) !void {
     const base_url = request.base_url orelse defaultBaseUrl(request.provider_id) orelse return error.MissingProviderBaseUrl;
+    const use_referrer_headers = std.mem.eql(u8, request.provider_id, "openrouter") or
+        std.mem.eql(u8, request.provider_id, "opencode") or
+        std.mem.eql(u8, request.provider_id, "zenmux");
+
+    if (shouldPreferResponsesApi(request, base_url)) {
+        return streamOpenAiResponses(allocator, request, callbacks, use_referrer_headers);
+    }
 
     const endpoint = try joinUrl(allocator, base_url, "/chat/completions");
     defer allocator.free(endpoint);
@@ -73,14 +82,8 @@ fn streamOpenAiCompatible(
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
     defer allocator.free(auth_header);
 
-    var extra_headers: [2]std.http.Header = .{
-        .{ .name = "HTTP-Referer", .value = "https://opencode.ai/" },
-        .{ .name = "X-Title", .value = "zig-ai" },
-    };
-
-    const use_referrer_headers = std.mem.eql(u8, request.provider_id, "openrouter") or
-        std.mem.eql(u8, request.provider_id, "opencode") or
-        std.mem.eql(u8, request.provider_id, "zenmux");
+    var extra_headers_storage: [3]std.http.Header = undefined;
+    const extra_headers = buildOpenAiExtraHeaders(request, use_referrer_headers, &extra_headers_storage);
 
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
@@ -92,7 +95,7 @@ fn streamOpenAiCompatible(
             .authorization = .{ .override = auth_header },
             .user_agent = .{ .override = "zig-ai/0.1" },
         },
-        .extra_headers = if (use_referrer_headers) extra_headers[0..] else &.{},
+        .extra_headers = extra_headers,
         .keep_alive = false,
     });
     defer req.deinit();
@@ -139,10 +142,8 @@ fn streamOpenAiLegacyCompletions(
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
     defer allocator.free(auth_header);
 
-    var extra_headers: [2]std.http.Header = .{
-        .{ .name = "HTTP-Referer", .value = "https://opencode.ai/" },
-        .{ .name = "X-Title", .value = "zig-ai" },
-    };
+    var extra_headers_storage: [3]std.http.Header = undefined;
+    const extra_headers = buildOpenAiExtraHeaders(request, use_referrer_headers, &extra_headers_storage);
 
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
@@ -154,7 +155,7 @@ fn streamOpenAiLegacyCompletions(
             .authorization = .{ .override = auth_header },
             .user_agent = .{ .override = "zig-ai/0.1" },
         },
-        .extra_headers = if (use_referrer_headers) extra_headers[0..] else &.{},
+        .extra_headers = extra_headers,
         .keep_alive = false,
     });
     defer req.deinit();
@@ -201,10 +202,8 @@ fn streamOpenAiResponses(
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
     defer allocator.free(auth_header);
 
-    var extra_headers: [2]std.http.Header = .{
-        .{ .name = "HTTP-Referer", .value = "https://opencode.ai/" },
-        .{ .name = "X-Title", .value = "zig-ai" },
-    };
+    var extra_headers_storage: [3]std.http.Header = undefined;
+    const extra_headers = buildOpenAiExtraHeaders(request, use_referrer_headers, &extra_headers_storage);
 
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
@@ -216,7 +215,7 @@ fn streamOpenAiResponses(
             .authorization = .{ .override = auth_header },
             .user_agent = .{ .override = "zig-ai/0.1" },
         },
-        .extra_headers = if (use_referrer_headers) extra_headers[0..] else &.{},
+        .extra_headers = extra_headers,
         .keep_alive = false,
     });
     defer req.deinit();
@@ -454,6 +453,35 @@ fn shouldRetryWithResponsesEndpoint(status: std.http.Status, error_body: []const
     return containsAsciiIgnoreCase(error_body, "not supported in the v1/completions endpoint");
 }
 
+fn shouldPreferResponsesApi(request: StreamRequest, base_url: []const u8) bool {
+    return request.prefer_responses_api or isChatGptCodexBaseUrl(base_url);
+}
+
+fn isChatGptCodexBaseUrl(base_url: []const u8) bool {
+    return containsAsciiIgnoreCase(base_url, "chatgpt.com/backend-api/codex");
+}
+
+fn buildOpenAiExtraHeaders(
+    request: StreamRequest,
+    use_referrer_headers: bool,
+    headers_out: *[3]std.http.Header,
+) []const std.http.Header {
+    var len: usize = 0;
+    if (use_referrer_headers) {
+        headers_out[len] = .{ .name = "HTTP-Referer", .value = "https://opencode.ai/" };
+        len += 1;
+        headers_out[len] = .{ .name = "X-Title", .value = "zig-ai" };
+        len += 1;
+    }
+
+    if (request.chatgpt_account_id) |account_id| {
+        headers_out[len] = .{ .name = "ChatGPT-Account-ID", .value = account_id };
+        len += 1;
+    }
+
+    return headers_out[0..len];
+}
+
 fn buildOpenAiPayload(allocator: std.mem.Allocator, request: StreamRequest) ![]u8 {
     var payload_writer: std.Io.Writer.Allocating = .init(allocator);
     defer payload_writer.deinit();
@@ -514,6 +542,9 @@ fn buildOpenAiLegacyCompletionsPayload(allocator: std.mem.Allocator, request: St
 }
 
 fn buildOpenAiResponsesPayload(allocator: std.mem.Allocator, request: StreamRequest) ![]u8 {
+    const instructions = try buildResponsesInstructions(allocator, request.messages);
+    defer allocator.free(instructions);
+
     var payload_writer: std.Io.Writer.Allocating = .init(allocator);
     defer payload_writer.deinit();
 
@@ -526,11 +557,16 @@ fn buildOpenAiResponsesPayload(allocator: std.mem.Allocator, request: StreamRequ
     try jw.write(request.model_id);
     try jw.objectField("stream");
     try jw.write(true);
+    try jw.objectField("store");
+    try jw.write(false);
+    try jw.objectField("instructions");
+    try jw.write(instructions);
     try jw.objectField("input");
     try jw.beginArray();
 
     for (request.messages) |message| {
         if (message.content.len == 0) continue;
+        if (message.role == .system) continue;
         const content_type = responsesContentTypeForRole(message.role);
 
         try jw.beginObject();
@@ -554,6 +590,27 @@ fn buildOpenAiResponsesPayload(allocator: std.mem.Allocator, request: StreamRequ
     try jw.endObject();
 
     return payload_writer.toOwnedSlice();
+}
+
+fn buildResponsesInstructions(allocator: std.mem.Allocator, messages: []const StreamMessage) ![]u8 {
+    var instructions_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer instructions_writer.deinit();
+
+    var wrote_system_message = false;
+    for (messages) |message| {
+        if (message.role != .system or message.content.len == 0) continue;
+        if (wrote_system_message) {
+            try instructions_writer.writer.writeAll("\n\n");
+        }
+        try instructions_writer.writer.writeAll(message.content);
+        wrote_system_message = true;
+    }
+
+    if (!wrote_system_message) {
+        try instructions_writer.writer.writeAll("You are a helpful coding assistant.");
+    }
+
+    return instructions_writer.toOwnedSlice();
 }
 
 fn responsesContentTypeForRole(role: Role) []const u8 {
@@ -1076,7 +1133,7 @@ test "buildOpenAiLegacyCompletionsPayload includes prompt transcript" {
     try std.testing.expect(containsAsciiIgnoreCase(payload, "assistant: "));
 }
 
-test "buildOpenAiResponsesPayload includes input transcript" {
+test "buildOpenAiResponsesPayload includes instructions and non-system input transcript" {
     const allocator = std.testing.allocator;
 
     const messages = [_]StreamMessage{
@@ -1096,11 +1153,84 @@ test "buildOpenAiResponsesPayload includes input transcript" {
     const payload = try buildOpenAiResponsesPayload(allocator, request);
     defer allocator.free(payload);
 
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"instructions\""));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"be concise\""));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"store\":false"));
     try std.testing.expect(containsAsciiIgnoreCase(payload, "\"input\""));
     try std.testing.expect(containsAsciiIgnoreCase(payload, "\"type\":\"message\""));
     try std.testing.expect(containsAsciiIgnoreCase(payload, "\"type\":\"input_text\""));
     try std.testing.expect(containsAsciiIgnoreCase(payload, "\"type\":\"output_text\""));
-    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"text\":\"be concise\""));
     try std.testing.expect(containsAsciiIgnoreCase(payload, "\"text\":\"hi\""));
     try std.testing.expect(containsAsciiIgnoreCase(payload, "\"text\":\"hello\""));
+}
+
+test "buildOpenAiResponsesPayload uses default instructions without system messages" {
+    const allocator = std.testing.allocator;
+
+    const messages = [_]StreamMessage{
+        .{ .role = .user, .content = "hi" },
+    };
+
+    const request: StreamRequest = .{
+        .provider_id = "openai",
+        .model_id = "gpt-5.2-codex",
+        .api_key = "test",
+        .base_url = null,
+        .messages = messages[0..],
+    };
+
+    const payload = try buildOpenAiResponsesPayload(allocator, request);
+    defer allocator.free(payload);
+
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"instructions\""));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "helpful coding assistant"));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"store\":false"));
+    try std.testing.expect(containsAsciiIgnoreCase(payload, "\"text\":\"hi\""));
+}
+
+test "shouldPreferResponsesApi detects codex backend and explicit preference" {
+    const messages = [_]StreamMessage{};
+    const request_default: StreamRequest = .{
+        .provider_id = "openai",
+        .model_id = "gpt-5.2-codex",
+        .api_key = "test",
+        .base_url = null,
+        .messages = messages[0..],
+    };
+    try std.testing.expect(!shouldPreferResponsesApi(request_default, "https://api.openai.com/v1"));
+    try std.testing.expect(shouldPreferResponsesApi(request_default, "https://chatgpt.com/backend-api/codex"));
+
+    const request_prefer: StreamRequest = .{
+        .provider_id = "openai",
+        .model_id = "gpt-5.2-codex",
+        .api_key = "test",
+        .base_url = null,
+        .prefer_responses_api = true,
+        .messages = messages[0..],
+    };
+    try std.testing.expect(shouldPreferResponsesApi(request_prefer, "https://api.openai.com/v1"));
+}
+
+test "buildOpenAiExtraHeaders includes account id and optional referrer headers" {
+    const messages = [_]StreamMessage{};
+    const request: StreamRequest = .{
+        .provider_id = "openai",
+        .model_id = "gpt-5.2-codex",
+        .api_key = "test",
+        .base_url = null,
+        .chatgpt_account_id = "acc_123",
+        .messages = messages[0..],
+    };
+
+    var storage: [3]std.http.Header = undefined;
+    const account_only = buildOpenAiExtraHeaders(request, false, &storage);
+    try std.testing.expectEqual(@as(usize, 1), account_only.len);
+    try std.testing.expectEqualStrings("ChatGPT-Account-ID", account_only[0].name);
+    try std.testing.expectEqualStrings("acc_123", account_only[0].value);
+
+    const with_referrer = buildOpenAiExtraHeaders(request, true, &storage);
+    try std.testing.expectEqual(@as(usize, 3), with_referrer.len);
+    try std.testing.expectEqualStrings("HTTP-Referer", with_referrer[0].name);
+    try std.testing.expectEqualStrings("X-Title", with_referrer[1].name);
+    try std.testing.expectEqualStrings("ChatGPT-Account-ID", with_referrer[2].name);
 }

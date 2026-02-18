@@ -116,6 +116,13 @@ pub fn main() !void {
         if (cfg.keybindings) |bindings| {
             startup_options.keybindings = bindings;
         }
+        if (cfg.openai_auth_mode) |auth_mode| {
+            startup_options.openai_auth_mode = switch (auth_mode) {
+                .auto => .auto,
+                .api_key => .api_key,
+                .codex => .codex,
+            };
+        }
     }
 
     var catalog = blk: {
@@ -156,7 +163,7 @@ pub fn main() !void {
             try app_state.saveToPath(allocator, paths.state_path);
         },
         .run_task => |task_options| {
-            try runSinglePromptTask(allocator, &paths, &app_state, &catalog, task_options);
+            try runSinglePromptTask(allocator, &paths, &app_state, &catalog, task_options, startup_options);
         },
         else => unreachable,
     }
@@ -168,6 +175,7 @@ fn runSinglePromptTask(
     app_state: *AppState,
     catalog: *models.Catalog,
     options: CliRunTaskOptions,
+    startup_options: tui.StartupOptions,
 ) !void {
     if (options.session_id) |session_id| {
         if (!app_state.switchConversation(session_id)) {
@@ -188,7 +196,7 @@ fn runSinglePromptTask(
 
     switch (options.output_format) {
         .text => {
-            const assistant_text = try tui.runTaskPrompt(allocator, paths, app_state, catalog, prompt);
+            const assistant_text = try tui.runTaskPrompt(allocator, paths, app_state, catalog, prompt, startup_options);
             defer allocator.free(assistant_text);
             try writeRunTaskOutputToStdout(assistant_text);
         },
@@ -200,6 +208,7 @@ fn runSinglePromptTask(
                 app_state,
                 catalog,
                 prompt,
+                startup_options,
                 .{
                     .on_event = onRunTaskLogEvent,
                     .context = &logger,
@@ -215,6 +224,7 @@ fn runSinglePromptTask(
                 app_state,
                 catalog,
                 prompt,
+                startup_options,
                 .{
                     .on_event = onRunTaskJsonStreamEvent,
                     .context = &writer,
@@ -233,6 +243,7 @@ fn runSinglePromptTask(
                 app_state,
                 catalog,
                 prompt,
+                startup_options,
                 .{
                     .on_event = onRunTaskCollectEvent,
                     .context = &collector,

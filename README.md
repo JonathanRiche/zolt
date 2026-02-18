@@ -43,7 +43,9 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 
 - Zig `0.15.2` (or very close)
 - Interactive terminal (TTY) for `zolt` chat mode
-- At least one provider API key in environment variables
+- Auth for at least one provider:
+  - provider API key env var, or
+  - OpenAI Codex/ChatGPT subscription auth via `CODEX_HOME/auth.json` (or `~/.codex/auth.json`)
 
 ## Quick Start
 
@@ -116,11 +118,21 @@ If `~/.local/bin` is in your `PATH`, you can then run:
 zolt
 ```
 
-4. Set a provider key (example):
+4. Set auth (examples):
 
 ```bash
 export OPENAI_API_KEY=...
 ```
+
+Or for OpenAI Codex subscription auth, run Codex login so this file exists:
+
+- `$CODEX_HOME/auth.json` (if `CODEX_HOME` is set)
+- fallback: `~/.codex/auth.json`
+
+If you logged into OpenCode OAuth/Codex plugin, Zolt also reads:
+
+- `$XDG_DATA_HOME/opencode/auth.json`
+- fallback: `~/.local/share/opencode/auth.json`
 
 ## API Key Setup
 
@@ -134,7 +146,26 @@ Common keys:
 - `GOOGLE_GENERATIVE_AI_API_KEY` or `GEMINI_API_KEY`
 - `ZENMUX_API_KEY`
 
-Use `/provider <id>` to switch provider, then `/model` to pick models.
+Use `/provider <id> [auto|api_key|codex]` to switch provider/auth mode, then `/model` to pick models.
+
+### OpenAI Codex Subscription Auth
+
+For provider `openai`, Zolt also supports Codex/ChatGPT subscription auth without `OPENAI_API_KEY`:
+
+- Reads token data from `CODEX_HOME/auth.json` or `~/.codex/auth.json`
+- Reads OAuth token data from OpenCode auth file (`$XDG_DATA_HOME/opencode/auth.json` or `~/.local/share/opencode/auth.json`)
+- Uses bearer `tokens.access_token`
+- Sends `ChatGPT-Account-ID` when available
+- Routes requests to `https://chatgpt.com/backend-api/codex` (`/responses`)
+- If no subscription token exists, switching to OpenAI codex auth via `/provider` will trigger `codex login`.
+
+If both subscription auth and `OPENAI_API_KEY` are present, API key auth is used first.
+
+Optional auth preference override:
+
+- `ZOLT_OPENAI_AUTH=auto` (default): API key first, then Codex auth fallback
+- `ZOLT_OPENAI_AUTH=api_key`: API key only
+- `ZOLT_OPENAI_AUTH=codex`: Codex auth first (fallback to API key)
 
 ## Config File (JSONC)
 
@@ -150,6 +181,7 @@ Supported keys:
 - `theme`: `codex` | `plain` | `forest`
 - `ui` (alias: `ui_mode`): `compact` | `comfy`
 - `compact_mode`: `true`/`false` (legacy alias for `ui`)
+- `openai_auth` (alias: `openai_auth_mode`): `auto` | `api_key` | `codex`
 - `keybindings` (alias: `hotkeys`): optional key overrides for normal/insert mode
 
 Example:
@@ -158,6 +190,7 @@ Example:
 {
   // startup defaults
   "provider": "openai",
+  "openai_auth": "codex",
   "model": "gpt-4.1",
   "theme": "codex",
   "ui": "compact",
@@ -190,7 +223,7 @@ This cache includes model context window metadata used in the footer.
 Commands:
 
 - `/models` shows cache status
-- `/models refresh` refreshes from `models.dev`
+- `/models refresh` is recommended regularly to keep latest OpenAI models from `models.dev`
 
 ## Core Usage
 
@@ -238,7 +271,8 @@ Picker triggers:
 
 - `/help` (same as `/commands`)
 - `/commands`
-- `/provider [id]`
+- `/provider` (shows current provider and OpenAI auth mode options)
+- `/provider [id] [auto|api_key|codex]` (OpenAI auth mode)
 - `/model [id]`
 - `/models [refresh]`
 - `/files [refresh]`

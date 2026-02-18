@@ -51,6 +51,16 @@
     "compact_mode": {
       "type": "boolean",
       "description": "Legacy alias for ui/ui_mode: true=compact, false=comfy."
+    },
+    "openai_auth": {
+      "type": "string",
+      "enum": ["auto", "api_key", "codex"],
+      "description": "OpenAI auth preference: auto, api_key, or codex."
+    },
+    "openai_auth_mode": {
+      "type": "string",
+      "enum": ["auto", "api_key", "codex"],
+      "description": "Alias for openai_auth."
     }
   }
 }

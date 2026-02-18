@@ -19,6 +19,30 @@ const Mode = enum {
     insert,
 };
 
+const ProviderAuthSource = enum {
+    api_key_env,
+    codex_subscription,
+};
+
+pub const OpenAiAuthMode = enum {
+    auto,
+    api_key,
+    codex,
+};
+
+const ResolvedProviderAuth = struct {
+    bearer_token: []u8,
+    chatgpt_account_id: ?[]u8 = null,
+    prefer_responses_api: bool = false,
+    base_url_override: ?[]const u8 = null,
+    source: ProviderAuthSource = .api_key_env,
+
+    fn deinit(self: *ResolvedProviderAuth, allocator: std.mem.Allocator) void {
+        allocator.free(self.bearer_token);
+        if (self.chatgpt_account_id) |account_id| allocator.free(account_id);
+    }
+};
+
 pub const Theme = enum {
     codex,
     plain,
@@ -29,6 +53,7 @@ pub const StartupOptions = struct {
     theme: ?Theme = null,
     compact_mode: ?bool = null,
     keybindings: ?Keybindings = null,
+    openai_auth_mode: ?OpenAiAuthMode = null,
 };
 
 pub const RunTaskEvent = union(enum) {
@@ -63,6 +88,7 @@ const CommandPickerKind = enum {
     slash_commands,
     quick_actions,
     conversation_switch,
+    provider_options,
 };
 
 const TerminalMetrics = struct {
@@ -221,6 +247,7 @@ const PROJECT_SEARCH_MAX_FILES: u8 = 24;
 const PROJECT_SEARCH_DEFAULT_MAX_MATCHES: u16 = 300;
 const PROJECT_SEARCH_MAX_MATCHES: u16 = 5000;
 const STREAM_INTERRUPT_ESC_WINDOW_MS: i64 = 1200;
+const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
@@ -334,6 +361,9 @@ pub fn run(
     if (startup_options.keybindings) |bindings| {
         app.keybindings = bindings;
     }
+    if (startup_options.openai_auth_mode) |auth_mode| {
+        app.openai_auth_mode = auth_mode;
+    }
     app.refreshFileIndex() catch {};
     app.ensureCurrentConversationVisibleInStrip();
 
@@ -380,8 +410,9 @@ pub fn runTaskPrompt(
     app_state: *AppState,
     catalog: *models.Catalog,
     prompt: []const u8,
+    startup_options: StartupOptions,
 ) ![]u8 {
-    return runTaskPromptWithObserver(allocator, paths, app_state, catalog, prompt, null);
+    return runTaskPromptWithObserver(allocator, paths, app_state, catalog, prompt, startup_options, null);
 }
 
 pub fn runTaskPromptWithObserver(
@@ -390,6 +421,7 @@ pub fn runTaskPromptWithObserver(
     app_state: *AppState,
     catalog: *models.Catalog,
     prompt: []const u8,
+    startup_options: StartupOptions,
     run_observer: ?RunTaskObserver,
 ) ![]u8 {
     const trimmed_prompt = std.mem.trim(u8, prompt, " \t\r\n");
@@ -405,6 +437,9 @@ pub fn runTaskPromptWithObserver(
         .notice = try allocator.dupe(u8, "Running non-interactive task..."),
     };
     defer app.deinit();
+    if (startup_options.openai_auth_mode) |auth_mode| {
+        app.openai_auth_mode = auth_mode;
+    }
     app.refreshFileIndex() catch {};
     app.ensureCurrentConversationVisibleInStrip();
 
@@ -509,6 +544,7 @@ const App = struct {
     stream_task: StreamTask = .idle,
     suspend_requested: bool = false,
     headless: bool = false,
+    openai_auth_mode: OpenAiAuthMode = .auto,
     run_observer: ?RunTaskObserver = null,
 
     notice: []u8,
@@ -854,17 +890,23 @@ const App = struct {
             self.app_state.currentConversation().model_context_window = window;
         }
 
-        const api_key = try self.resolveApiKey(provider_id);
-        if (api_key == null) {
-            try self.setLastAssistantMessage("[local] Missing API key for selected provider.");
-            try self.setNoticeFmt("Set env var for provider {s} and retry. Example: {s}", .{
-                provider_id,
-                firstEnvVarForProvider(self, provider_id) orelse "<PROVIDER>_API_KEY",
-            });
+        const maybe_auth = try self.resolveProviderAuth(provider_id);
+        if (maybe_auth == null) {
+            if (std.mem.eql(u8, provider_id, "openai")) {
+                try self.setLastAssistantMessage("[local] Missing OpenAI auth (API key or Codex subscription token).");
+                try self.setNotice("Set OPENAI_API_KEY, or login with Codex/OpenCode OAuth (CODEX_HOME/auth.json, ~/.codex/auth.json, or ~/.local/share/opencode/auth.json). Optional: ZOLT_OPENAI_AUTH=codex.");
+            } else {
+                try self.setLastAssistantMessage("[local] Missing API key for selected provider.");
+                try self.setNoticeFmt("Set env var for provider {s} and retry. Example: {s}", .{
+                    provider_id,
+                    firstEnvVarForProvider(self, provider_id) orelse "<PROVIDER>_API_KEY",
+                });
+            }
             try self.app_state.saveToPath(self.allocator, self.paths.state_path);
             return;
         }
-        defer self.allocator.free(api_key.?);
+        var auth = maybe_auth.?;
+        defer auth.deinit(self.allocator);
 
         self.is_streaming = true;
         self.stream_was_interrupted = false;
@@ -892,7 +934,7 @@ const App = struct {
 
         var step: usize = 0;
         while (step < TOOL_MAX_STEPS) : (step += 1) {
-            const success = try self.streamAssistantOnce(provider_id, model_id, api_key.?, true);
+            const success = try self.streamAssistantOnce(provider_id, model_id, auth, true);
             if (!success) break;
 
             const assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
@@ -1075,7 +1117,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .system, "[tool-result]\nTool output is already available. Stop calling tools and answer the user directly.");
                 }
                 try self.app_state.appendMessage(self.allocator, .assistant, "");
-                _ = try self.streamAssistantOnce(provider_id, model_id, api_key.?, false);
+                _ = try self.streamAssistantOnce(provider_id, model_id, auth, false);
             }
         }
 
@@ -1085,13 +1127,15 @@ const App = struct {
         try self.app_state.saveToPath(self.allocator, self.paths.state_path);
     }
 
-    fn streamAssistantOnce(self: *App, provider_id: []const u8, model_id: []const u8, api_key: []const u8, include_tool_prompt: bool) !bool {
+    fn streamAssistantOnce(self: *App, provider_id: []const u8, model_id: []const u8, auth: ResolvedProviderAuth, include_tool_prompt: bool) !bool {
         const provider_info = self.catalog.findProviderConst(provider_id);
         const request: provider_client.StreamRequest = .{
             .provider_id = provider_id,
             .model_id = model_id,
-            .api_key = api_key,
-            .base_url = if (provider_info) |info| info.api_base else null,
+            .api_key = auth.bearer_token,
+            .base_url = auth.base_url_override orelse if (provider_info) |info| info.api_base else null,
+            .chatgpt_account_id = auth.chatgpt_account_id,
+            .prefer_responses_api = auth.prefer_responses_api,
             .messages = try self.buildStreamMessages(include_tool_prompt),
         };
         defer self.allocator.free(request.messages);
@@ -2582,22 +2626,86 @@ const App = struct {
         }
 
         if (std.mem.eql(u8, command, "provider")) {
-            const provider_id = parts.next();
-            if (provider_id == null) {
-                try self.setNoticeFmt("Current provider: {s}", .{self.app_state.selected_provider_id});
+            const first_arg = parts.next();
+            if (first_arg == null) {
+                if (std.mem.eql(u8, self.app_state.selected_provider_id, "openai")) {
+                    try self.setNoticeFmt(
+                        "Current provider: openai (auth:{s}). Use /provider [openai] [auto|api_key|codex]",
+                        .{openAiAuthModeLabel(self.openai_auth_mode)},
+                    );
+                } else {
+                    try self.setNoticeFmt("Current provider: {s}. Use /provider <id>", .{self.app_state.selected_provider_id});
+                }
                 return;
             }
 
-            try self.app_state.setSelectedProvider(self.allocator, provider_id.?);
-            if (!self.catalog.hasModel(provider_id.?, self.app_state.selected_model_id)) {
-                if (self.catalog.findProviderConst(provider_id.?)) |provider| {
+            if (parseOpenAiAuthModeName(first_arg.?)) |mode_only| {
+                if (!std.mem.eql(u8, self.app_state.selected_provider_id, "openai")) {
+                    try self.setNotice("OpenAI auth mode only applies when provider is openai.");
+                    return;
+                }
+
+                self.openai_auth_mode = mode_only;
+                var codex_ready = true;
+                if (mode_only == .codex) {
+                    codex_ready = try self.ensureOpenAiCodexLoggedIn();
+                }
+                try self.app_state.saveToPath(self.allocator, self.paths.state_path);
+                if (mode_only == .codex and !codex_ready) {
+                    try self.setNotice("OpenAI auth mode set to codex, but login is still missing. Run `codex login` and retry.");
+                } else {
+                    try self.setNoticeFmt("OpenAI auth mode set to {s}", .{openAiAuthModeLabel(self.openai_auth_mode)});
+                }
+                return;
+            }
+
+            const provider_id = first_arg.?;
+            const maybe_auth_mode_arg = parts.next();
+            if (parts.next() != null) {
+                try self.setNotice("Usage: /provider <id> [auto|api_key|codex]");
+                return;
+            }
+
+            if (!std.mem.eql(u8, provider_id, "openai") and maybe_auth_mode_arg != null) {
+                try self.setNotice("OpenAI auth mode options are only valid with provider 'openai'.");
+                return;
+            }
+
+            var selected_openai_auth_mode = self.openai_auth_mode;
+            if (maybe_auth_mode_arg) |token| {
+                selected_openai_auth_mode = parseOpenAiAuthModeName(token) orelse {
+                    try self.setNotice("Unknown OpenAI auth mode. Use: auto, api_key, codex");
+                    return;
+                };
+            }
+
+            try self.app_state.setSelectedProvider(self.allocator, provider_id);
+            if (!self.catalog.hasModel(provider_id, self.app_state.selected_model_id)) {
+                if (self.catalog.findProviderConst(provider_id)) |provider| {
                     if (provider.models.items.len > 0) {
                         try self.app_state.setSelectedModel(self.allocator, provider.models.items[0].id);
                     }
                 }
             }
+
+            if (std.mem.eql(u8, provider_id, "openai")) {
+                self.openai_auth_mode = selected_openai_auth_mode;
+                var codex_ready = true;
+                if (self.openai_auth_mode == .codex) {
+                    codex_ready = try self.ensureOpenAiCodexLoggedIn();
+                }
+                try self.app_state.saveToPath(self.allocator, self.paths.state_path);
+
+                if (self.openai_auth_mode == .codex and !codex_ready) {
+                    try self.setNotice("Provider set to openai (auth:codex), but login is missing. Run `codex login` and retry.");
+                } else {
+                    try self.setNoticeFmt("Provider set to openai (auth:{s})", .{openAiAuthModeLabel(self.openai_auth_mode)});
+                }
+                return;
+            }
+
             try self.app_state.saveToPath(self.allocator, self.paths.state_path);
-            try self.setNoticeFmt("Provider set to {s}", .{provider_id.?});
+            try self.setNoticeFmt("Provider set to {s}", .{provider_id});
             return;
         }
 
@@ -2790,6 +2898,282 @@ const App = struct {
         }
 
         return null;
+    }
+
+    fn resolveProviderAuth(self: *App, provider_id: []const u8) !?ResolvedProviderAuth {
+        if (std.mem.eql(u8, provider_id, "openai")) {
+            return try self.resolveOpenAiProviderAuth();
+        }
+
+        if (try self.resolveApiKey(provider_id)) |api_key| {
+            return .{
+                .bearer_token = api_key,
+                .source = .api_key_env,
+            };
+        }
+
+        return null;
+    }
+
+    fn resolveOpenAiProviderAuth(self: *App) !?ResolvedProviderAuth {
+        const auth_mode = try self.resolveOpenAiAuthMode();
+        switch (auth_mode) {
+            .codex => {
+                if (try self.resolveOpenAiCodexSubscriptionAuth()) |auth| return auth;
+                if (try self.resolveOpenAiOpenCodeSubscriptionAuth()) |auth| return auth;
+                if (try self.resolveApiKey("openai")) |api_key| {
+                    return .{
+                        .bearer_token = api_key,
+                        .source = .api_key_env,
+                    };
+                }
+                return null;
+            },
+            .api_key => {
+                if (try self.resolveApiKey("openai")) |api_key| {
+                    return .{
+                        .bearer_token = api_key,
+                        .source = .api_key_env,
+                    };
+                }
+                return null;
+            },
+            .auto => {
+                if (try self.resolveApiKey("openai")) |api_key| {
+                    return .{
+                        .bearer_token = api_key,
+                        .source = .api_key_env,
+                    };
+                }
+                if (try self.resolveOpenAiCodexSubscriptionAuth()) |auth| return auth;
+                return try self.resolveOpenAiOpenCodeSubscriptionAuth();
+            },
+        }
+    }
+
+    fn resolveOpenAiAuthMode(self: *App) !OpenAiAuthMode {
+        if (self.openai_auth_mode != .auto) return self.openai_auth_mode;
+
+        const mode_raw = std.process.getEnvVarOwned(self.allocator, "ZOLT_OPENAI_AUTH") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        };
+        if (mode_raw) |text| {
+            defer self.allocator.free(text);
+            if (parseOpenAiAuthModeName(text)) |mode| return mode;
+        }
+        return .auto;
+    }
+
+    fn resolveOpenAiCodexSubscriptionAuth(self: *App) !?ResolvedProviderAuth {
+        const auth_path = try resolveCodexAuthPath(self.allocator) orelse return null;
+        defer self.allocator.free(auth_path);
+
+        var file = openFileForPath(auth_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close();
+
+        const payload = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| switch (err) {
+            error.FileTooBig => return null,
+            else => return err,
+        };
+        defer self.allocator.free(payload);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return null;
+        defer parsed.deinit();
+
+        const root = switch (parsed.value) {
+            .object => |object| object,
+            else => return null,
+        };
+        const tokens_value = root.get("tokens") orelse return null;
+        const tokens = switch (tokens_value) {
+            .object => |object| object,
+            else => return null,
+        };
+
+        const access_token_raw = jsonObjectFieldString(tokens, "access_token") orelse return null;
+        const access_token = std.mem.trim(u8, access_token_raw, " \t\r\n");
+        if (access_token.len == 0) return null;
+
+        const bearer_token = try self.allocator.dupe(u8, access_token);
+        errdefer self.allocator.free(bearer_token);
+
+        var account_id: ?[]u8 = null;
+        errdefer if (account_id) |account| self.allocator.free(account);
+
+        if (jsonObjectFieldString(tokens, "account_id")) |account_raw| {
+            const trimmed = std.mem.trim(u8, account_raw, " \t\r\n");
+            if (trimmed.len > 0) {
+                account_id = try self.allocator.dupe(u8, trimmed);
+            }
+        }
+
+        if (account_id == null) {
+            if (jsonObjectFieldString(tokens, "id_token")) |id_token| {
+                account_id = try extractChatgptAccountIdFromJwtAlloc(self.allocator, id_token);
+            }
+        }
+
+        if (account_id == null) {
+            if (jsonObjectFieldString(tokens, "access_token")) |jwt| {
+                account_id = try extractChatgptAccountIdFromJwtAlloc(self.allocator, jwt);
+            }
+        }
+
+        return .{
+            .bearer_token = bearer_token,
+            .chatgpt_account_id = account_id,
+            .prefer_responses_api = true,
+            .base_url_override = OPENAI_CODEX_BASE_URL,
+            .source = .codex_subscription,
+        };
+    }
+
+    fn resolveOpenAiOpenCodeSubscriptionAuth(self: *App) !?ResolvedProviderAuth {
+        const auth_path = try resolveOpenCodeAuthPath(self.allocator) orelse return null;
+        defer self.allocator.free(auth_path);
+
+        var file = openFileForPath(auth_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close();
+
+        const payload = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| switch (err) {
+            error.FileTooBig => return null,
+            else => return err,
+        };
+        defer self.allocator.free(payload);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return null;
+        defer parsed.deinit();
+
+        const root = switch (parsed.value) {
+            .object => |object| object,
+            else => return null,
+        };
+        const openai_value = root.get("openai") orelse return null;
+        const openai_auth = switch (openai_value) {
+            .object => |object| object,
+            else => return null,
+        };
+
+        const auth_type = jsonObjectFieldString(openai_auth, "type") orelse return null;
+        if (!std.mem.eql(u8, auth_type, "oauth")) return null;
+
+        const access_token_raw = jsonObjectFieldString(openai_auth, "access") orelse return null;
+        const access_token = std.mem.trim(u8, access_token_raw, " \t\r\n");
+        if (access_token.len == 0) return null;
+
+        const bearer_token = try self.allocator.dupe(u8, access_token);
+        errdefer self.allocator.free(bearer_token);
+
+        var account_id: ?[]u8 = null;
+        errdefer if (account_id) |account| self.allocator.free(account);
+
+        if (jsonObjectFieldString(openai_auth, "accountId")) |account_raw| {
+            const trimmed = std.mem.trim(u8, account_raw, " \t\r\n");
+            if (trimmed.len > 0) account_id = try self.allocator.dupe(u8, trimmed);
+        }
+        if (account_id == null) {
+            if (jsonObjectFieldString(openai_auth, "account_id")) |account_raw| {
+                const trimmed = std.mem.trim(u8, account_raw, " \t\r\n");
+                if (trimmed.len > 0) account_id = try self.allocator.dupe(u8, trimmed);
+            }
+        }
+        if (account_id == null) {
+            account_id = try extractChatgptAccountIdFromJwtAlloc(self.allocator, access_token);
+        }
+
+        return .{
+            .bearer_token = bearer_token,
+            .chatgpt_account_id = account_id,
+            .prefer_responses_api = true,
+            .base_url_override = OPENAI_CODEX_BASE_URL,
+            .source = .codex_subscription,
+        };
+    }
+
+    fn hasOpenAiSubscriptionAuth(self: *App) !bool {
+        if (try self.resolveOpenAiCodexSubscriptionAuth()) |auth| {
+            var owned = auth;
+            owned.deinit(self.allocator);
+            return true;
+        }
+        if (try self.resolveOpenAiOpenCodeSubscriptionAuth()) |auth| {
+            var owned = auth;
+            owned.deinit(self.allocator);
+            return true;
+        }
+        return false;
+    }
+
+    fn ensureOpenAiCodexLoggedIn(self: *App) !bool {
+        if (try self.hasOpenAiSubscriptionAuth()) return true;
+        if (self.headless) return false;
+
+        try self.setNotice("No Codex/OpenCode OAuth token found. Running `codex login`...");
+        try self.render();
+
+        const login_ok = try self.runCodexLoginCommand();
+        if (!login_ok) {
+            try self.setNotice("Codex login failed. Run `codex login` manually and retry.");
+            return false;
+        }
+
+        if (try self.hasOpenAiSubscriptionAuth()) return true;
+        try self.setNotice("Codex login completed but no auth token was found. Run `codex login` manually.");
+        return false;
+    }
+
+    fn runCodexLoginCommand(self: *App) !bool {
+        const stdin_handle = std.fs.File.stdin().handle;
+        const raw_termios = std.posix.tcgetattr(stdin_handle) catch null;
+        if (raw_termios) |raw| {
+            var cooked = raw;
+            cooked.iflag.ICRNL = true;
+            cooked.iflag.IXON = true;
+            cooked.lflag.ECHO = true;
+            cooked.lflag.ICANON = true;
+            cooked.lflag.ISIG = true;
+            cooked.lflag.IEXTEN = true;
+            cooked.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+            cooked.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+            std.posix.tcsetattr(stdin_handle, .NOW, cooked) catch {};
+            defer std.posix.tcsetattr(stdin_handle, .NOW, raw) catch {};
+        }
+
+        _ = std.posix.write(std.fs.File.stdout().handle, "\nLaunching codex login...\n") catch {};
+
+        var child = std.process.Child.init(&.{ "codex", "login" }, self.allocator);
+        child.cwd = ".";
+        child.stdin_behavior = .Inherit;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+        child.spawn() catch |err| switch (err) {
+            error.FileNotFound => {
+                try self.setNotice("`codex` not found in PATH. Install codex CLI or run with OPENAI_API_KEY.");
+                return false;
+            },
+            else => return err,
+        };
+        child.waitForSpawn() catch |err| {
+            try self.setNoticeFmt("Failed to start codex login: {s}", .{@errorName(err)});
+            return false;
+        };
+
+        const term = child.wait() catch |err| {
+            try self.setNoticeFmt("codex login wait failed: {s}", .{@errorName(err)});
+            return false;
+        };
+
+        return switch (term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
     }
 
     fn setNotice(self: *App, text: []const u8) !void {
@@ -3239,6 +3623,7 @@ const App = struct {
             .slash_commands => parseSlashCommandPickerQuery(self.input_buffer.items, self.input_cursor),
             .quick_actions => parseQuickActionPickerQuery(self.input_buffer.items, self.input_cursor),
             .conversation_switch => parseConversationSwitchPickerQuery(self.input_buffer.items, self.input_cursor),
+            .provider_options => parseProviderPickerQuery(self.input_buffer.items, self.input_cursor),
         };
     }
 
@@ -3246,6 +3631,9 @@ const App = struct {
         const maybe_kind_query: ?struct { kind: CommandPickerKind, query: []const u8 } = blk: {
             if (parseConversationSwitchPickerQuery(self.input_buffer.items, self.input_cursor)) |query| {
                 break :blk .{ .kind = .conversation_switch, .query = query };
+            }
+            if (parseProviderPickerQuery(self.input_buffer.items, self.input_cursor)) |query| {
+                break :blk .{ .kind = .provider_options, .query = query };
             }
             if (parseQuickActionPickerQuery(self.input_buffer.items, self.input_cursor)) |query| {
                 break :blk .{ .kind = .quick_actions, .query = query };
@@ -3535,6 +3923,9 @@ const App = struct {
                     if (conversationMatchesQuery(conversation, query)) count += 1;
                 }
             },
+            .provider_options => {
+                count = self.providerPickerMatchCount(query);
+            },
         }
         return count;
     }
@@ -3566,6 +3957,51 @@ const App = struct {
             if (!quickActionMatchesQuery(entry, query)) continue;
             if (seen == target_index) return entry;
             seen += 1;
+        }
+        return null;
+    }
+
+    fn providerPickerMatchCount(self: *App, query: []const u8) usize {
+        var count: usize = 0;
+        var included_openai_auth_options = false;
+        for (self.catalog.providers.items) |provider| {
+            const provider_entry: ProviderPickerEntry = .{
+                .command_suffix = provider.id,
+                .description = provider.name,
+            };
+            if (providerPickerEntryMatches(provider_entry, query)) count += 1;
+
+            if (!included_openai_auth_options and std.mem.eql(u8, provider.id, "openai")) {
+                included_openai_auth_options = true;
+                for (PROVIDER_PICKER_OPENAI_AUTH_OPTIONS) |auth_entry| {
+                    if (providerPickerEntryMatches(auth_entry, query)) count += 1;
+                }
+            }
+        }
+        return count;
+    }
+
+    fn providerPickerNthMatch(self: *App, query: []const u8, target_index: usize) ?ProviderPickerEntry {
+        var seen: usize = 0;
+        var included_openai_auth_options = false;
+        for (self.catalog.providers.items) |provider| {
+            const provider_entry: ProviderPickerEntry = .{
+                .command_suffix = provider.id,
+                .description = provider.name,
+            };
+            if (providerPickerEntryMatches(provider_entry, query)) {
+                if (seen == target_index) return provider_entry;
+                seen += 1;
+            }
+
+            if (!included_openai_auth_options and std.mem.eql(u8, provider.id, "openai")) {
+                included_openai_auth_options = true;
+                for (PROVIDER_PICKER_OPENAI_AUTH_OPTIONS) |auth_entry| {
+                    if (!providerPickerEntryMatches(auth_entry, query)) continue;
+                    if (seen == target_index) return auth_entry;
+                    seen += 1;
+                }
+            }
         }
         return null;
     }
@@ -3644,6 +4080,18 @@ const App = struct {
             self.input_buffer.clearRetainingCapacity();
             self.input_cursor = 0;
             try self.executeQuickAction(selected);
+        } else if (self.command_picker_kind == .provider_options) {
+            const selected = self.providerPickerNthMatch(query, self.command_picker_index) orelse return;
+            self.input_buffer.clearRetainingCapacity();
+            try self.input_buffer.appendSlice(self.allocator, "/provider ");
+            try self.input_buffer.appendSlice(self.allocator, selected.command_suffix);
+            self.input_cursor = self.input_buffer.items.len;
+            self.command_picker_open = false;
+            self.command_picker_kind = .slash_commands;
+            self.command_picker_index = 0;
+            self.command_picker_scroll = 0;
+            try self.setNoticeFmt("Inserted /provider {s}", .{selected.command_suffix});
+            self.syncPickersFromInput();
         } else if (self.command_picker_kind == .conversation_switch) {
             var ordered_matches = try collectConversationSwitchMatchOrder(
                 self.allocator,
@@ -3835,7 +4283,14 @@ const App = struct {
             self.allocator,
             "{s} ({d}) query:{s}",
             .{
-                if (self.command_picker_kind == .conversation_switch) "conversation sessions" else if (self.command_picker_kind == .quick_actions) "command palette" else "command picker",
+                if (self.command_picker_kind == .conversation_switch)
+                    "conversation sessions"
+                else if (self.command_picker_kind == .quick_actions)
+                    "command palette"
+                else if (self.command_picker_kind == .provider_options)
+                    "provider picker"
+                else
+                    "command picker",
                 total,
                 if (query.len == 0) "*" else query,
             },
@@ -3883,6 +4338,13 @@ const App = struct {
                     self.allocator,
                     "{s}{s} {s}  {s}  {s}",
                     .{ marker, current_marker, conversation.id, age_label, title },
+                );
+            } else if (self.command_picker_kind == .provider_options) blk: {
+                const selected_entry = self.providerPickerNthMatch(query, index) orelse continue;
+                break :blk try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s} /provider {s}  {s}",
+                    .{ marker, selected_entry.command_suffix, selected_entry.description },
                 );
             } else blk: {
                 const selected_entry = self.commandPickerNthMatch(query, index) orelse continue;
@@ -4721,10 +5183,15 @@ const QuickActionEntry = struct {
     keywords: []const u8 = "",
 };
 
+const ProviderPickerEntry = struct {
+    command_suffix: []const u8,
+    description: []const u8,
+};
+
 const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "help", .description = "open command palette", .insert_trailing_space = false },
     .{ .name = "commands", .description = "open quick action palette", .insert_trailing_space = false },
-    .{ .name = "provider", .description = "set/show provider id" },
+    .{ .name = "provider", .description = "set provider (+ openai auth mode)" },
     .{ .name = "model", .description = "pick or set model id" },
     .{ .name = "models", .description = "list models cache / refresh" },
     .{ .name = "files", .description = "show file index / refresh" },
@@ -4748,6 +5215,12 @@ const QUICK_ACTIONS = [_]QuickActionEntry{
     .{ .id = .toggle_ui_density, .label = "Toggle UI density", .description = "switch compact/comfy UI", .keywords = "compact comfy ui" },
     .{ .id = .toggle_theme, .label = "Toggle theme", .description = "cycle codex/plain/forest", .keywords = "theme colors" },
     .{ .id = .show_help, .label = "Show help", .description = "open command palette", .keywords = "help commands palette" },
+};
+
+const PROVIDER_PICKER_OPENAI_AUTH_OPTIONS = [_]ProviderPickerEntry{
+    .{ .command_suffix = "openai auto", .description = "openai provider + auto auth mode" },
+    .{ .command_suffix = "openai api_key", .description = "openai provider + API key auth mode" },
+    .{ .command_suffix = "openai codex", .description = "openai provider + codex subscription auth mode" },
 };
 
 fn parseSlashCommandPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
@@ -4792,6 +5265,20 @@ fn parseConversationSwitchPickerQuery(input: []const u8, cursor: usize) ?[]const
     return null;
 }
 
+fn parseProviderPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
+    if (!std.mem.startsWith(u8, input, "/provider")) return null;
+    const command_len: usize = 9;
+    if (cursor < command_len) return null;
+
+    if (input.len == command_len) return "";
+    if (input.len > command_len and input[command_len] == ' ') {
+        const query_start: usize = command_len + 1;
+        const query_cursor = @max(query_start, @min(cursor, input.len));
+        return std.mem.trimLeft(u8, input[query_start..query_cursor], " ");
+    }
+    return null;
+}
+
 fn commandMatchesQuery(entry: BuiltinCommandEntry, query: []const u8) bool {
     if (query.len == 0) return true;
     return containsAsciiIgnoreCase(entry.name, query) or containsAsciiIgnoreCase(entry.description, query);
@@ -4807,6 +5294,12 @@ fn quickActionMatchesQuery(entry: QuickActionEntry, query: []const u8) bool {
 fn conversationMatchesQuery(conversation: *const Conversation, query: []const u8) bool {
     if (query.len == 0) return true;
     return containsAsciiIgnoreCase(conversation.id, query) or containsAsciiIgnoreCase(conversation.title, query);
+}
+
+fn providerPickerEntryMatches(entry: ProviderPickerEntry, query: []const u8) bool {
+    if (query.len == 0) return true;
+    return containsAsciiIgnoreCase(entry.command_suffix, query) or
+        containsAsciiIgnoreCase(entry.description, query);
 }
 
 const ConversationRelativeAge = struct {
@@ -6632,11 +7125,127 @@ fn jsonValueObjectField(value: std.json.Value, key: []const u8) ?std.json.Value 
     };
 }
 
+fn jsonObjectFieldString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
 fn jsonValueFirstArrayItem(value: std.json.Value) ?std.json.Value {
     return switch (value) {
         .array => |array| if (array.items.len > 0) array.items[0] else null,
         else => null,
     };
+}
+
+fn resolveCodexAuthPath(allocator: std.mem.Allocator) !?[]u8 {
+    const from_codex_home = std.process.getEnvVarOwned(allocator, "CODEX_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    if (from_codex_home) |codex_home| {
+        defer allocator.free(codex_home);
+        return @as(?[]u8, try std.fs.path.join(allocator, &.{ codex_home, "auth.json" }));
+    }
+
+    const from_home = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    if (from_home) |home| {
+        defer allocator.free(home);
+        return @as(?[]u8, try std.fs.path.join(allocator, &.{ home, ".codex", "auth.json" }));
+    }
+
+    return null;
+}
+
+fn resolveOpenCodeAuthPath(allocator: std.mem.Allocator) !?[]u8 {
+    const from_data_home = std.process.getEnvVarOwned(allocator, "XDG_DATA_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    if (from_data_home) |data_home| {
+        defer allocator.free(data_home);
+        return @as(?[]u8, try std.fs.path.join(allocator, &.{ data_home, "opencode", "auth.json" }));
+    }
+
+    const from_home = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    if (from_home) |home| {
+        defer allocator.free(home);
+        return @as(?[]u8, try std.fs.path.join(allocator, &.{ home, ".local", "share", "opencode", "auth.json" }));
+    }
+
+    return null;
+}
+
+fn extractChatgptAccountIdFromJwtAlloc(allocator: std.mem.Allocator, jwt: []const u8) !?[]u8 {
+    var parts = std.mem.splitScalar(u8, jwt, '.');
+    _ = parts.next() orelse return null;
+    const payload_b64 = parts.next() orelse return null;
+    _ = parts.next() orelse return null;
+
+    const decoded_cap = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload_b64) catch return null;
+    if (decoded_cap == 0) return null;
+
+    const decoded_payload = try allocator.alloc(u8, decoded_cap);
+    defer allocator.free(decoded_payload);
+
+    std.base64.url_safe_no_pad.Decoder.decode(decoded_payload, payload_b64) catch return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded_payload, .{}) catch return null;
+    defer parsed.deinit();
+
+    const claims = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+
+    const raw_account = extractChatgptAccountIdFromClaims(claims) orelse return null;
+    const account_id = std.mem.trim(u8, raw_account, " \t\r\n");
+    if (account_id.len == 0) return null;
+    return @as(?[]u8, try allocator.dupe(u8, account_id));
+}
+
+fn extractChatgptAccountIdFromClaims(claims: std.json.ObjectMap) ?[]const u8 {
+    if (jsonObjectFieldString(claims, "chatgpt_account_id")) |account_id| {
+        return account_id;
+    }
+
+    if (claims.get("https://api.openai.com/auth")) |auth_value| {
+        switch (auth_value) {
+            .object => |auth_object| {
+                if (jsonObjectFieldString(auth_object, "chatgpt_account_id")) |account_id| {
+                    return account_id;
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (claims.get("organizations")) |organizations_value| {
+        switch (organizations_value) {
+            .array => |organizations| {
+                for (organizations.items) |entry| {
+                    switch (entry) {
+                        .object => |organization| {
+                            if (jsonObjectFieldString(organization, "id")) |account_id| {
+                                return account_id;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    return null;
 }
 
 fn openDirForPath(path: []const u8, flags: std.fs.Dir.OpenOptions) !std.fs.Dir {
@@ -6792,6 +7401,22 @@ fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (matched) return true;
     }
     return false;
+}
+
+fn parseOpenAiAuthModeName(input: []const u8) ?OpenAiAuthMode {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(trimmed, "api_key")) return .api_key;
+    if (std.ascii.eqlIgnoreCase(trimmed, "codex")) return .codex;
+    return null;
+}
+
+fn openAiAuthModeLabel(mode: OpenAiAuthMode) []const u8 {
+    return switch (mode) {
+        .auto => "auto",
+        .api_key => "api_key",
+        .codex => "codex",
+    };
 }
 
 fn fallbackEnvVars(provider_id: []const u8) []const []const u8 {
@@ -7284,6 +7909,15 @@ test "parseConversationSwitchPickerQuery handles /sessions and /switch queries" 
     try std.testing.expect(parseConversationSwitchPickerQuery("/swit", 5) == null);
 }
 
+test "parseProviderPickerQuery handles /provider argument edits" {
+    try std.testing.expectEqualStrings("", parseProviderPickerQuery("/provider", 9).?);
+    try std.testing.expectEqualStrings("", parseProviderPickerQuery("/provider ", 10).?);
+    try std.testing.expectEqualStrings("op", parseProviderPickerQuery("/provider op", 12).?);
+    try std.testing.expectEqualStrings("openai codex", parseProviderPickerQuery("/provider openai codex", 22).?);
+    try std.testing.expect(parseProviderPickerQuery("/provider", 4) == null);
+    try std.testing.expect(parseProviderPickerQuery("/providerx", 10) == null);
+}
+
 test "collectConversationSwitchMatchOrder sorts newest conversations first" {
     const allocator = std.testing.allocator;
     var conversations = [_]Conversation{
@@ -7746,4 +8380,52 @@ test "buildStreamingNotice includes task and elapsed timer" {
 
     try std.testing.expect(std.mem.indexOf(u8, notice, "Running READ (5s") != null);
     try std.testing.expect(std.mem.indexOf(u8, notice, "esc to interrupt") != null);
+}
+
+test "parseOpenAiAuthModeName supports known values" {
+    try std.testing.expect(parseOpenAiAuthModeName("auto").? == .auto);
+    try std.testing.expect(parseOpenAiAuthModeName("api_key").? == .api_key);
+    try std.testing.expect(parseOpenAiAuthModeName("codex").? == .codex);
+    try std.testing.expect(parseOpenAiAuthModeName("unknown") == null);
+}
+
+test "extractChatgptAccountIdFromJwtAlloc parses nested auth claim" {
+    const allocator = std.testing.allocator;
+
+    const payload_json =
+        \\{"https://api.openai.com/auth":{"chatgpt_account_id":"acc_nested_123"}}
+    ;
+    const payload_len = std.base64.url_safe_no_pad.Encoder.calcSize(payload_json.len);
+    const payload_b64 = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload_b64);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(payload_b64, payload_json);
+
+    const header = "e30"; // {}
+    const signature = "c2ln"; // sig
+    const jwt = try std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ header, payload_b64, signature });
+    defer allocator.free(jwt);
+
+    const account_id = try extractChatgptAccountIdFromJwtAlloc(allocator, jwt);
+    defer if (account_id) |value| allocator.free(value);
+
+    try std.testing.expect(account_id != null);
+    try std.testing.expectEqualStrings("acc_nested_123", account_id.?);
+}
+
+test "extractChatgptAccountIdFromClaims supports organizations fallback" {
+    const allocator = std.testing.allocator;
+    const payload_json =
+        \\{"organizations":[{"id":"org_abc"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    const claims = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const account_id = extractChatgptAccountIdFromClaims(claims);
+    try std.testing.expect(account_id != null);
+    try std.testing.expectEqualStrings("org_abc", account_id.?);
 }

@@ -14,11 +14,18 @@ pub const UiMode = enum {
     comfy,
 };
 
+pub const OpenAiAuthMode = enum {
+    auto,
+    api_key,
+    codex,
+};
+
 pub const Config = struct {
     provider_id: ?[]u8 = null,
     model_id: ?[]u8 = null,
     theme: ?Theme = null,
     ui_mode: ?UiMode = null,
+    openai_auth_mode: ?OpenAiAuthMode = null,
     keybindings: ?keybindings.Keybindings = null,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
@@ -38,6 +45,8 @@ const RawConfig = struct {
     ui: ?[]const u8 = null,
     ui_mode: ?[]const u8 = null,
     compact_mode: ?bool = null,
+    openai_auth: ?[]const u8 = null,
+    openai_auth_mode: ?[]const u8 = null,
     keybindings: ?RawKeybindings = null,
     hotkeys: ?RawKeybindings = null,
 };
@@ -126,6 +135,11 @@ fn configFromRaw(allocator: std.mem.Allocator, raw: RawConfig) !Config {
         config.ui_mode = if (compact_mode) .compact else .comfy;
     }
 
+    if (raw.openai_auth orelse raw.openai_auth_mode) |auth_mode_name| {
+        const parsed = parseOpenAiAuthModeName(auth_mode_name) orelse return error.InvalidOpenAiAuthMode;
+        config.openai_auth_mode = parsed;
+    }
+
     if (raw.keybindings orelse raw.hotkeys) |raw_keybindings| {
         config.keybindings = try parseKeybindings(raw_keybindings);
     }
@@ -183,6 +197,14 @@ fn parseUiModeName(input: []const u8) ?UiMode {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
     if (std.ascii.eqlIgnoreCase(trimmed, "compact")) return .compact;
     if (std.ascii.eqlIgnoreCase(trimmed, "comfy")) return .comfy;
+    return null;
+}
+
+fn parseOpenAiAuthModeName(input: []const u8) ?OpenAiAuthMode {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(trimmed, "api_key")) return .api_key;
+    if (std.ascii.eqlIgnoreCase(trimmed, "codex")) return .codex;
     return null;
 }
 
@@ -274,7 +296,8 @@ test "parse jsonc config with comments and aliases" {
         \\  "selected_model_id": "gpt-4.1",
         \\  "theme": "plain",
         \\  /* legacy bool form */
-        \\  "compact_mode": false
+        \\  "compact_mode": false,
+        \\  "openai_auth": "codex"
         \\}
     ;
 
@@ -285,6 +308,7 @@ test "parse jsonc config with comments and aliases" {
     try std.testing.expectEqualStrings("gpt-4.1", config.model_id.?);
     try std.testing.expect(config.theme.? == .plain);
     try std.testing.expect(config.ui_mode.? == .comfy);
+    try std.testing.expect(config.openai_auth_mode.? == .codex);
 }
 
 test "stripJsonCommentsAlloc preserves comment-like text inside strings" {
@@ -330,4 +354,19 @@ test "parse jsonc keybindings overrides" {
     try std.testing.expectEqual(@as(u8, 15), bindings.normal.command_palette);
     try std.testing.expectEqual(@as(u8, 10), bindings.insert.picker_next);
     try std.testing.expectEqual(@as(u8, 25), bindings.insert.paste_image);
+}
+
+test "parse jsonc openai auth aliases" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  "openai_auth_mode": "api_key"
+        \\}
+    ;
+
+    var config = try parseConfigJsonc(allocator, input);
+    defer config.deinit(allocator);
+
+    try std.testing.expect(config.openai_auth_mode != null);
+    try std.testing.expect(config.openai_auth_mode.? == .api_key);
 }
