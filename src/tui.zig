@@ -5799,6 +5799,68 @@ fn containsWhitespace(text: []const u8) bool {
     return false;
 }
 
+fn findGitTopLevelAlloc(allocator: std.mem.Allocator) !?[]u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "git", "rev-parse", "--show-toplevel" },
+        .cwd = ".",
+        .max_output_bytes = 16 * 1024,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return @as(?[]u8, try allocator.dupe(u8, trimmed));
+}
+
+fn pathHasRootPrefix(path: []const u8, root: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    if (path.len == root.len) return true;
+    const next = path[root.len];
+    return next == '/' or next == '\\';
+}
+
+fn formatInjectedPathForSummaryAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    cwd: ?[]const u8,
+    repo_root: ?[]const u8,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, path, " \t\r\n");
+    if (trimmed.len == 0) return allocator.dupe(u8, path);
+
+    var absolute_path_owned: ?[]u8 = null;
+    defer if (absolute_path_owned) |owned| allocator.free(owned);
+
+    const absolute_path = blk: {
+        if (std.fs.path.isAbsolute(trimmed)) break :blk trimmed;
+        if (cwd) |cwd_path| {
+            absolute_path_owned = try std.fs.path.join(allocator, &.{ cwd_path, trimmed });
+            break :blk absolute_path_owned.?;
+        }
+        break :blk trimmed;
+    };
+
+    if (repo_root) |root| {
+        if (pathHasRootPrefix(absolute_path, root)) {
+            const suffix = std.mem.trimLeft(u8, absolute_path[root.len..], "/\\");
+            if (suffix.len == 0) return allocator.dupe(u8, ".");
+            return allocator.dupe(u8, suffix);
+        }
+    }
+
+    return allocator.dupe(u8, trimmed);
+}
+
 const FileInjectResult = struct {
     payload: ?[]u8 = null,
     referenced_count: usize = 0,
@@ -5817,6 +5879,12 @@ fn buildFileInjectionPayload(allocator: std.mem.Allocator, prompt: []const u8) !
 
     var body_writer: std.Io.Writer.Allocating = .init(allocator);
     defer body_writer.deinit();
+    var included_paths: std.ArrayList([]const u8) = .empty;
+    defer included_paths.deinit(allocator);
+    const cwd = std.process.getCwdAlloc(allocator) catch null;
+    defer if (cwd) |path| allocator.free(path);
+    const repo_root = findGitTopLevelAlloc(allocator) catch null;
+    defer if (repo_root) |path| allocator.free(path);
 
     var included_count: usize = 0;
     var skipped_count: usize = 0;
@@ -5839,6 +5907,7 @@ fn buildFileInjectionPayload(allocator: std.mem.Allocator, prompt: []const u8) !
         };
         if (image_info) |info| {
             included_count += 1;
+            try included_paths.append(allocator, path);
             try body_writer.writer.print(
                 "<image path=\"{s}\" mime=\"{s}\" format=\"{s}\" bytes=\"{d}\"",
                 .{ path, info.mime, info.format, info.bytes },
@@ -5862,6 +5931,7 @@ fn buildFileInjectionPayload(allocator: std.mem.Allocator, prompt: []const u8) !
         }
 
         included_count += 1;
+        try included_paths.append(allocator, path);
         try body_writer.writer.print("<file path=\"{s}\">\n", .{path});
         try body_writer.writer.writeAll(file_content);
         if (file_content.len == 0 or file_content[file_content.len - 1] != '\n') {
@@ -5885,9 +5955,23 @@ fn buildFileInjectionPayload(allocator: std.mem.Allocator, prompt: []const u8) !
     defer payload_writer.deinit();
 
     try payload_writer.writer.print(
-        "{s} included:{d} referenced:{d} skipped:{d}\n",
+        "{s} included:{d} referenced:{d} skipped:{d}",
         .{ FILE_INJECT_HEADER, included_count, references.items.len, skipped_count },
     );
+    if (included_paths.items.len > 0) {
+        try payload_writer.writer.writeAll(" read: ");
+        const shown = @min(included_paths.items.len, @as(usize, 3));
+        for (included_paths.items[0..shown], 0..) |path, idx| {
+            if (idx > 0) try payload_writer.writer.writeAll(", ");
+            const display_name = try formatInjectedPathForSummaryAlloc(allocator, path, cwd, repo_root);
+            defer allocator.free(display_name);
+            try payload_writer.writer.writeAll(display_name);
+        }
+        if (included_paths.items.len > shown) {
+            try payload_writer.writer.print(" (+{d} more)", .{included_paths.items.len - shown});
+        }
+    }
+    try payload_writer.writer.writeByte('\n');
     try payload_writer.writer.writeAll(
         "The user referenced these files with @path. Treat this as project context. For <image .../> entries use <VIEW_IMAGE> to inspect metadata.\n",
     );
