@@ -7,6 +7,7 @@ const keybindings = @import("keybindings.zig");
 const models = @import("models.zig");
 const patch_tool = @import("patch_tool.zig");
 const provider_client = @import("provider_client.zig");
+const tools_runtime = @import("tools/runtime.zig");
 const Paths = @import("paths.zig").Paths;
 const AppState = @import("state.zig").AppState;
 const Conversation = @import("state.zig").Conversation;
@@ -1273,848 +1274,43 @@ const App = struct {
     }
 
     fn runReadToolCommand(self: *App, command_text: []const u8) ![]u8 {
-        var parsed_args = try std.process.ArgIteratorGeneral(.{ .single_quotes = true }).init(self.allocator, command_text);
-        defer parsed_args.deinit();
-
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(self.allocator);
-
-        while (parsed_args.next()) |token| {
-            try argv.append(self.allocator, token);
-            if (argv.items.len > 64) {
-                return std.fmt.allocPrint(self.allocator, "[read-result]\ncommand: {s}\nerror: too many arguments", .{command_text});
-            }
-        }
-
-        if (argv.items.len == 0) {
-            return std.fmt.allocPrint(self.allocator, "[read-result]\ncommand: {s}\nerror: empty command", .{command_text});
-        }
-
-        if (!isAllowedReadCommand(argv.items)) {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[read-result]\ncommand: {s}\nerror: command not allowed ({s})",
-                .{ command_text, argv.items[0] },
-            );
-        }
-
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
-            .argv = argv.items,
-            .cwd = ".",
-            .max_output_bytes = READ_TOOL_MAX_OUTPUT_BYTES,
-        }) catch |err| {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[read-result]\ncommand: {s}\nerror: {s}",
-                .{ command_text, @errorName(err) },
-            );
-        };
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
-
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
-
-        try output.writer.print("[read-result]\ncommand: {s}\nterm: ", .{command_text});
-        switch (result.term) {
-            .Exited => |code| try output.writer.print("exited:{d}\n", .{code}),
-            .Signal => |sig| try output.writer.print("signal:{d}\n", .{sig}),
-            .Stopped => |sig| try output.writer.print("stopped:{d}\n", .{sig}),
-            .Unknown => |code| try output.writer.print("unknown:{d}\n", .{code}),
-        }
-
-        if (result.stdout.len > 0) {
-            try output.writer.writeAll("stdout:\n");
-            try output.writer.writeAll(result.stdout);
-            if (result.stdout[result.stdout.len - 1] != '\n') try output.writer.writeByte('\n');
-        }
-
-        if (result.stderr.len > 0) {
-            try output.writer.writeAll("stderr:\n");
-            try output.writer.writeAll(result.stderr);
-            if (result.stderr[result.stderr.len - 1] != '\n') try output.writer.writeByte('\n');
-        }
-
-        if (result.stdout.len == 0 and result.stderr.len == 0) {
-            try output.writer.writeAll("stdout:\n(no output)\n");
-        }
-
-        return output.toOwnedSlice();
+        return tools_runtime.runReadToolCommand(self, command_text);
     }
 
     fn runListDirToolPayload(self: *App, payload: []const u8) ![]u8 {
-        const input = parseListDirInput(self.allocator, payload) catch {
-            return self.allocator.dupe(u8, "[list-dir-result]\nerror: invalid payload (expected plain path or JSON with path, recursive, max_entries)");
-        };
-        defer self.allocator.free(input.path);
-
-        var dir = openDirForPath(input.path, .{ .iterate = true }) catch |err| {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[list-dir-result]\npath: {s}\nerror: {s}",
-                .{ input.path, @errorName(err) },
-            );
-        };
-        defer dir.close();
-
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
-        try output.writer.print(
-            "[list-dir-result]\npath: {s}\nrecursive: {s}\nmax_entries: {d}\n",
-            .{ input.path, if (input.recursive) "true" else "false", input.max_entries },
-        );
-
-        var count: u32 = 0;
-        var truncated = false;
-
-        if (input.recursive) {
-            var walker = try dir.walk(self.allocator);
-            defer walker.deinit();
-
-            while (true) {
-                const entry = walker.next() catch |err| {
-                    try output.writer.print("error: {s}\n", .{@errorName(err)});
-                    break;
-                };
-                if (entry == null) break;
-
-                if (count >= input.max_entries) {
-                    truncated = true;
-                    break;
-                }
-                count += 1;
-                try output.writer.print(
-                    "{d}. [{s}] {s}\n",
-                    .{ count, dirEntryKindLabel(entry.?.kind), entry.?.path },
-                );
-            }
-        } else {
-            var iterator = dir.iterate();
-            while (true) {
-                const entry = iterator.next() catch |err| {
-                    try output.writer.print("error: {s}\n", .{@errorName(err)});
-                    break;
-                };
-                if (entry == null) break;
-
-                if (count >= input.max_entries) {
-                    truncated = true;
-                    break;
-                }
-                count += 1;
-                try output.writer.print(
-                    "{d}. [{s}] {s}\n",
-                    .{ count, dirEntryKindLabel(entry.?.kind), entry.?.name },
-                );
-            }
-        }
-
-        if (count == 0) {
-            try output.writer.writeAll("note: no entries\n");
-        }
-        if (truncated) {
-            try output.writer.writeAll("note: truncated by max_entries\n");
-        }
-
-        return output.toOwnedSlice();
+        return tools_runtime.runListDirToolPayload(self, payload);
     }
 
     fn runReadFileToolPayload(self: *App, payload: []const u8) ![]u8 {
-        const input = parseReadFileInput(self.allocator, payload) catch {
-            return self.allocator.dupe(u8, "[read-file-result]\nerror: invalid payload (expected plain path or JSON with path and optional max_bytes)");
-        };
-        defer self.allocator.free(input.path);
-
-        var file = openFileForPath(input.path, .{}) catch |err| {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[read-file-result]\npath: {s}\nerror: {s}",
-                .{ input.path, @errorName(err) },
-            );
-        };
-        defer file.close();
-
-        const content = file.readToEndAlloc(self.allocator, input.max_bytes) catch |err| switch (err) {
-            error.FileTooBig => return std.fmt.allocPrint(
-                self.allocator,
-                "[read-file-result]\npath: {s}\nerror: file too big (max_bytes:{d})",
-                .{ input.path, input.max_bytes },
-            ),
-            else => return std.fmt.allocPrint(
-                self.allocator,
-                "[read-file-result]\npath: {s}\nerror: {s}",
-                .{ input.path, @errorName(err) },
-            ),
-        };
-        defer self.allocator.free(content);
-
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
-        try output.writer.print(
-            "[read-file-result]\npath: {s}\nbytes: {d}\n",
-            .{ input.path, content.len },
-        );
-        if (looksBinary(content)) {
-            try output.writer.writeAll("note: file appears binary; content omitted\n");
-            return output.toOwnedSlice();
-        }
-
-        try output.writer.writeAll("content:\n");
-        try output.writer.writeAll(content);
-        if (content.len == 0 or content[content.len - 1] != '\n') {
-            try output.writer.writeByte('\n');
-        }
-        return output.toOwnedSlice();
+        return tools_runtime.runReadFileToolPayload(self, payload);
     }
 
     fn runGrepFilesToolPayload(self: *App, payload: []const u8) ![]u8 {
-        var input = parseGrepFilesInput(self.allocator, payload) catch {
-            return self.allocator.dupe(u8, "[grep-files-result]\nerror: invalid payload (expected plain query or JSON with query/path/glob/max_matches)");
-        };
-        defer input.deinit(self.allocator);
-
-        if (input.query.len == 0) {
-            return self.allocator.dupe(u8, "[grep-files-result]\nerror: empty query");
-        }
-
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(self.allocator);
-        try argv.appendSlice(self.allocator, &.{
-            "rg",
-            "--line-number",
-            "--column",
-            "--no-heading",
-            "--color",
-            "never",
-            "--smart-case",
-        });
-        if (input.glob) |glob| {
-            try argv.appendSlice(self.allocator, &.{ "--glob", glob });
-        }
-        try argv.append(self.allocator, input.query);
-        try argv.append(self.allocator, input.path);
-
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
-            .argv = argv.items,
-            .cwd = ".",
-            .max_output_bytes = GREP_FILES_MAX_OUTPUT_BYTES,
-        }) catch |err| {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[grep-files-result]\nquery: {s}\npath: {s}\nerror: {s}",
-                .{ input.query, input.path, @errorName(err) },
-            );
-        };
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
-
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
-
-        try output.writer.print("[grep-files-result]\nquery: {s}\npath: {s}\n", .{ input.query, input.path });
-        if (input.glob) |glob| try output.writer.print("glob: {s}\n", .{glob});
-
-        const exit_code = switch (result.term) {
-            .Exited => |code| code,
-            .Signal => |sig| return std.fmt.allocPrint(self.allocator, "[grep-files-result]\nerror: rg terminated by signal {d}", .{sig}),
-            .Stopped => |sig| return std.fmt.allocPrint(self.allocator, "[grep-files-result]\nerror: rg stopped by signal {d}", .{sig}),
-            .Unknown => |code| return std.fmt.allocPrint(self.allocator, "[grep-files-result]\nerror: rg unknown term {d}", .{code}),
-        };
-
-        if (exit_code == 1) {
-            try output.writer.writeAll("matches: 0\nnote: no matches\n");
-            return output.toOwnedSlice();
-        }
-        if (exit_code != 0) {
-            const stderr_trimmed = std.mem.trim(u8, result.stderr, " \t\r\n");
-            if (stderr_trimmed.len > 0) {
-                try output.writer.print("error: rg failed ({d}) {s}\n", .{ exit_code, stderr_trimmed });
-            } else {
-                try output.writer.print("error: rg failed ({d})\n", .{exit_code});
-            }
-            return output.toOwnedSlice();
-        }
-
-        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
-        var total_matches: u32 = 0;
-        var emitted_matches: u32 = 0;
-        while (lines.next()) |raw_line| {
-            const line = std.mem.trimRight(u8, raw_line, "\r");
-            if (line.len == 0) continue;
-            total_matches += 1;
-            if (emitted_matches < input.max_matches) {
-                emitted_matches += 1;
-                try output.writer.print("{s}\n", .{line});
-            }
-        }
-
-        try output.writer.print("matches: {d}\n", .{total_matches});
-        if (total_matches > emitted_matches) {
-            try output.writer.print("note: truncated output ({d} hidden)\n", .{total_matches - emitted_matches});
-        }
-
-        return output.toOwnedSlice();
+        return tools_runtime.runGrepFilesToolPayload(self, payload);
     }
 
     fn runProjectSearchToolPayload(self: *App, payload: []const u8) ![]u8 {
-        var input = parseProjectSearchInput(self.allocator, payload) catch {
-            return self.allocator.dupe(u8, "[project-search-result]\nerror: invalid payload (expected plain query or JSON with query/path/max_files/max_matches)");
-        };
-        defer input.deinit(self.allocator);
-
-        if (input.query.len == 0) {
-            return self.allocator.dupe(u8, "[project-search-result]\nerror: empty query");
-        }
-
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(self.allocator);
-        try argv.appendSlice(self.allocator, &.{
-            "rg",
-            "--line-number",
-            "--column",
-            "--no-heading",
-            "--color",
-            "never",
-            "--smart-case",
-            "--max-count",
-            "8",
-        });
-        try argv.append(self.allocator, input.query);
-        try argv.append(self.allocator, input.path);
-
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
-            .argv = argv.items,
-            .cwd = ".",
-            .max_output_bytes = GREP_FILES_MAX_OUTPUT_BYTES,
-        }) catch |err| {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[project-search-result]\nquery: {s}\npath: {s}\nerror: {s}",
-                .{ input.query, input.path, @errorName(err) },
-            );
-        };
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
-
-        const exit_code = switch (result.term) {
-            .Exited => |code| code,
-            else => return self.allocator.dupe(u8, "[project-search-result]\nerror: rg did not exit cleanly"),
-        };
-
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
-        try output.writer.print("[project-search-result]\nquery: {s}\npath: {s}\n", .{ input.query, input.path });
-
-        if (exit_code == 1) {
-            try output.writer.writeAll("files: 0\nnote: no matches\n");
-            return output.toOwnedSlice();
-        }
-        if (exit_code != 0) {
-            const stderr_trimmed = std.mem.trim(u8, result.stderr, " \t\r\n");
-            if (stderr_trimmed.len > 0) {
-                try output.writer.print("error: rg failed ({d}) {s}\n", .{ exit_code, stderr_trimmed });
-            } else {
-                try output.writer.print("error: rg failed ({d})\n", .{exit_code});
-            }
-            return output.toOwnedSlice();
-        }
-
-        var hits: std.ArrayList(ProjectSearchFileHit) = .empty;
-        defer {
-            for (hits.items) |*hit| hit.deinit(self.allocator);
-            hits.deinit(self.allocator);
-        }
-
-        var path_to_index: std.StringHashMapUnmanaged(usize) = .empty;
-        defer path_to_index.deinit(self.allocator);
-
-        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
-        var parsed_matches: u32 = 0;
-        while (lines.next()) |raw_line| {
-            if (parsed_matches >= input.max_matches) break;
-            const line = std.mem.trimRight(u8, raw_line, "\r");
-            if (line.len == 0) continue;
-
-            const rg_line = parseRgLine(line) orelse continue;
-            parsed_matches += 1;
-
-            if (path_to_index.get(rg_line.path)) |existing_index| {
-                const hit = &hits.items[existing_index];
-                hit.hits += 1;
-                if (rg_line.line < hit.first_line or (rg_line.line == hit.first_line and rg_line.col < hit.first_col)) {
-                    hit.first_line = rg_line.line;
-                    hit.first_col = rg_line.col;
-                    self.allocator.free(hit.first_snippet);
-                    hit.first_snippet = try self.allocator.dupe(u8, rg_line.text);
-                }
-                continue;
-            }
-
-            const new_index = hits.items.len;
-            const path_owned = try self.allocator.dupe(u8, rg_line.path);
-            errdefer self.allocator.free(path_owned);
-            const snippet_owned = try self.allocator.dupe(u8, rg_line.text);
-            errdefer self.allocator.free(snippet_owned);
-
-            try hits.append(self.allocator, .{
-                .path = path_owned,
-                .hits = 1,
-                .first_line = rg_line.line,
-                .first_col = rg_line.col,
-                .first_snippet = snippet_owned,
-            });
-            try path_to_index.put(self.allocator, hits.items[new_index].path, new_index);
-        }
-
-        if (hits.items.len == 0) {
-            try output.writer.writeAll("files: 0\nnote: no parseable matches\n");
-            return output.toOwnedSlice();
-        }
-
-        std.sort.pdq(ProjectSearchFileHit, hits.items, {}, projectSearchHitLessThan);
-
-        const shown = @min(hits.items.len, @as(usize, input.max_files));
-        try output.writer.print("files: {d}\n", .{hits.items.len});
-        for (hits.items[0..shown], 0..) |hit, index| {
-            const snippet = std.mem.trim(u8, hit.first_snippet, " \t\r\n");
-            try output.writer.print(
-                "{d}. {s} (hits:{d})\n   first: {d}:{d}: {s}\n",
-                .{ index + 1, hit.path, hit.hits, hit.first_line, hit.first_col, snippet },
-            );
-        }
-        if (hits.items.len > shown) {
-            try output.writer.print("note: omitted {d} files\n", .{hits.items.len - shown});
-        }
-
-        return output.toOwnedSlice();
+        return tools_runtime.runProjectSearchToolPayload(self, payload);
     }
 
     fn runApplyPatchToolPatch(self: *App, patch_text: []const u8) ![]u8 {
-        const trimmed_patch = std.mem.trim(u8, patch_text, " \t\r\n");
-        if (trimmed_patch.len == 0) {
-            return self.allocator.dupe(u8, "[apply-patch-result]\nerror: empty patch payload");
-        }
-
-        if (trimmed_patch.len > APPLY_PATCH_TOOL_MAX_PATCH_BYTES) {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[apply-patch-result]\nerror: patch too large ({d} bytes > {d})",
-                .{ trimmed_patch.len, APPLY_PATCH_TOOL_MAX_PATCH_BYTES },
-            );
-        }
-
-        if (!isValidApplyPatchPayload(trimmed_patch)) {
-            return self.allocator.dupe(u8, "[apply-patch-result]\nerror: invalid patch payload; expected codex apply_patch format");
-        }
-
-        const stats = patch_tool.applyCodexPatch(self.allocator, trimmed_patch) catch |err| {
-            const detail = switch (err) {
-                error.FileNotFound => "target file not found",
-                error.UpdateTargetMissing => "update target file not found (use *** Add File for new files)",
-                error.DeleteTargetMissing => "delete target file not found",
-                error.AddTargetExists => "add target already exists (use *** Update File instead)",
-                error.PatchContextNotFound => "patch context not found in target file",
-                error.MissingBeginPatch => "missing *** Begin Patch header",
-                error.MissingEndPatch => "missing *** End Patch trailer",
-                error.InvalidPatchHeader => "invalid patch operation header",
-                error.InvalidPatchPath => "invalid or empty patch path",
-                error.InvalidAddFileLine => "invalid add-file body line (expected leading +)",
-                error.InvalidUpdateLine => "invalid update hunk line (expected ' ', '+', '-', or @@)",
-                error.EmptyPatchOperations => "patch contains no operations",
-                else => @errorName(err),
-            };
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[apply-patch-result]\nerror: {s}",
-                .{detail},
-            );
-        };
-
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
-
-        try output.writer.print(
-            "[apply-patch-result]\nbytes: {d}\nops:{d} files_changed:{d} added:{d} updated:{d} deleted:{d} moved:{d}\nstatus: ok\n",
-            .{
-                trimmed_patch.len,
-                stats.operations,
-                stats.files_changed,
-                stats.added,
-                stats.updated,
-                stats.deleted,
-                stats.moved,
-            },
-        );
-
-        const preview = try buildApplyPatchPreview(self.allocator, trimmed_patch, APPLY_PATCH_PREVIEW_MAX_LINES);
-        defer self.allocator.free(preview.text);
-        if (preview.included_lines > 0) {
-            try output.writer.writeAll("diff_preview:\n");
-            try output.writer.writeAll(preview.text);
-        }
-        if (preview.omitted_lines > 0) {
-            try output.writer.print(
-                "note: preview truncated ({d} patch lines omitted)\n",
-                .{preview.omitted_lines},
-            );
-        }
-
-        return output.toOwnedSlice();
+        return tools_runtime.runApplyPatchToolPatch(self, patch_text);
     }
 
     fn runExecCommandToolPayload(self: *App, payload: []const u8) ![]u8 {
-        const input = parseExecCommandInput(self.allocator, payload) catch {
-            return self.allocator.dupe(u8, "[exec-result]\nerror: invalid payload (expected JSON with cmd and optional yield_ms)");
-        };
-        defer self.allocator.free(input.cmd);
-
-        if (input.cmd.len == 0) {
-            return self.allocator.dupe(u8, "[exec-result]\nerror: empty command");
-        }
-
-        try self.pruneCommandSessionsForCapacity();
-
-        const session = try self.startCommandSession(input.cmd);
-        const drained = try self.drainCommandSessionOutput(session, input.yield_ms);
-        defer self.allocator.free(drained.stdout);
-        defer self.allocator.free(drained.stderr);
-
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
-
-        try output.writer.print("[exec-result]\nsession_id: {d}\ncommand: {s}\n", .{
-            session.id,
-            session.command_line,
-        });
-        try self.appendCommandSessionStateLine(&output.writer, session);
-        try self.appendCommandDrainOutput(&output.writer, drained);
-
-        return output.toOwnedSlice();
+        return tools_runtime.runExecCommandToolPayload(self, payload);
     }
 
     fn runWriteStdinToolPayload(self: *App, payload: []const u8) ![]u8 {
-        var input = parseWriteStdinInput(self.allocator, payload) catch {
-            return self.allocator.dupe(u8, "[write-stdin-result]\nerror: invalid payload (expected JSON with session_id, chars, optional yield_ms)");
-        };
-        defer self.allocator.free(input.chars);
-
-        const session = self.findCommandSessionById(input.session_id) orelse {
-            return std.fmt.allocPrint(self.allocator, "[write-stdin-result]\nerror: session not found ({d})", .{input.session_id});
-        };
-
-        if (session.finished) {
-            var output: std.Io.Writer.Allocating = .init(self.allocator);
-            defer output.deinit();
-            try output.writer.print("[write-stdin-result]\nsession_id: {d}\nchars_written: 0\n", .{session.id});
-            try self.appendCommandSessionStateLine(&output.writer, session);
-            return output.toOwnedSlice();
-        }
-
-        var written: usize = 0;
-        if (input.chars.len > 0) {
-            const stdin_file = session.child.stdin orelse {
-                return std.fmt.allocPrint(self.allocator, "[write-stdin-result]\nsession_id: {d}\nerror: session stdin is closed", .{session.id});
-            };
-
-            while (written < input.chars.len) {
-                const n = std.posix.write(stdin_file.handle, input.chars[written..]) catch |err| switch (err) {
-                    error.BrokenPipe => {
-                        session.child.stdin.?.close();
-                        session.child.stdin = null;
-                        break;
-                    },
-                    else => return std.fmt.allocPrint(
-                        self.allocator,
-                        "[write-stdin-result]\nsession_id: {d}\nerror: {s}",
-                        .{ session.id, @errorName(err) },
-                    ),
-                };
-                written += n;
-            }
-        }
-
-        const drained = try self.drainCommandSessionOutput(session, input.yield_ms);
-        defer self.allocator.free(drained.stdout);
-        defer self.allocator.free(drained.stderr);
-
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
-        try output.writer.print("[write-stdin-result]\nsession_id: {d}\nchars_written: {d}\n", .{
-            session.id,
-            written,
-        });
-        try self.appendCommandSessionStateLine(&output.writer, session);
-        try self.appendCommandDrainOutput(&output.writer, drained);
-        return output.toOwnedSlice();
+        return tools_runtime.runWriteStdinToolPayload(self, payload);
     }
 
     fn runWebSearchToolPayload(self: *App, payload: []const u8) ![]u8 {
-        const input = parseWebSearchInput(self.allocator, payload) catch {
-            return self.allocator.dupe(u8, "[web-search-result]\nerror: invalid payload (expected plain query text or JSON with query and optional limit/engine)");
-        };
-        defer self.allocator.free(input.query);
-
-        if (input.query.len == 0) {
-            return self.allocator.dupe(u8, "[web-search-result]\nerror: empty query");
-        }
-
-        const results = switch (input.engine) {
-            .duckduckgo => self.runDuckDuckGoWebSearch(input.query, input.limit) catch |err| {
-                return std.fmt.allocPrint(
-                    self.allocator,
-                    "[web-search-result]\nengine: {s}\nquery: {s}\nerror: {s}",
-                    .{ webSearchEngineLabel(input.engine), input.query, @errorName(err) },
-                );
-            },
-            .exa => self.runExaWebSearch(input.query, input.limit) catch |err| {
-                return switch (err) {
-                    error.EnvironmentVariableNotFound => std.fmt.allocPrint(
-                        self.allocator,
-                        "[web-search-result]\nengine: exa\nquery: {s}\nerror: missing EXA_API_KEY",
-                        .{input.query},
-                    ),
-                    else => std.fmt.allocPrint(
-                        self.allocator,
-                        "[web-search-result]\nengine: exa\nquery: {s}\nerror: {s}",
-                        .{ input.query, @errorName(err) },
-                    ),
-                };
-            },
-        };
-        defer {
-            for (results) |*item| item.deinit(self.allocator);
-            self.allocator.free(results);
-        }
-
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
-
-        try output.writer.print(
-            "[web-search-result]\nengine: {s}\nquery: {s}\nresults: {d}\n",
-            .{ webSearchEngineLabel(input.engine), input.query, results.len },
-        );
-
-        for (results, 0..) |item, index| {
-            try output.writer.print("{d}. {s}\n", .{ index + 1, item.title });
-            try output.writer.print("   url: {s}\n", .{item.url});
-        }
-
-        if (results.len == 0) {
-            try output.writer.writeAll("note: no results found\n");
-        }
-
-        return output.toOwnedSlice();
-    }
-
-    fn runDuckDuckGoWebSearch(self: *App, query: []const u8, limit: u8) ![]WebSearchResultItem {
-        var encoded_query_writer: std.Io.Writer.Allocating = .init(self.allocator);
-        defer encoded_query_writer.deinit();
-        try (std.Uri.Component{ .raw = query }).formatQuery(&encoded_query_writer.writer);
-        const encoded_query = try encoded_query_writer.toOwnedSlice();
-        defer self.allocator.free(encoded_query);
-
-        const endpoint = try std.fmt.allocPrint(
-            self.allocator,
-            "https://duckduckgo.com/html/?q={s}&kl=us-en",
-            .{encoded_query},
-        );
-        defer self.allocator.free(endpoint);
-
-        var client: std.http.Client = .{ .allocator = self.allocator };
-        defer client.deinit();
-
-        var response_writer: std.Io.Writer.Allocating = .init(self.allocator);
-        defer response_writer.deinit();
-
-        const fetch_result = try client.fetch(.{
-            .location = .{ .url = endpoint },
-            .method = .GET,
-            .headers = .{
-                .user_agent = .{ .override = "Zolt/0.1" },
-            },
-            .response_writer = &response_writer.writer,
-            .keep_alive = false,
-        });
-        if (fetch_result.status != .ok) return error.WebSearchHttpStatus;
-
-        const html_body = try response_writer.toOwnedSlice();
-        defer self.allocator.free(html_body);
-        if (html_body.len == 0) return error.EmptyResponseBody;
-        if (html_body.len > WEB_SEARCH_MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
-
-        return parseDuckDuckGoHtmlResults(self.allocator, html_body, limit);
-    }
-
-    fn runExaWebSearch(self: *App, query: []const u8, limit: u8) ![]WebSearchResultItem {
-        const exa_api_key = try std.process.getEnvVarOwned(self.allocator, "EXA_API_KEY");
-        defer self.allocator.free(exa_api_key);
-
-        var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
-        defer payload_writer.deinit();
-        var jw: std.json.Stringify = .{
-            .writer = &payload_writer.writer,
-        };
-        try jw.beginObject();
-        try jw.objectField("query");
-        try jw.write(query);
-        try jw.objectField("numResults");
-        try jw.write(limit);
-        try jw.endObject();
-        const payload = try payload_writer.toOwnedSlice();
-        defer self.allocator.free(payload);
-
-        var client: std.http.Client = .{ .allocator = self.allocator };
-        defer client.deinit();
-
-        var extra_headers: [1]std.http.Header = .{
-            .{ .name = "x-api-key", .value = exa_api_key },
-        };
-
-        const uri = try std.Uri.parse("https://api.exa.ai/search");
-        var req = try client.request(.POST, uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .user_agent = .{ .override = "Zolt/0.1" },
-            },
-            .extra_headers = extra_headers[0..],
-            .keep_alive = false,
-        });
-        defer req.deinit();
-
-        req.transfer_encoding = .{ .content_length = payload.len };
-
-        var body_writer = try req.sendBodyUnflushed(&.{});
-        try body_writer.writer.writeAll(payload);
-        try body_writer.end();
-        try req.connection.?.flush();
-
-        var response = try req.receiveHead(&.{});
-        if (response.head.status != .ok) {
-            const error_body = readHttpResponseBodyAlloc(self.allocator, &response) catch "";
-            defer if (error_body.len > 0) self.allocator.free(error_body);
-            const detail = try formatHttpErrorDetail(self.allocator, response.head.status, error_body);
-            defer self.allocator.free(detail);
-            std.log.err("exa web search failed: {s}", .{detail});
-            return error.WebSearchHttpStatus;
-        }
-
-        const json_body = try readHttpResponseBodyAlloc(self.allocator, &response);
-        defer self.allocator.free(json_body);
-        if (json_body.len == 0) return error.EmptyResponseBody;
-        if (json_body.len > WEB_SEARCH_MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
-
-        return parseExaJsonResults(self.allocator, json_body, limit);
+        return tools_runtime.runWebSearchToolPayload(self, payload);
     }
 
     fn runViewImageToolPayload(self: *App, payload: []const u8) ![]u8 {
-        const input = parseViewImageInput(self.allocator, payload) catch {
-            return self.allocator.dupe(u8, "[view-image-result]\nerror: invalid payload (expected plain path or JSON with path)");
-        };
-        defer self.allocator.free(input.path);
-
-        if (input.path.len == 0) {
-            return self.allocator.dupe(u8, "[view-image-result]\nerror: empty path");
-        }
-
-        const maybe_image_info = inspectImageFile(self.allocator, input.path, true) catch |err| {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[view-image-result]\npath: {s}\nerror: {s}",
-                .{ input.path, @errorName(err) },
-            );
-        };
-        if (maybe_image_info == null) {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[view-image-result]\npath: {s}\nerror: unsupported or unknown image format",
-                .{input.path},
-            );
-        }
-        var image_info = maybe_image_info.?;
-        defer image_info.deinit(self.allocator);
-
-        if (image_info.format.len == 0) {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[view-image-result]\npath: {s}\nerror: unsupported or unknown image format",
-                .{input.path},
-            );
-        }
-
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
-
-        try output.writer.print(
-            "[view-image-result]\npath: {s}\nbytes: {d}\nformat: {s}\nmime: {s}\n",
-            .{ input.path, image_info.bytes, image_info.format, image_info.mime },
-        );
-        if (image_info.width != null and image_info.height != null) {
-            try output.writer.print("dimensions: {d}x{d}\n", .{ image_info.width.?, image_info.height.? });
-        } else {
-            try output.writer.writeAll("dimensions: unknown\n");
-        }
-        if (image_info.sha256_hex) |sha| {
-            try output.writer.print("sha256: {s}\n", .{sha});
-        }
-
-        var vision_note: []const u8 = "metadata-only";
-        var vision_caption: ?[]u8 = null;
-        defer if (vision_caption) |caption| self.allocator.free(caption);
-        var vision_error: ?[]u8 = null;
-        defer if (vision_error) |detail| self.allocator.free(detail);
-
-        if (isOpenAiCompatibleProviderId(self.app_state.selected_provider_id)) {
-            const api_key = try self.resolveApiKey(self.app_state.selected_provider_id);
-            defer if (api_key) |key| self.allocator.free(key);
-
-            if (api_key) |key| {
-                const provider_info = self.catalog.findProviderConst(self.app_state.selected_provider_id);
-                const base_url = if (provider_info) |info|
-                    (info.api_base orelse defaultBaseUrlForProviderId(self.app_state.selected_provider_id) orelse "")
-                else
-                    (defaultBaseUrlForProviderId(self.app_state.selected_provider_id) orelse "");
-                if (base_url.len > 0) {
-                    const vision_result = try self.tryVisionCaptionOpenAiCompatible(
-                        input.path,
-                        image_info.mime,
-                        self.app_state.selected_provider_id,
-                        base_url,
-                        key,
-                    );
-                    if (vision_result.caption) |caption| {
-                        vision_note = "visual-caption-ok";
-                        vision_caption = caption;
-                    } else if (vision_result.error_detail) |detail| {
-                        vision_note = "visual-caption-failed";
-                        vision_error = detail;
-                    } else {
-                        vision_note = "visual-caption-unavailable";
-                    }
-                } else {
-                    vision_note = "visual-caption-unsupported-provider-base-url";
-                }
-            } else {
-                vision_note = "visual-caption-missing-api-key";
-            }
-        } else {
-            vision_note = "visual-caption-unsupported-provider";
-        }
-
-        if (vision_caption) |caption| {
-            try output.writer.writeAll("vision_caption:\n");
-            try output.writer.writeAll(caption);
-            if (caption.len == 0 or caption[caption.len - 1] != '\n') {
-                try output.writer.writeByte('\n');
-            }
-        } else if (vision_error) |detail| {
-            try output.writer.print("vision_error: {s}\n", .{detail});
-        }
-        try output.writer.print("note: {s}\n", .{vision_note});
-
-        return output.toOwnedSlice();
+        return tools_runtime.runViewImageToolPayload(self, payload);
     }
 
     fn pasteClipboardImageIntoInput(self: *App) !void {
@@ -2164,7 +1360,7 @@ const App = struct {
         try self.setNoticeFmt("Pasted image from clipboard -> @{s}", .{image_path});
     }
 
-    fn tryVisionCaptionOpenAiCompatible(
+    pub fn tryVisionCaptionOpenAiCompatible(
         self: *App,
         image_path: []const u8,
         image_mime: []const u8,
@@ -2353,7 +1549,7 @@ const App = struct {
         return .{ .caption = caption.? };
     }
 
-    fn appendCommandDrainOutput(self: *App, writer: *std.Io.Writer, drained: SessionDrainResult) !void {
+    pub fn appendCommandDrainOutput(self: *App, writer: *std.Io.Writer, drained: SessionDrainResult) !void {
         _ = self;
         if (drained.stdout.len > 0) {
             try writer.writeAll("stdout:\n");
@@ -2376,7 +1572,7 @@ const App = struct {
         }
     }
 
-    fn appendCommandSessionStateLine(self: *App, writer: *std.Io.Writer, session: *CommandSession) !void {
+    pub fn appendCommandSessionStateLine(self: *App, writer: *std.Io.Writer, session: *CommandSession) !void {
         _ = self;
         if (session.finished and session.term != null) {
             const term = session.term.?;
@@ -2391,7 +1587,7 @@ const App = struct {
         try writer.writeAll("state: running\n");
     }
 
-    fn pruneCommandSessionsForCapacity(self: *App) !void {
+    pub fn pruneCommandSessionsForCapacity(self: *App) !void {
         if (self.command_sessions.items.len < COMMAND_TOOL_MAX_SESSIONS) return;
 
         var index: usize = 0;
@@ -2410,14 +1606,14 @@ const App = struct {
         }
     }
 
-    fn findCommandSessionById(self: *App, session_id: u32) ?*CommandSession {
+    pub fn findCommandSessionById(self: *App, session_id: u32) ?*CommandSession {
         for (self.command_sessions.items) |session| {
             if (session.id == session_id) return session;
         }
         return null;
     }
 
-    fn startCommandSession(self: *App, command_text: []const u8) !*CommandSession {
+    pub fn startCommandSession(self: *App, command_text: []const u8) !*CommandSession {
         const session = try self.allocator.create(CommandSession);
         errdefer self.allocator.destroy(session);
 
@@ -2453,7 +1649,7 @@ const App = struct {
         return session;
     }
 
-    fn drainCommandSessionOutput(self: *App, session: *CommandSession, yield_ms: u32) !SessionDrainResult {
+    pub fn drainCommandSessionOutput(self: *App, session: *CommandSession, yield_ms: u32) !SessionDrainResult {
         var stdout: std.ArrayList(u8) = .empty;
         defer stdout.deinit(self.allocator);
         var stderr: std.ArrayList(u8) = .empty;
@@ -2972,7 +2168,7 @@ const App = struct {
         try self.setNoticeFmt("Unknown command: /{s}", .{command});
     }
 
-    fn resolveApiKey(self: *App, provider_id: []const u8) !?[]u8 {
+    pub fn resolveApiKey(self: *App, provider_id: []const u8) !?[]u8 {
         if (self.catalog.findProviderConst(provider_id)) |provider| {
             if (provider.env_vars.items.len > 0) {
                 for (provider.env_vars.items) |env_var| {
