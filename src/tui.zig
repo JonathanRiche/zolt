@@ -115,9 +115,15 @@ const WriteStdinInput = struct {
     yield_ms: u32 = COMMAND_TOOL_DEFAULT_YIELD_MS,
 };
 
+const WebSearchEngine = enum {
+    duckduckgo,
+    exa,
+};
+
 const WebSearchInput = struct {
     query: []u8,
     limit: u8 = WEB_SEARCH_DEFAULT_RESULTS,
+    engine: WebSearchEngine = .duckduckgo,
 };
 
 const ViewImageInput = struct {
@@ -301,7 +307,7 @@ const TOOL_SYSTEM_PROMPT =
     "</WRITE_STDIN>\n" ++
     "For web search, use:\n" ++
     "<WEB_SEARCH>\n" ++
-    "{\"query\":\"zig 0.15 release notes\",\"limit\":5}\n" ++
+    "{\"query\":\"zig 0.15 release notes\",\"limit\":5,\"engine\":\"duckduckgo\"}\n" ++
     "</WEB_SEARCH>\n" ++
     "For image metadata inspection, use:\n" ++
     "<VIEW_IMAGE>\n" ++
@@ -1847,7 +1853,7 @@ const App = struct {
 
     fn runWebSearchToolPayload(self: *App, payload: []const u8) ![]u8 {
         const input = parseWebSearchInput(self.allocator, payload) catch {
-            return self.allocator.dupe(u8, "[web-search-result]\nerror: invalid payload (expected plain query text or JSON with query and optional limit)");
+            return self.allocator.dupe(u8, "[web-search-result]\nerror: invalid payload (expected plain query text or JSON with query and optional limit/engine)");
         };
         defer self.allocator.free(input.query);
 
@@ -1855,9 +1861,58 @@ const App = struct {
             return self.allocator.dupe(u8, "[web-search-result]\nerror: empty query");
         }
 
+        const results = switch (input.engine) {
+            .duckduckgo => self.runDuckDuckGoWebSearch(input.query, input.limit) catch |err| {
+                return std.fmt.allocPrint(
+                    self.allocator,
+                    "[web-search-result]\nengine: {s}\nquery: {s}\nerror: {s}",
+                    .{ webSearchEngineLabel(input.engine), input.query, @errorName(err) },
+                );
+            },
+            .exa => self.runExaWebSearch(input.query, input.limit) catch |err| {
+                return switch (err) {
+                    error.EnvironmentVariableNotFound => std.fmt.allocPrint(
+                        self.allocator,
+                        "[web-search-result]\nengine: exa\nquery: {s}\nerror: missing EXA_API_KEY",
+                        .{input.query},
+                    ),
+                    else => std.fmt.allocPrint(
+                        self.allocator,
+                        "[web-search-result]\nengine: exa\nquery: {s}\nerror: {s}",
+                        .{ input.query, @errorName(err) },
+                    ),
+                };
+            },
+        };
+        defer {
+            for (results) |*item| item.deinit(self.allocator);
+            self.allocator.free(results);
+        }
+
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+
+        try output.writer.print(
+            "[web-search-result]\nengine: {s}\nquery: {s}\nresults: {d}\n",
+            .{ webSearchEngineLabel(input.engine), input.query, results.len },
+        );
+
+        for (results, 0..) |item, index| {
+            try output.writer.print("{d}. {s}\n", .{ index + 1, item.title });
+            try output.writer.print("   url: {s}\n", .{item.url});
+        }
+
+        if (results.len == 0) {
+            try output.writer.writeAll("note: no results found\n");
+        }
+
+        return output.toOwnedSlice();
+    }
+
+    fn runDuckDuckGoWebSearch(self: *App, query: []const u8, limit: u8) ![]WebSearchResultItem {
         var encoded_query_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer encoded_query_writer.deinit();
-        try (std.Uri.Component{ .raw = input.query }).formatQuery(&encoded_query_writer.writer);
+        try (std.Uri.Component{ .raw = query }).formatQuery(&encoded_query_writer.writer);
         const encoded_query = try encoded_query_writer.toOwnedSlice();
         defer self.allocator.free(encoded_query);
 
@@ -1874,7 +1929,7 @@ const App = struct {
         var response_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer response_writer.deinit();
 
-        const fetch_result = client.fetch(.{
+        const fetch_result = try client.fetch(.{
             .location = .{ .url = endpoint },
             .method = .GET,
             .headers = .{
@@ -1882,71 +1937,76 @@ const App = struct {
             },
             .response_writer = &response_writer.writer,
             .keep_alive = false,
-        }) catch |err| {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[web-search-result]\nquery: {s}\nerror: {s}",
-                .{ input.query, @errorName(err) },
-            );
-        };
-
-        if (fetch_result.status != .ok) {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[web-search-result]\nquery: {s}\nerror: http status {s}",
-                .{ input.query, @tagName(fetch_result.status) },
-            );
-        }
+        });
+        if (fetch_result.status != .ok) return error.WebSearchHttpStatus;
 
         const html_body = try response_writer.toOwnedSlice();
         defer self.allocator.free(html_body);
+        if (html_body.len == 0) return error.EmptyResponseBody;
+        if (html_body.len > WEB_SEARCH_MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
 
-        if (html_body.len == 0) {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[web-search-result]\nquery: {s}\nerror: empty response body",
-                .{input.query},
-            );
-        }
+        return parseDuckDuckGoHtmlResults(self.allocator, html_body, limit);
+    }
 
-        if (html_body.len > WEB_SEARCH_MAX_RESPONSE_BYTES) {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[web-search-result]\nquery: {s}\nerror: response too large ({d} bytes)",
-                .{ input.query, html_body.len },
-            );
-        }
+    fn runExaWebSearch(self: *App, query: []const u8, limit: u8) ![]WebSearchResultItem {
+        const exa_api_key = try std.process.getEnvVarOwned(self.allocator, "EXA_API_KEY");
+        defer self.allocator.free(exa_api_key);
 
-        const results = parseDuckDuckGoHtmlResults(self.allocator, html_body, input.limit) catch |err| {
-            return std.fmt.allocPrint(
-                self.allocator,
-                "[web-search-result]\nquery: {s}\nerror: parse failed ({s})",
-                .{ input.query, @errorName(err) },
-            );
+        var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer payload_writer.deinit();
+        var jw: std.json.Stringify = .{
+            .writer = &payload_writer.writer,
         };
-        defer {
-            for (results) |*item| item.deinit(self.allocator);
-            self.allocator.free(results);
+        try jw.beginObject();
+        try jw.objectField("query");
+        try jw.write(query);
+        try jw.objectField("numResults");
+        try jw.write(limit);
+        try jw.endObject();
+        const payload = try payload_writer.toOwnedSlice();
+        defer self.allocator.free(payload);
+
+        var client: std.http.Client = .{ .allocator = self.allocator };
+        defer client.deinit();
+
+        var extra_headers: [1]std.http.Header = .{
+            .{ .name = "x-api-key", .value = exa_api_key },
+        };
+
+        const uri = try std.Uri.parse("https://api.exa.ai/search");
+        var req = try client.request(.POST, uri, .{
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+                .user_agent = .{ .override = "Zolt/0.1" },
+            },
+            .extra_headers = extra_headers[0..],
+            .keep_alive = false,
+        });
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = payload.len };
+
+        var body_writer = try req.sendBodyUnflushed(&.{});
+        try body_writer.writer.writeAll(payload);
+        try body_writer.end();
+        try req.connection.?.flush();
+
+        var response = try req.receiveHead(&.{});
+        if (response.head.status != .ok) {
+            const error_body = readHttpResponseBodyAlloc(self.allocator, &response) catch "";
+            defer if (error_body.len > 0) self.allocator.free(error_body);
+            const detail = try formatHttpErrorDetail(self.allocator, response.head.status, error_body);
+            defer self.allocator.free(detail);
+            std.log.err("exa web search failed: {s}", .{detail});
+            return error.WebSearchHttpStatus;
         }
 
-        var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
+        const json_body = try readHttpResponseBodyAlloc(self.allocator, &response);
+        defer self.allocator.free(json_body);
+        if (json_body.len == 0) return error.EmptyResponseBody;
+        if (json_body.len > WEB_SEARCH_MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
 
-        try output.writer.print(
-            "[web-search-result]\nengine: duckduckgo\nquery: {s}\nresults: {d}\n",
-            .{ input.query, results.len },
-        );
-
-        for (results, 0..) |item, index| {
-            try output.writer.print("{d}. {s}\n", .{ index + 1, item.title });
-            try output.writer.print("   url: {s}\n", .{item.url});
-        }
-
-        if (results.len == 0) {
-            try output.writer.writeAll("note: no results found\n");
-        }
-
-        return output.toOwnedSlice();
+        return parseExaJsonResults(self.allocator, json_body, limit);
     }
 
     fn runViewImageToolPayload(self: *App, payload: []const u8) ![]u8 {
@@ -5837,9 +5897,19 @@ fn parseWebSearchInput(allocator: std.mem.Allocator, payload: []const u8) !WebSe
             WEB_SEARCH_DEFAULT_RESULTS,
     );
 
+    const engine: WebSearchEngine = blk: {
+        const engine_value = object.get("engine") orelse object.get("provider") orelse break :blk .duckduckgo;
+        const engine_name = switch (engine_value) {
+            .string => |text| text,
+            else => return error.InvalidToolPayload,
+        };
+        break :blk parseWebSearchEngineName(engine_name) orelse return error.InvalidToolPayload;
+    };
+
     return .{
         .query = try allocator.dupe(u8, std.mem.trim(u8, query, " \t\r\n")),
         .limit = limit,
+        .engine = engine,
     };
 }
 
@@ -6073,6 +6143,24 @@ fn sanitizeWebSearchLimit(limit: u32) u8 {
     return @as(u8, @intCast(clamped));
 }
 
+fn parseWebSearchEngineName(input: []const u8) ?WebSearchEngine {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "duckduckgo") or std.ascii.eqlIgnoreCase(trimmed, "ddg")) {
+        return .duckduckgo;
+    }
+    if (std.ascii.eqlIgnoreCase(trimmed, "exa")) {
+        return .exa;
+    }
+    return null;
+}
+
+fn webSearchEngineLabel(engine: WebSearchEngine) []const u8 {
+    return switch (engine) {
+        .duckduckgo => "duckduckgo",
+        .exa => "exa",
+    };
+}
+
 fn parseDuckDuckGoHtmlResults(
     allocator: std.mem.Allocator,
     html: []const u8,
@@ -6126,6 +6214,59 @@ fn parseDuckDuckGoHtmlResults(
     }
 
     return results.toOwnedSlice(allocator);
+}
+
+fn parseExaJsonResults(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    limit: u8,
+) ![]WebSearchResultItem {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidWebSearchResponse,
+    };
+
+    const results_value = root.get("results") orelse return error.InvalidWebSearchResponse;
+    const results_array = switch (results_value) {
+        .array => |array| array,
+        else => return error.InvalidWebSearchResponse,
+    };
+
+    var out: std.ArrayList(WebSearchResultItem) = .empty;
+    errdefer {
+        for (out.items) |*item| item.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    for (results_array.items) |entry| {
+        if (out.items.len >= @as(usize, limit)) break;
+        const entry_object = switch (entry) {
+            .object => |object| object,
+            else => continue,
+        };
+
+        const url = if (entry_object.get("url")) |value| switch (value) {
+            .string => |text| std.mem.trim(u8, text, " \t\r\n"),
+            else => "",
+        } else "";
+        if (url.len == 0) continue;
+
+        const title_raw = if (entry_object.get("title")) |value| switch (value) {
+            .string => |text| std.mem.trim(u8, text, " \t\r\n"),
+            else => "",
+        } else "";
+        const title = if (title_raw.len == 0) url else title_raw;
+
+        try out.append(allocator, .{
+            .title = try allocator.dupe(u8, title),
+            .url = try allocator.dupe(u8, url),
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
 }
 
 fn extractAnchorHref(anchor_tag: []const u8) ?[]const u8 {
@@ -7715,16 +7856,23 @@ test "parseWebSearchInput parses json and plain query" {
 
     const json_input = try parseWebSearchInput(
         allocator,
-        "{\"query\":\"zig allocator tutorial\",\"limit\":12}",
+        "{\"query\":\"zig allocator tutorial\",\"limit\":12,\"engine\":\"exa\"}",
     );
     defer allocator.free(json_input.query);
     try std.testing.expectEqualStrings("zig allocator tutorial", json_input.query);
     try std.testing.expectEqual(@as(u8, WEB_SEARCH_MAX_RESULTS), json_input.limit);
+    try std.testing.expect(json_input.engine == .exa);
 
     const plain_input = try parseWebSearchInput(allocator, "zig async await");
     defer allocator.free(plain_input.query);
     try std.testing.expectEqualStrings("zig async await", plain_input.query);
     try std.testing.expectEqual(@as(u8, WEB_SEARCH_DEFAULT_RESULTS), plain_input.limit);
+    try std.testing.expect(plain_input.engine == .duckduckgo);
+
+    try std.testing.expectError(
+        error.InvalidToolPayload,
+        parseWebSearchInput(allocator, "{\"query\":\"zig\",\"engine\":\"unknown\"}"),
+    );
 }
 
 test "parseViewImageInput parses json and plain path" {
@@ -7839,6 +7987,25 @@ test "parseDuckDuckGoHtmlResults extracts titles and urls" {
     try std.testing.expectEqualStrings("https://example.com/path?a=1&b=2", results[0].url);
     try std.testing.expectEqualStrings("Zig Learn", results[1].title);
     try std.testing.expectEqualStrings("https://ziglang.org/learn", results[1].url);
+}
+
+test "parseExaJsonResults extracts titles and urls" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"results":[{"title":"Zig Language","url":"https://ziglang.org/"},{"title":"","url":"https://example.com/fallback-title"},{"url":"https://example.com/no-title-field"}]}
+    ;
+
+    const results = try parseExaJsonResults(allocator, payload, 5);
+    defer {
+        for (results) |*item| item.deinit(allocator);
+        allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("Zig Language", results[0].title);
+    try std.testing.expectEqualStrings("https://ziglang.org/", results[0].url);
+    try std.testing.expectEqualStrings("https://example.com/fallback-title", results[1].title);
+    try std.testing.expectEqualStrings("https://example.com/no-title-field", results[2].title);
 }
 
 test "parseVisionCaptionFromChatCompletionsAlloc parses string content" {

@@ -37,7 +37,7 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 - Tool loop with discovery/edit/exec primitives:
   - `READ` (allowlisted shell read commands)
   - `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`
-  - `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`, `VIEW_IMAGE`
+  - `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH` (DuckDuckGo default, Exa optional), `VIEW_IMAGE`
 
 ## Requirements
 
@@ -145,6 +145,7 @@ Common keys:
 - `ANTHROPIC_API_KEY`
 - `GOOGLE_GENERATIVE_AI_API_KEY` or `GEMINI_API_KEY`
 - `ZENMUX_API_KEY`
+- `EXA_API_KEY` (only for `WEB_SEARCH` when `engine:"exa"` is requested)
 
 Use `/provider <id> [auto|api_key|codex]` to switch provider/auth mode, then `/model` to pick models.
 
