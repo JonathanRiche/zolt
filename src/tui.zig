@@ -251,6 +251,9 @@ const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
+const AGENTS_CONTEXT_HEADER = "[agents-context]";
+const AGENTS_CONTEXT_MAX_FILE_BYTES: usize = 128 * 1024;
+const AGENTS_CONTEXT_MAX_INSTRUCTIONS_BYTES: usize = 24 * 1024;
 const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const KEY_UP_ARROW: u8 = keybindings.KEY_UP_ARROW;
 const KEY_DOWN_ARROW: u8 = keybindings.KEY_DOWN_ARROW;
@@ -545,6 +548,8 @@ const App = struct {
     suspend_requested: bool = false,
     headless: bool = false,
     openai_auth_mode: OpenAiAuthMode = .auto,
+    agents_context_initialized: bool = false,
+    agents_context_payload: ?[]u8 = null,
     run_observer: ?RunTaskObserver = null,
 
     notice: []u8,
@@ -558,6 +563,7 @@ const App = struct {
         self.input_buffer.deinit(self.allocator);
         for (self.file_index.items) |path| self.allocator.free(path);
         self.file_index.deinit(self.allocator);
+        if (self.agents_context_payload) |payload| self.allocator.free(payload);
         self.allocator.free(self.notice);
     }
 
@@ -869,6 +875,7 @@ const App = struct {
     fn handlePrompt(self: *App, prompt: []const u8) !void {
         const inject_result = try buildFileInjectionPayload(self.allocator, prompt);
         defer if (inject_result.payload) |payload| self.allocator.free(payload);
+        const conversation_was_empty = self.app_state.currentConversationConst().messages.items.len == 0;
 
         if (self.shouldAutoTitleCurrentConversation()) {
             const title = try deriveConversationTitleFromPrompt(self.allocator, prompt);
@@ -876,6 +883,10 @@ const App = struct {
             if (title.len > 0) {
                 try self.app_state.setConversationTitle(self.allocator, title);
             }
+        }
+
+        if (conversation_was_empty) {
+            try self.injectAgentsContextIntoCurrentConversation();
         }
 
         try self.app_state.appendMessage(self.allocator, .user, prompt);
@@ -1227,6 +1238,32 @@ const App = struct {
         }
 
         return messages;
+    }
+
+    fn injectAgentsContextIntoCurrentConversation(self: *App) !void {
+        const conversation = self.app_state.currentConversationConst();
+        if (conversation.messages.items.len != 0) return;
+
+        const payload = (try self.ensureAgentsContextPayload()) orelse return;
+        try self.app_state.appendMessage(self.allocator, .system, payload);
+    }
+
+    fn ensureAgentsContextPayload(self: *App) !?[]const u8 {
+        if (self.agents_context_initialized) {
+            return if (self.agents_context_payload) |payload| payload else null;
+        }
+        self.agents_context_initialized = true;
+
+        const agents_path = try findNearestAgentsFilePathAlloc(self.allocator);
+        defer if (agents_path) |path| self.allocator.free(path);
+        const path = agents_path orelse return null;
+
+        const payload = readAgentsContextPayloadAlloc(self.allocator, path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        self.agents_context_payload = payload;
+        return payload;
     }
 
     fn runReadToolCommand(self: *App, command_text: []const u8) ![]u8 {
@@ -4539,9 +4576,13 @@ fn appendMessageBlock(
 fn messageDisplayContent(message: anytype) []const u8 {
     if (message.content.len == 0) return "...";
 
-    if (message.role == .system and std.mem.startsWith(u8, message.content, FILE_INJECT_HEADER)) {
-        const line_end = std.mem.indexOfScalar(u8, message.content, '\n') orelse message.content.len;
-        return message.content[0..line_end];
+    if (message.role == .system) {
+        if (std.mem.startsWith(u8, message.content, FILE_INJECT_HEADER) or
+            std.mem.startsWith(u8, message.content, AGENTS_CONTEXT_HEADER))
+        {
+            const line_end = std.mem.indexOfScalar(u8, message.content, '\n') orelse message.content.len;
+            return message.content[0..line_end];
+        }
     }
 
     return message.content;
@@ -7248,6 +7289,133 @@ fn extractChatgptAccountIdFromClaims(claims: std.json.ObjectMap) ?[]const u8 {
     return null;
 }
 
+fn findNearestAgentsFilePathAlloc(allocator: std.mem.Allocator) !?[]u8 {
+    var current_dir = try std.process.getCwdAlloc(allocator);
+    const file_names = [_][]const u8{ "AGENTS.md", "agents.md" };
+
+    while (true) {
+        for (file_names) |file_name| {
+            const candidate = try std.fs.path.join(allocator, &.{ current_dir, file_name });
+
+            var file = openFileForPath(candidate, .{}) catch |err| {
+                switch (err) {
+                    error.FileNotFound, error.NotDir => {
+                        allocator.free(candidate);
+                        continue;
+                    },
+                    else => {
+                        allocator.free(candidate);
+                        allocator.free(current_dir);
+                        return err;
+                    },
+                }
+            };
+            file.close();
+
+            allocator.free(current_dir);
+            return @as(?[]u8, candidate);
+        }
+
+        const parent = std.fs.path.dirname(current_dir) orelse {
+            allocator.free(current_dir);
+            return null;
+        };
+
+        const next_dir = try allocator.dupe(u8, parent);
+        allocator.free(current_dir);
+        current_dir = next_dir;
+    }
+}
+
+fn readAgentsContextPayloadAlloc(allocator: std.mem.Allocator, agents_path: []const u8) ![]u8 {
+    var file = try openFileForPath(agents_path, .{});
+    defer file.close();
+
+    const raw_content = try file.readToEndAlloc(allocator, AGENTS_CONTEXT_MAX_FILE_BYTES);
+    defer allocator.free(raw_content);
+
+    const trimmed = std.mem.trim(u8, raw_content, " \t\r\n");
+    if (trimmed.len == 0) {
+        return std.fmt.allocPrint(allocator, "{s}\nsource: {s}\nworkspace_instructions:\n(no content)", .{
+            AGENTS_CONTEXT_HEADER,
+            agents_path,
+        });
+    }
+
+    const instructions = try truncateAgentsInstructionsAlloc(allocator, trimmed);
+    defer allocator.free(instructions);
+
+    const skills_summary = try extractAvailableSkillsSummaryAlloc(allocator, trimmed);
+    defer if (skills_summary) |summary| allocator.free(summary);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try out.writer.print("{s}\nsource: {s}\nworkspace_instructions:\n{s}", .{
+        AGENTS_CONTEXT_HEADER,
+        agents_path,
+        instructions,
+    });
+
+    if (skills_summary) |summary| {
+        try out.writer.writeAll("\n\navailable_skills (lazy metadata only):\n");
+        try out.writer.writeAll(summary);
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn truncateAgentsInstructionsAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (text.len <= AGENTS_CONTEXT_MAX_INSTRUCTIONS_BYTES) {
+        return allocator.dupe(u8, text);
+    }
+
+    const omitted_bytes = text.len - AGENTS_CONTEXT_MAX_INSTRUCTIONS_BYTES;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n\n[... AGENTS instructions truncated, omitted {d} bytes ...]",
+        .{ text[0..AGENTS_CONTEXT_MAX_INSTRUCTIONS_BYTES], omitted_bytes },
+    );
+}
+
+fn extractAvailableSkillsSummaryAlloc(allocator: std.mem.Allocator, agents_text: []const u8) !?[]u8 {
+    var lines = std.mem.splitScalar(u8, agents_text, '\n');
+    var in_available_skills = false;
+    var has_items = false;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const trimmed = std.mem.trim(u8, line, " \t");
+
+        if (std.mem.startsWith(u8, trimmed, "### ")) {
+            if (in_available_skills) break;
+            in_available_skills = std.ascii.eqlIgnoreCase(trimmed, "### Available skills");
+            continue;
+        }
+
+        if (!in_available_skills) continue;
+        if (!std.mem.startsWith(u8, trimmed, "- ")) continue;
+
+        const bullet_body = std.mem.trim(u8, trimmed[2..], " ");
+        if (bullet_body.len == 0) continue;
+
+        const colon_index = std.mem.indexOfScalar(u8, bullet_body, ':') orelse continue;
+        const skill_name = std.mem.trim(u8, bullet_body[0..colon_index], " ");
+        const skill_description = std.mem.trim(u8, bullet_body[colon_index + 1 ..], " ");
+        if (skill_name.len == 0 or skill_description.len == 0) continue;
+
+        if (has_items) try out.writer.writeByte('\n');
+        try out.writer.print("- {s}: {s}", .{ skill_name, skill_description });
+        has_items = true;
+    }
+
+    if (!has_items) return null;
+    return @as(?[]u8, try out.toOwnedSlice());
+}
+
 fn openDirForPath(path: []const u8, flags: std.fs.Dir.OpenOptions) !std.fs.Dir {
     if (std.fs.path.isAbsolute(path)) {
         return std.fs.openDirAbsolute(path, flags);
@@ -8387,6 +8555,37 @@ test "parseOpenAiAuthModeName supports known values" {
     try std.testing.expect(parseOpenAiAuthModeName("api_key").? == .api_key);
     try std.testing.expect(parseOpenAiAuthModeName("codex").? == .codex);
     try std.testing.expect(parseOpenAiAuthModeName("unknown") == null);
+}
+
+test "extractAvailableSkillsSummaryAlloc parses available skills section" {
+    const allocator = std.testing.allocator;
+    const agents_text =
+        \\## Skills
+        \\### Available skills
+        \\- alpha-tool: Alpha description
+        \\- beta-tool: Beta description
+        \\### How to use skills
+        \\- ignored: this section is not part of available skills
+    ;
+
+    const summary = try extractAvailableSkillsSummaryAlloc(allocator, agents_text);
+    defer if (summary) |text| allocator.free(text);
+
+    try std.testing.expect(summary != null);
+    try std.testing.expectEqualStrings("- alpha-tool: Alpha description\n- beta-tool: Beta description", summary.?);
+}
+
+test "messageDisplayContent collapses agents context payload" {
+    const sample = struct {
+        role: Role,
+        content: []const u8,
+    }{
+        .role = .system,
+        .content = "[agents-context]\nsource: /tmp/AGENTS.md\nworkspace_instructions:\nhello",
+    };
+
+    const visible = messageDisplayContent(sample);
+    try std.testing.expectEqualStrings("[agents-context]", visible);
 }
 
 test "extractChatgptAccountIdFromJwtAlloc parses nested auth claim" {

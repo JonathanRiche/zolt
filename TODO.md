@@ -18,7 +18,7 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [ ] `request_user_input` equivalent
   - [ ] define blocking vs non-blocking behavior
   - [ ] specify UI surface (modal, inline prompt, status bar, etc.)
-- [ ] auto-load `agents.md` at start of each new chat; lazily load skill names/descriptions so the LLM knows when to use a skill
+- [x] auto-load `agents.md` at start of each new chat; lazily load skill names/descriptions so the LLM knows when to use a skill
 - [x] OpenAI provider: allow user to choose between Codex/ChatGPT subscription vs API key option
 
 ## External Context (Next)
