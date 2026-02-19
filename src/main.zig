@@ -142,7 +142,7 @@ pub fn main() !void {
     switch (cli_action) {
         .run_tui => |run_options| {
             if (run_options.session_id) |session_id| {
-                if (!app_state.switchConversation(session_id)) {
+                if (!(try app_state.switchConversation(allocator, session_id))) {
                     try writeSessionNotFoundToStderr(session_id);
                     return;
                 }
@@ -178,7 +178,7 @@ fn runSinglePromptTask(
     startup_options: tui.StartupOptions,
 ) !void {
     if (options.session_id) |session_id| {
-        if (!app_state.switchConversation(session_id)) {
+        if (!(try app_state.switchConversation(allocator, session_id))) {
             try writeSessionNotFoundToStderr(session_id);
             return;
         }

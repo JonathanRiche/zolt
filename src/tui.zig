@@ -2099,7 +2099,7 @@ const App = struct {
                 return;
             };
 
-            if (!self.app_state.switchConversation(conversation_id)) {
+            if (!(try self.app_state.switchConversation(self.allocator, conversation_id))) {
                 try self.setNoticeFmt("Conversation not found: {s}", .{conversation_id});
                 return;
             }
@@ -3399,7 +3399,7 @@ const App = struct {
                 self.command_picker_index = ordered_matches.items.len - 1;
             }
             const selected = &self.app_state.conversations.items[ordered_matches.items[self.command_picker_index]];
-            _ = self.app_state.switchConversation(selected.id);
+            _ = try self.app_state.switchConversation(self.allocator, selected.id);
             self.scroll_lines = 0;
             self.ensureCurrentConversationVisibleInStrip();
             try self.app_state.saveToPath(self.allocator, self.paths.state_path);

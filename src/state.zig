@@ -83,6 +83,8 @@ pub const TokenUsage = struct {
 pub const Conversation = struct {
     id: []u8,
     title: []u8,
+    selected_provider_id: ?[]u8 = null,
+    selected_model_id: ?[]u8 = null,
     created_ms: i64,
     updated_ms: i64,
     total_token_usage: TokenUsage = .{},
@@ -93,6 +95,8 @@ pub const Conversation = struct {
     pub fn deinit(self: *Conversation, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.title);
+        if (self.selected_provider_id) |provider_id| allocator.free(provider_id);
+        if (self.selected_model_id) |model_id| allocator.free(model_id);
         for (self.messages.items) |*message| {
             message.deinit(allocator);
         }
@@ -105,6 +109,10 @@ pub const Conversation = struct {
         try jw.write(self.id);
         try jw.objectField("title");
         try jw.write(self.title);
+        try jw.objectField("selected_provider_id");
+        try jw.write(self.selected_provider_id);
+        try jw.objectField("selected_model_id");
+        try jw.write(self.selected_model_id);
         try jw.objectField("created_ms");
         try jw.write(self.created_ms);
         try jw.objectField("updated_ms");
@@ -164,11 +172,15 @@ pub const AppState = struct {
         const conversation: Conversation = .{
             .id = try generateConversationId(allocator),
             .title = try allocator.dupe(u8, title),
+            .selected_provider_id = try allocator.dupe(u8, self.selected_provider_id),
+            .selected_model_id = try allocator.dupe(u8, self.selected_model_id),
             .created_ms = now_ms,
             .updated_ms = now_ms,
         };
         errdefer allocator.free(conversation.id);
         errdefer allocator.free(conversation.title);
+        errdefer if (conversation.selected_provider_id) |provider_id| allocator.free(provider_id);
+        errdefer if (conversation.selected_model_id) |model_id| allocator.free(model_id);
 
         try self.conversations.append(allocator, conversation);
         self.current_index = self.conversations.items.len - 1;
@@ -205,10 +217,32 @@ pub const AppState = struct {
         conversation.updated_ms = std.time.milliTimestamp();
     }
 
-    pub fn switchConversation(self: *AppState, conversation_id: []const u8) bool {
+    pub fn switchConversation(self: *AppState, allocator: std.mem.Allocator, conversation_id: []const u8) !bool {
         for (self.conversations.items, 0..) |conversation, index| {
             if (std.mem.eql(u8, conversation.id, conversation_id)) {
+                var provider_replacement: ?[]u8 = null;
+                errdefer if (provider_replacement) |provider| allocator.free(provider);
+                if (conversation.selected_provider_id) |provider_id| {
+                    provider_replacement = try allocator.dupe(u8, provider_id);
+                }
+
+                var model_replacement: ?[]u8 = null;
+                errdefer if (model_replacement) |model| allocator.free(model);
+                if (conversation.selected_model_id) |model_id| {
+                    model_replacement = try allocator.dupe(u8, model_id);
+                }
+
                 self.current_index = index;
+                if (provider_replacement) |replacement| {
+                    allocator.free(self.selected_provider_id);
+                    self.selected_provider_id = replacement;
+                    provider_replacement = null;
+                }
+                if (model_replacement) |replacement| {
+                    allocator.free(self.selected_model_id);
+                    self.selected_model_id = replacement;
+                    model_replacement = null;
+                }
                 return true;
             }
         }
@@ -217,12 +251,20 @@ pub const AppState = struct {
 
     pub fn setSelectedProvider(self: *AppState, allocator: std.mem.Allocator, provider_id: []const u8) !void {
         const replacement = try allocator.dupe(u8, provider_id);
+        errdefer allocator.free(replacement);
+        const conversation = self.currentConversation();
+        if (conversation.selected_provider_id) |existing| allocator.free(existing);
+        conversation.selected_provider_id = try allocator.dupe(u8, provider_id);
         allocator.free(self.selected_provider_id);
         self.selected_provider_id = replacement;
     }
 
     pub fn setSelectedModel(self: *AppState, allocator: std.mem.Allocator, model_id: []const u8) !void {
         const replacement = try allocator.dupe(u8, model_id);
+        errdefer allocator.free(replacement);
+        const conversation = self.currentConversation();
+        if (conversation.selected_model_id) |existing| allocator.free(existing);
+        conversation.selected_model_id = try allocator.dupe(u8, model_id);
         allocator.free(self.selected_model_id);
         self.selected_model_id = replacement;
     }
@@ -338,6 +380,14 @@ pub const AppState = struct {
             var conversation: Conversation = .{
                 .id = try allocator.dupe(u8, persisted_conversation.id),
                 .title = try allocator.dupe(u8, persisted_conversation.title),
+                .selected_provider_id = try allocator.dupe(
+                    u8,
+                    persisted_conversation.selected_provider_id orelse persisted_state.selected_provider_id,
+                ),
+                .selected_model_id = try allocator.dupe(
+                    u8,
+                    persisted_conversation.selected_model_id orelse persisted_state.selected_model_id,
+                ),
                 .created_ms = persisted_conversation.created_ms,
                 .updated_ms = persisted_conversation.updated_ms,
                 .total_token_usage = persisted_conversation.total_token_usage orelse .{},
@@ -406,6 +456,8 @@ const PersistedMessage = struct {
 const PersistedConversation = struct {
     id: []const u8,
     title: []const u8,
+    selected_provider_id: ?[]const u8 = null,
+    selected_model_id: ?[]const u8 = null,
     created_ms: i64,
     updated_ms: i64,
     total_token_usage: ?TokenUsage = null,
@@ -545,7 +597,39 @@ test "switchConversation returns false for unknown id" {
     var state = try AppState.init(allocator);
     defer state.deinit(allocator);
 
-    try std.testing.expect(!state.switchConversation("does-not-exist"));
+    try std.testing.expect(!(try state.switchConversation(allocator, "does-not-exist")));
+}
+
+test "switchConversation restores selected provider and model for target conversation" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator);
+    defer state.deinit(allocator);
+
+    const first_id = try allocator.dupe(u8, state.currentConversationConst().id);
+    defer allocator.free(first_id);
+
+    try state.setSelectedProvider(allocator, "openai");
+    try state.setSelectedModel(allocator, "gpt-5.3-codex-spark");
+    try state.appendMessage(allocator, .user, "first convo");
+
+    const second_id = try state.createConversation(allocator, "Second conversation");
+    try state.setSelectedProvider(allocator, "opencode");
+    try state.setSelectedModel(allocator, "claude-opus-4-1");
+    try state.appendMessage(allocator, .user, "second convo");
+
+    try std.testing.expect(std.mem.eql(u8, state.selected_provider_id, "opencode"));
+    try std.testing.expect(std.mem.eql(u8, state.selected_model_id, "claude-opus-4-1"));
+
+    try std.testing.expect(try state.switchConversation(allocator, first_id));
+    try std.testing.expect(std.mem.eql(u8, state.currentConversationConst().id, first_id));
+    try std.testing.expect(std.mem.eql(u8, state.selected_provider_id, "openai"));
+    try std.testing.expect(std.mem.eql(u8, state.selected_model_id, "gpt-5.3-codex-spark"));
+
+    try std.testing.expect(try state.switchConversation(allocator, second_id));
+    try std.testing.expect(std.mem.eql(u8, state.currentConversationConst().id, second_id));
+    try std.testing.expect(std.mem.eql(u8, state.selected_provider_id, "opencode"));
+    try std.testing.expect(std.mem.eql(u8, state.selected_model_id, "claude-opus-4-1"));
 }
 
 test "percentOfContextWindowRemaining reflects usage without fixed baseline" {
