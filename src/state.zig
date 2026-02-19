@@ -269,6 +269,18 @@ pub const AppState = struct {
         self.selected_model_id = replacement;
     }
 
+    pub fn setActiveProvider(self: *AppState, allocator: std.mem.Allocator, provider_id: []const u8) !void {
+        const replacement = try allocator.dupe(u8, provider_id);
+        allocator.free(self.selected_provider_id);
+        self.selected_provider_id = replacement;
+    }
+
+    pub fn setActiveModel(self: *AppState, allocator: std.mem.Allocator, model_id: []const u8) !void {
+        const replacement = try allocator.dupe(u8, model_id);
+        allocator.free(self.selected_model_id);
+        self.selected_model_id = replacement;
+    }
+
     fn shouldPersistConversation(conversation: *const Conversation) bool {
         return conversation.messages.items.len > 0;
     }
@@ -630,6 +642,31 @@ test "switchConversation restores selected provider and model for target convers
     try std.testing.expect(std.mem.eql(u8, state.currentConversationConst().id, second_id));
     try std.testing.expect(std.mem.eql(u8, state.selected_provider_id, "opencode"));
     try std.testing.expect(std.mem.eql(u8, state.selected_model_id, "claude-opus-4-1"));
+}
+
+test "setActiveProvider and setActiveModel do not overwrite conversation bindings" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator);
+    defer state.deinit(allocator);
+
+    try state.setSelectedProvider(allocator, "openai");
+    try state.setSelectedModel(allocator, "gpt-5.3-codex-spark");
+    try state.appendMessage(allocator, .user, "bound convo");
+
+    const conversation_id = try allocator.dupe(u8, state.currentConversationConst().id);
+    defer allocator.free(conversation_id);
+
+    try state.setActiveProvider(allocator, "opencode");
+    try state.setActiveModel(allocator, "claude-opus-4-1");
+    try std.testing.expect(std.mem.eql(u8, state.selected_provider_id, "opencode"));
+    try std.testing.expect(std.mem.eql(u8, state.selected_model_id, "claude-opus-4-1"));
+    try std.testing.expect(std.mem.eql(u8, state.currentConversationConst().selected_provider_id.?, "openai"));
+    try std.testing.expect(std.mem.eql(u8, state.currentConversationConst().selected_model_id.?, "gpt-5.3-codex-spark"));
+
+    try std.testing.expect(try state.switchConversation(allocator, conversation_id));
+    try std.testing.expect(std.mem.eql(u8, state.selected_provider_id, "openai"));
+    try std.testing.expect(std.mem.eql(u8, state.selected_model_id, "gpt-5.3-codex-spark"));
 }
 
 test "percentOfContextWindowRemaining reflects usage without fixed baseline" {

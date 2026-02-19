@@ -95,10 +95,10 @@ pub fn main() !void {
     var startup_options: tui.StartupOptions = .{};
     if (config) |cfg| {
         if (cfg.provider_id) |provider_id| {
-            try app_state.setSelectedProvider(allocator, provider_id);
+            try app_state.setActiveProvider(allocator, provider_id);
         }
         if (cfg.model_id) |model_id| {
-            try app_state.setSelectedModel(allocator, model_id);
+            try app_state.setActiveModel(allocator, model_id);
         }
         if (cfg.theme) |theme| {
             startup_options.theme = switch (theme) {
