@@ -854,12 +854,41 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
         .forest => .{ .fg = .{ .index = 114 }, .bold = true },
         .plain => .{},
     };
+    const style_diff_add: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 114 }, .bold = true },
+        .forest => .{ .fg = .{ .index = 114 }, .bold = true },
+        .plain => .{},
+    };
+    const style_diff_remove: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 203 }, .bold = true },
+        .forest => .{ .fg = .{ .index = 203 }, .bold = true },
+        .plain => .{},
+    };
+    const style_diff_meta: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 180 } },
+        .forest => .{ .fg = .{ .index = 151 } },
+        .plain => .{},
+    };
+    const style_code: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 117 }, .italic = true },
+        .forest => .{ .fg = .{ .index = 114 }, .italic = true },
+        .plain => .{},
+    };
 
     var row_index: usize = 0;
     var frame_lines = std.mem.splitScalar(u8, frame, '\n');
     while (frame_lines.next()) |line| {
         if (row_index >= lines) break;
         if (line.len == 0 and row_index + 1 >= lines) break;
+
+        const role_content: ?[]const u8 = if (std.mem.startsWith(u8, line, "▸ "))
+            line["▸ ".len..]
+        else if (std.mem.startsWith(u8, line, "● "))
+            line["● ".len..]
+        else if (std.mem.startsWith(u8, line, "◦ "))
+            line["◦ ".len..]
+        else
+            null;
 
         const line_style: vaxis.Style =
             if (std.mem.startsWith(u8, line, "Zolt | "))
@@ -874,14 +903,27 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
                 style_input
             else if (std.mem.startsWith(u8, line, "["))
                 style_picker_header
-            else if (std.mem.startsWith(u8, line, "▸ "))
-                style_user
-            else if (std.mem.startsWith(u8, line, "● "))
-                style_assistant
-            else if (std.mem.startsWith(u8, line, "◦ "))
-                style_system
             else if (std.mem.startsWith(u8, line, "> "))
                 style_accent
+            else if (role_content) |content|
+                if (std.mem.startsWith(u8, content, "+"))
+                    style_diff_add
+                else if (std.mem.startsWith(u8, content, "-") and !std.mem.startsWith(u8, content, "---"))
+                    style_diff_remove
+                else if (std.mem.startsWith(u8, content, "@@") or std.mem.startsWith(u8, content, "*** "))
+                    style_diff_meta
+                else if (std.mem.startsWith(u8, content, "[code") or
+                    std.mem.startsWith(u8, content, "[/code]") or
+                    std.mem.startsWith(u8, content, "    "))
+                    style_code
+                else if (std.mem.startsWith(u8, line, "▸ "))
+                    style_user
+                else if (std.mem.startsWith(u8, line, "● "))
+                    style_assistant
+                else if (std.mem.startsWith(u8, line, "◦ "))
+                    style_system
+                else
+                    .{}
             else if (std.mem.startsWith(u8, line, "```") or std.mem.startsWith(u8, line, "    "))
                 style_accent
             else
