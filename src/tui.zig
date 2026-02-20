@@ -374,7 +374,6 @@ pub fn run(
     if (startup_options.openai_auth_mode) |auth_mode| {
         app.openai_auth_mode = auth_mode;
     }
-    app.refreshFileIndex() catch {};
     app.ensureCurrentConversationVisibleInStrip();
 
     var raw_mode = try RawMode.enable();
@@ -450,7 +449,6 @@ pub fn runTaskPromptWithObserver(
     if (startup_options.openai_auth_mode) |auth_mode| {
         app.openai_auth_mode = auth_mode;
     }
-    app.refreshFileIndex() catch {};
     app.ensureCurrentConversationVisibleInStrip();
 
     try app.handlePrompt(trimmed_prompt);
@@ -540,6 +538,8 @@ const App = struct {
     file_picker_index: usize = 0,
     file_picker_scroll: usize = 0,
     file_index: std.ArrayList([]u8) = .empty,
+    file_index_attempted: bool = false,
+    file_index_loaded: bool = false,
     command_sessions: std.ArrayList(*CommandSession) = .empty,
     next_command_session_id: u32 = 1,
     compact_mode: bool = true,
@@ -2061,14 +2061,24 @@ const App = struct {
         if (std.mem.eql(u8, command, "files")) {
             const action = parts.next();
             if (action != null and std.mem.eql(u8, action.?, "refresh")) {
+                self.file_index_attempted = true;
                 self.refreshFileIndex() catch |err| {
                     try self.setNoticeFmt("file index refresh failed: {s}", .{@errorName(err)});
                     return;
                 };
+                self.file_index_loaded = true;
                 try self.setNoticeFmt("file index refreshed ({d} files)", .{self.file_index.items.len});
                 return;
             }
 
+            if (!self.file_index_attempted) {
+                try self.setNotice("file index not loaded yet (lazy). Type @ to load, or use /files refresh.");
+                return;
+            }
+            if (!self.file_index_loaded) {
+                try self.setNotice("file index unavailable (last load failed). Use /files refresh to retry.");
+                return;
+            }
             try self.setNoticeFmt("file index has {d} files. Use /files refresh after file changes.", .{self.file_index.items.len});
             return;
         }
@@ -2973,6 +2983,7 @@ const App = struct {
             return;
         };
 
+        self.ensureFileIndexLoaded();
         if (!self.file_picker_open) {
             self.file_picker_index = 0;
             self.file_picker_scroll = 0;
@@ -3678,6 +3689,13 @@ const App = struct {
             if (line.len == 0) continue;
             try self.file_index.append(self.allocator, try self.allocator.dupe(u8, line));
         }
+    }
+
+    fn ensureFileIndexLoaded(self: *App) void {
+        if (self.file_index_loaded or self.file_index_attempted) return;
+        self.file_index_attempted = true;
+        self.refreshFileIndex() catch return;
+        self.file_index_loaded = true;
     }
 };
 
