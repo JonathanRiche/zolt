@@ -29,6 +29,9 @@ const CliRunTaskOptions = struct {
 
 const CliListModelsOptions = struct {
     provider_id: ?[]const u8 = null,
+    search_query: ?[]const u8 = null,
+    select: bool = false,
+    set_default_model_id: ?[]const u8 = null,
 };
 
 const CliAction = union(enum) {
@@ -77,7 +80,7 @@ pub fn main() !void {
         defer catalog.deinit(allocator);
         defer paths.deinit(allocator);
 
-        try writeModelsListToStdout(&catalog, cli_action.list_models);
+        try writeModelsListToStdout(allocator, &catalog, cli_action.list_models, paths.config_path);
         return;
     }
 
@@ -185,7 +188,7 @@ pub fn main() !void {
             try runSinglePromptTask(allocator, &paths, &app_state, &catalog, task_options, startup_options);
         },
         .list_models => |options| {
-            try writeModelsListToStdout(&catalog, options);
+            try writeModelsListToStdout(allocator, &catalog, options, paths.config_path);
         },
         else => unreachable,
     }
@@ -566,10 +569,58 @@ fn parseListModelsCliAction(args: []const []const u8) CliAction {
             continue;
         }
 
+        if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--search")) {
+            if (index + 1 >= args.len) return .{ .invalid = arg };
+            if (options.search_query != null) return .{ .invalid = arg };
+            const query = args[index + 1];
+            if (query.len == 0 or query[0] == '-') return .{ .invalid = arg };
+            options.search_query = query;
+            index += 2;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--search=")) {
+            if (options.search_query != null) return .{ .invalid = arg };
+            const query = arg["--search=".len..];
+            if (query.len == 0) return .{ .invalid = arg };
+            options.search_query = query;
+            index += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--select")) {
+            options.select = true;
+            index += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--set-default")) {
+            if (index + 1 >= args.len) return .{ .invalid = arg };
+            if (options.set_default_model_id != null) return .{ .invalid = arg };
+            const model_id = args[index + 1];
+            if (model_id.len == 0 or model_id[0] == '-') return .{ .invalid = arg };
+            options.set_default_model_id = model_id;
+            index += 2;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--set-default=")) {
+            if (options.set_default_model_id != null) return .{ .invalid = arg };
+            const model_id = arg["--set-default=".len..];
+            if (model_id.len == 0) return .{ .invalid = arg };
+            options.set_default_model_id = model_id;
+            index += 1;
+            continue;
+        }
+
         if (arg.len > 0 and arg[0] == '-') return .{ .invalid = arg };
         if (options.provider_id != null) return .{ .invalid = arg };
         options.provider_id = arg;
         index += 1;
+    }
+
+    if ((options.select or options.set_default_model_id != null) and options.provider_id == null) {
+        return .{ .invalid = "models" };
     }
 
     return .{ .list_models = options };
@@ -656,6 +707,9 @@ fn writeHelpToStdout() !void {
             "  zolt run --output <text|logs|json|json-stream> \"<prompt>\"\n" ++
             "  zolt models [provider-id]\n" ++
             "  zolt models --provider <provider-id>\n" ++
+            "  zolt models --provider <provider-id> --search <query>\n" ++
+            "  zolt models --provider <provider-id> --select [--search <query>]\n" ++
+            "  zolt models --provider <provider-id> --set-default <model-id>\n" ++
             "  zolt -s <conversation-id>\n" ++
             "  zolt --session <conversation-id>\n" ++
             "  zolt run --session <conversation-id> \"<prompt>\"\n" ++
@@ -673,11 +727,18 @@ fn writeHelpToStdout() !void {
             "Models listing:\n" ++
             "  zolt models                 list providers and model counts\n" ++
             "  zolt models opencode        list model IDs for provider\n" ++
-            "  zolt models -p openai       same as above\n",
+            "  zolt models -p openai       same as above\n" ++
+            "  zolt models -p openai -q codex  filter provider models\n" ++
+            "  zolt models -p openai --select  choose and save default model\n",
     );
 }
 
-fn writeModelsListToStdout(catalog: *const models.Catalog, options: CliListModelsOptions) !void {
+fn writeModelsListToStdout(
+    allocator: std.mem.Allocator,
+    catalog: *const models.Catalog,
+    options: CliListModelsOptions,
+    config_path: []const u8,
+) !void {
     var output_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&output_buffer);
     defer stdout_writer.interface.flush() catch {};
@@ -695,18 +756,82 @@ fn writeModelsListToStdout(catalog: *const models.Catalog, options: CliListModel
         if (provider.env_vars.items.len > 0) {
             try stdout_writer.interface.print("api_key_env: {s}\n", .{provider.env_vars.items[0]});
         }
+
+        if (options.set_default_model_id) |model_id| {
+            const model = findModelById(provider, model_id) orelse {
+                try writeModelNotFoundToStderr(provider, model_id);
+                return;
+            };
+
+            try app_config.setDefaultProviderModelAtPath(allocator, config_path, provider.id, model.id);
+            try stdout_writer.interface.print(
+                "saved defaults to {s}\nprovider: {s}\nmodel: {s}\n",
+                .{ config_path, provider.id, model.id },
+            );
+            return;
+        }
+
+        var matched_indexes: std.ArrayList(usize) = .empty;
+        defer matched_indexes.deinit(allocator);
+        for (provider.models.items, 0..) |model, model_index| {
+            if (modelMatchesSearch(model, options.search_query)) {
+                try matched_indexes.append(allocator, model_index);
+            }
+        }
+
+        if (options.search_query) |query| {
+            try stdout_writer.interface.print("filtered: {d}/{d}  query:{s}\n", .{
+                matched_indexes.items.len,
+                provider.models.items.len,
+                query,
+            });
+        }
+
+        if (options.select) {
+            const selected_model_index = selectModelIndexInteractively(
+                allocator,
+                provider,
+                matched_indexes.items,
+                options.search_query,
+            ) catch |err| switch (err) {
+                error.NotATerminal => {
+                    try writeModelsSelectionNeedsTtyToStderr();
+                    return;
+                },
+                error.InvalidSelection => {
+                    try writeModelsSelectionInvalidToStderr();
+                    return;
+                },
+                else => return err,
+            };
+
+            if (selected_model_index) |model_index| {
+                const selected = provider.models.items[model_index];
+                try app_config.setDefaultProviderModelAtPath(allocator, config_path, provider.id, selected.id);
+                try stdout_writer.interface.print(
+                    "saved defaults to {s}\nprovider: {s}\nmodel: {s}\n",
+                    .{ config_path, provider.id, selected.id },
+                );
+            } else {
+                try stdout_writer.interface.writeAll("selection canceled\n");
+            }
+            return;
+        }
+
         try stdout_writer.interface.writeAll("\nmodel ids:\n");
-        for (provider.models.items) |model| {
+        for (matched_indexes.items) |model_index| {
+            const model = provider.models.items[model_index];
             if (model.context_window) |window| {
                 try stdout_writer.interface.print("- {s}  (ctx:{d})\n", .{ model.id, window });
             } else {
                 try stdout_writer.interface.print("- {s}\n", .{model.id});
             }
         }
-        if (provider.models.items.len > 0) {
+        if (matched_indexes.items.len > 0) {
+            const first = provider.models.items[matched_indexes.items[0]];
             try stdout_writer.interface.print(
                 "\nconfig.jsonc example:\n{{\n  \"provider\": \"{s}\",\n  \"model\": \"{s}\"\n}}\n",
-                .{ provider.id, provider.models.items[0].id },
+                .{ provider.id, first.id },
             );
         }
         return;
@@ -727,6 +852,137 @@ fn writeModelsListToStdout(catalog: *const models.Catalog, options: CliListModel
             );
         }
     }
+}
+
+fn modelMatchesSearch(model: models.ModelInfo, query: ?[]const u8) bool {
+    const search = query orelse return true;
+    const trimmed = std.mem.trim(u8, search, " \t\r\n");
+    if (trimmed.len == 0) return true;
+    return containsAsciiIgnoreCase(model.id, trimmed) or containsAsciiIgnoreCase(model.name, trimmed);
+}
+
+fn findModelById(provider: *const models.ProviderInfo, model_id: []const u8) ?models.ModelInfo {
+    for (provider.models.items) |model| {
+        if (std.mem.eql(u8, model.id, model_id)) return model;
+    }
+    return null;
+}
+
+fn selectModelIndexInteractively(
+    allocator: std.mem.Allocator,
+    provider: *const models.ProviderInfo,
+    matched_indexes: []const usize,
+    search_query: ?[]const u8,
+) !?usize {
+    if (!std.posix.isatty(std.fs.File.stdin().handle) or !std.posix.isatty(std.fs.File.stdout().handle)) {
+        return error.NotATerminal;
+    }
+
+    var output_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&output_buffer);
+    defer stdout_writer.interface.flush() catch {};
+
+    if (search_query) |query| {
+        try stdout_writer.interface.print(
+            "select from {d} model(s) for provider {s} (query:{s})\n",
+            .{ matched_indexes.len, provider.id, query },
+        );
+    } else {
+        try stdout_writer.interface.print(
+            "select from {d} model(s) for provider {s}\n",
+            .{ matched_indexes.len, provider.id },
+        );
+    }
+
+    if (matched_indexes.len == 0) {
+        try stdout_writer.interface.writeAll("no models match the current query\n");
+        return null;
+    }
+
+    for (matched_indexes, 0..) |model_index, display_index| {
+        const model = provider.models.items[model_index];
+        if (model.context_window) |window| {
+            try stdout_writer.interface.print("{d}. {s}  (ctx:{d})\n", .{ display_index + 1, model.id, window });
+        } else {
+            try stdout_writer.interface.print("{d}. {s}\n", .{ display_index + 1, model.id });
+        }
+    }
+
+    try stdout_writer.interface.print("choice [1-{d}] (enter to cancel): ", .{matched_indexes.len});
+    try stdout_writer.interface.flush();
+
+    const line = try readLineFromStdinAlloc(allocator, 64);
+    defer allocator.free(line);
+
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    const selected = std.fmt.parseInt(usize, trimmed, 10) catch return error.InvalidSelection;
+    if (selected < 1 or selected > matched_indexes.len) return error.InvalidSelection;
+    return matched_indexes[selected - 1];
+}
+
+fn readLineFromStdinAlloc(allocator: std.mem.Allocator, max_len: usize) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const read_len = try std.posix.read(std.fs.File.stdin().handle, byte[0..]);
+        if (read_len == 0) break;
+        if (byte[0] == '\n') break;
+        if (byte[0] == '\r') continue;
+
+        if (output.items.len >= max_len) return error.InvalidSelection;
+        try output.append(allocator, byte[0]);
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var matched = true;
+        var i: usize = 0;
+        while (i < needle.len) : (i += 1) {
+            if (std.ascii.toLower(haystack[start + i]) != std.ascii.toLower(needle[i])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+
+    return false;
+}
+
+fn writeModelNotFoundToStderr(provider: *const models.ProviderInfo, model_id: []const u8) !void {
+    var output_buffer: [2048]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
+    defer stderr_writer.interface.flush() catch {};
+
+    try stderr_writer.interface.print("model not found for provider {s}: {s}\n", .{ provider.id, model_id });
+    try stderr_writer.interface.writeAll("Try: zolt models --provider ");
+    try stderr_writer.interface.writeAll(provider.id);
+    try stderr_writer.interface.writeAll("\n");
+}
+
+fn writeModelsSelectionNeedsTtyToStderr() !void {
+    var output_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
+    defer stderr_writer.interface.flush() catch {};
+    try stderr_writer.interface.writeAll("model selection requires a TTY. Use --set-default <model-id> for non-interactive usage.\n");
+}
+
+fn writeModelsSelectionInvalidToStderr() !void {
+    var output_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
+    defer stderr_writer.interface.flush() catch {};
+    try stderr_writer.interface.writeAll("invalid model selection input\n");
 }
 
 fn writeModelProviderNotFoundToStderr(catalog: *const models.Catalog, provider_id: []const u8) !void {
@@ -855,7 +1111,12 @@ test "parseCliAction handles invalid and empty args" {
 test "parseCliAction parses models subcommand variants" {
     const basic = parseCliAction(&.{"models"});
     switch (basic) {
-        .list_models => |options| try std.testing.expect(options.provider_id == null),
+        .list_models => |options| {
+            try std.testing.expect(options.provider_id == null);
+            try std.testing.expect(options.search_query == null);
+            try std.testing.expect(!options.select);
+            try std.testing.expect(options.set_default_model_id == null);
+        },
         else => return error.TestUnexpectedResult,
     }
 
@@ -876,6 +1137,24 @@ test "parseCliAction parses models subcommand variants" {
         .list_models => |options| try std.testing.expectEqualStrings("anthropic", options.provider_id.?),
         else => return error.TestUnexpectedResult,
     }
+
+    const search_flag = parseCliAction(&.{ "models", "-p", "openai", "--search", "codex" });
+    switch (search_flag) {
+        .list_models => |options| try std.testing.expectEqualStrings("codex", options.search_query.?),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const select_flag = parseCliAction(&.{ "models", "-p", "openai", "--select" });
+    switch (select_flag) {
+        .list_models => |options| try std.testing.expect(options.select),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const set_default_flag = parseCliAction(&.{ "models", "--provider", "openai", "--set-default", "gpt-5.3-codex" });
+    switch (set_default_flag) {
+        .list_models => |options| try std.testing.expectEqualStrings("gpt-5.3-codex", options.set_default_model_id.?),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "parseCliAction rejects invalid models subcommand args" {
@@ -888,6 +1167,18 @@ test "parseCliAction rejects invalid models subcommand args" {
     const duplicate_provider = parseCliAction(&.{ "models", "openai", "opencode" });
     switch (duplicate_provider) {
         .invalid => |arg| try std.testing.expectEqualStrings("opencode", arg),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const set_default_without_provider = parseCliAction(&.{ "models", "--set-default", "gpt-5.3-codex" });
+    switch (set_default_without_provider) {
+        .invalid => |arg| try std.testing.expectEqualStrings("models", arg),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const select_without_provider = parseCliAction(&.{ "models", "--select" });
+    switch (select_without_provider) {
+        .invalid => |arg| try std.testing.expectEqualStrings("models", arg),
         else => return error.TestUnexpectedResult,
     }
 }

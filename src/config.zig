@@ -100,6 +100,53 @@ pub fn loadOptionalFromPath(allocator: std.mem.Allocator, path: []const u8) !?Co
     return @as(?Config, try parseConfigJsonc(allocator, content));
 }
 
+pub fn setDefaultProviderModelAtPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    provider_id: []const u8,
+    model_id: []const u8,
+) !void {
+    const provider_trimmed = std.mem.trim(u8, provider_id, " \t\r\n");
+    const model_trimmed = std.mem.trim(u8, model_id, " \t\r\n");
+    if (provider_trimmed.len == 0 or model_trimmed.len == 0) return error.InvalidConfigValue;
+
+    var parsed = try loadJsonObjectConfigFromPathOrDefault(allocator, path);
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidConfigRoot,
+    };
+
+    const arena_allocator = parsed.arena.allocator();
+    try upsertJsonObjectString(root_object, arena_allocator, "provider", provider_trimmed);
+    try upsertJsonObjectString(root_object, arena_allocator, "model", model_trimmed);
+
+    if (std.fs.path.dirname(path)) |dirname| {
+        try std.fs.cwd().makePath(dirname);
+    }
+
+    var payload_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer payload_writer.deinit();
+    var jw: std.json.Stringify = .{
+        .writer = &payload_writer.writer,
+        .options = .{ .whitespace = .indent_2 },
+    };
+    try jw.write(parsed.value);
+
+    const payload = try payload_writer.toOwnedSlice();
+    defer allocator.free(payload);
+
+    var file = try createFileForPath(path, .{ .truncate = true });
+    defer file.close();
+
+    var write_buffer: [4096]u8 = undefined;
+    var writer = file.writer(&write_buffer);
+    defer writer.interface.flush() catch {};
+    try writer.interface.writeAll(payload);
+    try writer.interface.writeByte('\n');
+}
+
 fn parseConfigJsonc(allocator: std.mem.Allocator, text: []const u8) !Config {
     const stripped = try stripJsonCommentsAlloc(allocator, text);
     defer allocator.free(stripped);
@@ -280,6 +327,61 @@ fn stripJsonCommentsAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8
     return output.toOwnedSlice(allocator);
 }
 
+fn loadJsonObjectConfigFromPathOrDefault(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !std.json.Parsed(std.json.Value) {
+    var file = openFileForPath(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return parseEmptyConfigObject(allocator),
+        else => return err,
+    };
+    defer file.close();
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(&read_buffer);
+    var content_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer content_writer.deinit();
+
+    _ = try reader.interface.streamRemaining(&content_writer.writer);
+    const content = try content_writer.toOwnedSlice();
+    defer allocator.free(content);
+
+    const stripped = try stripJsonCommentsAlloc(allocator, content);
+    defer allocator.free(stripped);
+    const trimmed = std.mem.trim(u8, stripped, " \t\r\n");
+    if (trimmed.len == 0) return parseEmptyConfigObject(allocator);
+
+    return std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{
+        .duplicate_field_behavior = .use_last,
+        .allocate = .alloc_always,
+    });
+}
+
+fn parseEmptyConfigObject(allocator: std.mem.Allocator) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, "{}", .{
+        .duplicate_field_behavior = .use_last,
+        .allocate = .alloc_always,
+    });
+}
+
+fn upsertJsonObjectString(
+    object: *std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    const copy = try allocator.dupe(u8, value);
+    const entry = try object.getOrPut(key);
+    entry.value_ptr.* = .{ .string = copy };
+}
+
+fn createFileForPath(path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.createFileAbsolute(path, flags);
+    }
+    return std.fs.cwd().createFile(path, flags);
+}
+
 fn openFileForPath(path: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File {
     if (std.fs.path.isAbsolute(path)) {
         return std.fs.openFileAbsolute(path, flags);
@@ -369,4 +471,62 @@ test "parse jsonc openai auth aliases" {
 
     try std.testing.expect(config.openai_auth_mode != null);
     try std.testing.expect(config.openai_auth_mode.? == .api_key);
+}
+
+test "setDefaultProviderModelAtPath creates config file" {
+    const allocator = std.testing.allocator;
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const abs_dir = try temp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs_dir);
+
+    const config_path = try std.fs.path.join(allocator, &.{ abs_dir, "zolt", "config.jsonc" });
+    defer allocator.free(config_path);
+
+    try setDefaultProviderModelAtPath(allocator, config_path, "openai", "gpt-5.3-codex");
+
+    var loaded = try loadOptionalFromPath(allocator, config_path);
+    defer if (loaded) |*cfg| cfg.deinit(allocator);
+    try std.testing.expect(loaded != null);
+    try std.testing.expectEqualStrings("openai", loaded.?.provider_id.?);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", loaded.?.model_id.?);
+}
+
+test "setDefaultProviderModelAtPath preserves existing config fields" {
+    const allocator = std.testing.allocator;
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const abs_dir = try temp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs_dir);
+
+    const config_path = try std.fs.path.join(allocator, &.{ abs_dir, "config.jsonc" });
+    defer allocator.free(config_path);
+
+    var file = try createFileForPath(config_path, .{ .truncate = true });
+    defer file.close();
+
+    var write_buffer: [512]u8 = undefined;
+    var writer = file.writer(&write_buffer);
+    defer writer.interface.flush() catch {};
+    try writer.interface.writeAll(
+        \\{
+        \\  "theme": "codex",
+        \\  "ui_mode": "comfy"
+        \\}
+    );
+    try writer.interface.flush();
+
+    try setDefaultProviderModelAtPath(allocator, config_path, "opencode", "gpt-5.3-codex");
+
+    var loaded = try loadOptionalFromPath(allocator, config_path);
+    defer if (loaded) |*cfg| cfg.deinit(allocator);
+    try std.testing.expect(loaded != null);
+    try std.testing.expectEqualStrings("opencode", loaded.?.provider_id.?);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", loaded.?.model_id.?);
+    try std.testing.expect(loaded.?.theme.? == .codex);
+    try std.testing.expect(loaded.?.ui_mode.? == .comfy);
 }

@@ -78,6 +78,9 @@ zolt --version
 zolt models
 zolt models opencode
 zolt models --provider openai
+zolt models --provider openai --search codex
+zolt models --provider openai --select --search codex
+zolt models --provider openai --set-default gpt-5.3-codex
 zolt -s <conversation-id>
 zolt --session <conversation-id>
 zolt run "<prompt>"
@@ -231,6 +234,9 @@ Commands:
 - CLI model listing:
   - `zolt models` shows provider IDs + model counts
   - `zolt models <provider-id>` prints exact model IDs (plus config snippet)
+  - `zolt models --provider <id> --search <query>` filters models by id/name
+  - `zolt models --provider <id> --select [--search <query>]` opens a numbered picker in terminal and saves defaults
+  - `zolt models --provider <id> --set-default <model-id>` writes provider/model defaults to config without opening TUI
 
 ## Core Usage
 
