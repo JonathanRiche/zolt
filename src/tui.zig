@@ -524,12 +524,12 @@ fn runInteractiveVaxisLoop(app: *App) !void {
 
         try vx.enterAltScreen(tty.writer());
         try vx.queryTerminal(tty.writer(), 100 * std.time.ns_per_ms);
-        try app.render();
 
         while (!app.should_exit and !app.restart_interactive_loop) {
             switch (loop.nextEvent()) {
-                .winsize => {
-                    try app.render();
+                .winsize => |winsize| {
+                    try vx.resize(app.allocator, tty.writer(), winsize);
+                    try renderVaxisFrame(&vx, &tty, app);
                 },
                 .key_press => |key| {
                     const mapped_key = mapVaxisKeyToByte(key) orelse continue;
@@ -540,7 +540,7 @@ fn runInteractiveVaxisLoop(app: *App) !void {
                     try app.handleByte(mapped_key);
                     if (app.restart_interactive_loop) return;
                     if (!app.should_exit) {
-                        try app.render();
+                        try renderVaxisFrame(&vx, &tty, app);
                     }
                 },
             }
@@ -586,7 +586,280 @@ fn suspendForJobControlVaxis(vx: anytype, tty: anytype, app: *App) !void {
     try std.posix.raise(std.posix.SIG.TSTP);
     try vx.enterAltScreen(tty.writer());
     try app.setNotice("Resumed (fg)");
-    try app.render();
+    try renderVaxisFrame(vx, tty, app);
+}
+
+fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
+    if (self.headless) return;
+
+    const vaxis = @import("vaxis");
+    const width: usize = @intCast(vx.screen.width);
+    const lines: usize = @intCast(vx.screen.height);
+    if (width == 0 or lines == 0) return;
+
+    var body_writer: std.Io.Writer.Allocating = .init(self.allocator);
+    defer body_writer.deinit();
+
+    const conversation = self.app_state.currentConversationConst();
+    const palette = paletteForTheme(.plain);
+    const content_width = if (width > 4) width - 4 else 56;
+    const top_lines: usize = if (self.compact_mode) 2 else 4;
+    const picker_lines = self.pickerLineCount(lines);
+    const bottom_lines: usize = 3 + picker_lines;
+    const viewport_height = @max(@as(usize, 4), lines - top_lines - bottom_lines);
+
+    const now_ms = std.time.milliTimestamp();
+    const stream_notice = if (self.is_streaming)
+        try buildStreamingNotice(self.allocator, streamTaskTitle(self.stream_task), self.stream_started_ms, now_ms)
+    else
+        null;
+    defer if (stream_notice) |text| self.allocator.free(text);
+    const active_notice = stream_notice orelse self.notice;
+    const last_index = if (conversation.messages.items.len == 0) @as(usize, 0) else conversation.messages.items.len - 1;
+    for (conversation.messages.items, 0..) |message, index| {
+        const loading_placeholder = if (self.is_streaming and
+            index == last_index and
+            message.role == .assistant and
+            message.content.len == 0)
+            try buildWorkingPlaceholder(self.allocator, streamTaskTitle(self.stream_task), self.stream_started_ms, now_ms)
+        else
+            null;
+        defer if (loading_placeholder) |text| self.allocator.free(text);
+
+        try appendMessageBlock(
+            self.allocator,
+            &body_writer.writer,
+            message,
+            content_width,
+            palette,
+            self.compact_mode,
+            loading_placeholder,
+        );
+    }
+    const body = try body_writer.toOwnedSlice();
+    defer self.allocator.free(body);
+
+    var body_lines: std.ArrayList([]const u8) = .empty;
+    defer body_lines.deinit(self.allocator);
+    var split_lines = std.mem.splitScalar(u8, body, '\n');
+    while (split_lines.next()) |line| {
+        try body_lines.append(self.allocator, line);
+    }
+    if (body_lines.items.len > 0 and body_lines.items[body_lines.items.len - 1].len == 0) {
+        _ = body_lines.orderedRemove(body_lines.items.len - 1);
+    }
+
+    const total_body_lines = body_lines.items.len;
+    const max_scroll = if (total_body_lines > viewport_height) total_body_lines - viewport_height else 0;
+    if (self.scroll_lines > max_scroll) self.scroll_lines = max_scroll;
+    const start_line = if (total_body_lines > viewport_height) total_body_lines - viewport_height - self.scroll_lines else 0;
+    const end_line = @min(start_line + viewport_height, total_body_lines);
+
+    var frame_writer: std.Io.Writer.Allocating = .init(self.allocator);
+    defer frame_writer.deinit();
+
+    const mode_label = if (self.mode == .insert) "insert" else "normal";
+    const stream_label = if (self.is_streaming) "streaming" else "idle";
+    const short_conv_id = if (conversation.id.len > 10) conversation.id[0..10] else conversation.id;
+
+    if (self.compact_mode) {
+        const compact = try std.fmt.allocPrint(
+            self.allocator,
+            "Zolt  {s}/{s}  mode:{s}  conv:{s}  {s}",
+            .{ self.app_state.selected_provider_id, self.app_state.selected_model_id, mode_label, short_conv_id, stream_label },
+        );
+        defer self.allocator.free(compact);
+        const compact_line = try truncateLineAlloc(self.allocator, compact, width);
+        defer self.allocator.free(compact_line);
+        try frame_writer.writer.writeAll(compact_line);
+        try frame_writer.writer.writeByte('\n');
+    } else {
+        const title = try std.fmt.allocPrint(
+            self.allocator,
+            "Zolt  mode:{s}  conv:{s}",
+            .{ mode_label, conversation.id },
+        );
+        defer self.allocator.free(title);
+        const title_line = try truncateLineAlloc(self.allocator, title, width);
+        defer self.allocator.free(title_line);
+        try frame_writer.writer.writeAll(title_line);
+        try frame_writer.writer.writeByte('\n');
+
+        const model_line = try std.fmt.allocPrint(
+            self.allocator,
+            "model: {s}/{s}  theme:{s}  ui:{s}  status:{s}",
+            .{ self.app_state.selected_provider_id, self.app_state.selected_model_id, @tagName(self.theme), if (self.compact_mode) "compact" else "comfy", stream_label },
+        );
+        defer self.allocator.free(model_line);
+        const model_trimmed = try truncateLineAlloc(self.allocator, model_line, width);
+        defer self.allocator.free(model_trimmed);
+        try frame_writer.writer.writeAll(model_trimmed);
+        try frame_writer.writer.writeByte('\n');
+
+        const note_text = try std.fmt.allocPrint(self.allocator, "note: {s}", .{active_notice});
+        defer self.allocator.free(note_text);
+        const note_line = try truncateLineAlloc(self.allocator, note_text, width);
+        defer self.allocator.free(note_line);
+        try frame_writer.writer.writeAll(note_line);
+        try frame_writer.writer.writeByte('\n');
+    }
+
+    try frame_writer.writer.splatByteAll('-', width);
+    try frame_writer.writer.writeByte('\n');
+
+    var rendered_lines: usize = 0;
+    for (body_lines.items[start_line..end_line]) |line| {
+        try frame_writer.writer.writeAll(line);
+        try frame_writer.writer.writeByte('\n');
+        rendered_lines += 1;
+    }
+    while (rendered_lines < viewport_height) : (rendered_lines += 1) {
+        try frame_writer.writer.writeByte('\n');
+    }
+
+    try frame_writer.writer.splatByteAll('-', width);
+    try frame_writer.writer.writeByte('\n');
+
+    const key_hint = if (self.is_streaming)
+        "esc esc stop pgup/pgdn"
+    else if (self.model_picker_open)
+        "ctrl-n/p or up/down, enter/tab select, esc close"
+    else if (self.command_picker_open)
+        if (self.command_picker_kind == .quick_actions)
+            "ctrl-n/p or up/down, enter/tab run, esc close"
+        else if (self.command_picker_kind == .conversation_switch)
+            "ctrl-n/p or up/down, enter/tab switch, esc close"
+        else
+            "ctrl-n/p or up/down, enter/tab insert, esc close"
+    else if (self.file_picker_open)
+        "ctrl-n/p or up/down, enter/tab insert, esc close"
+    else if (self.mode == .insert)
+        "enter esc / ctrl-p ctrl-v pgup/pgdn"
+    else
+        "i j/k pgup/pgdn / ctrl-p q";
+    const context_summary = try self.contextUsageSummary(conversation);
+    defer if (context_summary) |summary| self.allocator.free(summary);
+    const status_text = if (context_summary) |summary|
+        try std.fmt.allocPrint(
+            self.allocator,
+            "{s} | {s} | keys:{s} | scroll:{d}/{d}",
+            .{ active_notice, summary, key_hint, self.scroll_lines, max_scroll },
+        )
+    else
+        try std.fmt.allocPrint(
+            self.allocator,
+            "{s} | keys:{s} | scroll:{d}/{d}",
+            .{ active_notice, key_hint, self.scroll_lines, max_scroll },
+        );
+    defer self.allocator.free(status_text);
+    const status_line = try truncateLineAlloc(self.allocator, status_text, width);
+    defer self.allocator.free(status_line);
+    try frame_writer.writer.writeAll(status_line);
+    try frame_writer.writer.writeByte('\n');
+
+    if (self.model_picker_open) {
+        try self.renderModelPicker(&frame_writer.writer, width, lines, palette);
+    } else if (self.command_picker_open) {
+        try self.renderCommandPicker(&frame_writer.writer, width, lines, palette);
+    } else if (self.file_picker_open) {
+        try self.renderFilePicker(&frame_writer.writer, width, lines, palette);
+    }
+
+    const before_cursor = self.input_buffer.items[0..self.input_cursor];
+    const after_cursor = self.input_buffer.items[self.input_cursor..];
+    const input_view = try buildInputView(self.allocator, before_cursor, after_cursor, if (width > 10) width - 10 else 22);
+    defer self.allocator.free(input_view.text);
+    const input_line = try std.fmt.allocPrint(
+        self.allocator,
+        "[{s}]> {s}",
+        .{ if (self.mode == .insert) "INS" else "NOR", input_view.text },
+    );
+    defer self.allocator.free(input_line);
+    const input_line_trimmed = try truncateLineAlloc(self.allocator, input_line, width);
+    defer self.allocator.free(input_line_trimmed);
+    try frame_writer.writer.writeAll(input_line_trimmed);
+
+    const frame = try frame_writer.toOwnedSlice();
+    defer self.allocator.free(frame);
+
+    var win = vx.window();
+    win.clear();
+    const style_header: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 110 } },
+        .forest => .{ .fg = .{ .index = 71 } },
+        .plain => .{},
+    };
+    const style_dim: vaxis.Style = switch (self.theme) {
+        .codex, .forest => .{ .fg = .{ .index = 245 }, .dim = true },
+        .plain => .{},
+    };
+    const style_accent: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 117 } },
+        .forest => .{ .fg = .{ .index = 114 } },
+        .plain => .{},
+    };
+    const style_user: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 215 } },
+        .forest => .{ .fg = .{ .index = 151 } },
+        .plain => .{},
+    };
+    const style_assistant: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 114 } },
+        .forest => .{ .fg = .{ .index = 108 } },
+        .plain => .{},
+    };
+    const style_system: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 146 } },
+        .forest => .{ .fg = .{ .index = 145 } },
+        .plain => .{},
+    };
+
+    var row_index: usize = 0;
+    var frame_lines = std.mem.splitScalar(u8, frame, '\n');
+    while (frame_lines.next()) |line| {
+        if (row_index >= lines) break;
+        if (line.len == 0 and row_index + 1 >= lines) break;
+
+        const line_style: vaxis.Style =
+            if (std.mem.startsWith(u8, line, "Zolt  "))
+                style_header
+            else if (line.len > 0 and std.mem.trim(u8, line, "-").len == 0)
+                style_dim
+            else if (std.mem.startsWith(u8, line, "› "))
+                style_user
+            else if (std.mem.startsWith(u8, line, "• "))
+                style_assistant
+            else if (std.mem.startsWith(u8, line, "○ "))
+                style_system
+            else if (std.mem.startsWith(u8, line, "[INS]>") or std.mem.startsWith(u8, line, "[NOR]>"))
+                style_accent
+            else if (std.mem.startsWith(u8, line, "```") or std.mem.startsWith(u8, line, "    "))
+                style_accent
+            else
+                .{};
+
+        const segment: vaxis.Segment = .{ .text = line, .style = line_style };
+        _ = win.print(&.{segment}, .{
+            .row_offset = @as(u16, @intCast(row_index)),
+            .col_offset = 0,
+            .wrap = .none,
+        });
+        row_index += 1;
+    }
+
+    const cursor = computeInputCursorPlacement(
+        width,
+        lines,
+        self.compact_mode,
+        viewport_height,
+        picker_lines,
+        input_view.cursor_col,
+    );
+    const cursor_col: u16 = @intCast(@min(cursor.col -| 1, width -| 1));
+    const cursor_row: u16 = @intCast(@min(cursor.row -| 1, lines -| 1));
+    win.showCursor(cursor_col, cursor_row);
+
+    try vx.render(tty.writer());
 }
 
 pub fn runTaskPrompt(

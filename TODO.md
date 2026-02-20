@@ -5,16 +5,16 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 ## Vaxis Low-Level Migration Plan (New)
 - [x] extract terminal backend boundary (`src/terminal_backend.zig`) for raw mode + key mapping + pending input polling
 - [x] add optional `libvaxis` dependency + `-Dvaxis=true` build option (wired in `build.zig`, gated import)
-- [x] define backend interface in TUI (`ansi` vs `vaxis`) and route run loop through it (vaxis currently shimmed to ansi loop)
-- [ ] implement vaxis low-level event adapter:
+- [x] define backend interface in TUI (`ansi` vs `vaxis`) and route run loop through it
+- [x] implement vaxis low-level event adapter:
   - [x] keyboard (normal/insert, arrows, pgup/pgdn, ctrl combos)
   - [x] resize handling
   - [x] suspend/resume behavior parity (`Ctrl-Z`, `fg`) (POSIX path)
-- [ ] implement vaxis frame renderer parity:
-  - [ ] header/status/footer
-  - [ ] chat viewport + scrolling
-  - [ ] model/command/file/skills pickers
-  - [ ] markdown line styling parity
+- [x] implement vaxis frame renderer parity:
+  - [x] header/status/footer
+  - [x] chat viewport + scrolling
+  - [x] model/command/file/skills pickers
+  - [x] markdown line styling parity
 - [x] keep non-interactive `zolt run` path independent of vaxis backend (headless path bypasses interactive backend loops)
 - [x] add A/B toggle command (`/ui backend ansi|vaxis`) for runtime testing when vaxis is enabled
 - [x] add regression tests for parsing/key behavior that should remain backend-agnostic
