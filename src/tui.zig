@@ -601,6 +601,13 @@ fn suspendForJobControlVaxis(vx: anytype, tty: anytype, app: *App) !void {
     try renderVaxisFrame(vx, tty, app);
 }
 
+fn writeVaxisRuleLine(writer: *std.Io.Writer, width: usize) !void {
+    var index: usize = 0;
+    while (index < width) : (index += 1) {
+        try writer.writeAll("─");
+    }
+}
+
 fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
     if (self.headless) return;
 
@@ -671,14 +678,22 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
     defer frame_writer.deinit();
 
     const mode_label = if (self.mode == .insert) "insert" else "normal";
+    const mode_badge = if (self.mode == .insert) "INSERT" else "NORMAL";
     const stream_label = if (self.is_streaming) "streaming" else "idle";
     const short_conv_id = if (conversation.id.len > 10) conversation.id[0..10] else conversation.id;
+    const ui_density_label = if (self.compact_mode) "compact" else "comfy";
 
     if (self.compact_mode) {
         const compact = try std.fmt.allocPrint(
             self.allocator,
-            "Zolt  {s}/{s}  mode:{s}  conv:{s}  {s}",
-            .{ self.app_state.selected_provider_id, self.app_state.selected_model_id, mode_label, short_conv_id, stream_label },
+            "Zolt | {s}/{s} | {s} | {s} | conv:{s}",
+            .{
+                self.app_state.selected_provider_id,
+                self.app_state.selected_model_id,
+                mode_badge,
+                stream_label,
+                short_conv_id,
+            },
         );
         defer self.allocator.free(compact);
         const compact_line = try truncateLineAlloc(self.allocator, compact, width);
@@ -686,26 +701,26 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
         try frame_writer.writer.writeAll(compact_line);
         try frame_writer.writer.writeByte('\n');
     } else {
-        const title = try std.fmt.allocPrint(
+        const title_line_text = try std.fmt.allocPrint(
             self.allocator,
-            "Zolt  mode:{s}  conv:{s}",
-            .{ mode_label, conversation.id },
+            "Zolt | {s}/{s} | {s}",
+            .{ self.app_state.selected_provider_id, self.app_state.selected_model_id, stream_label },
         );
-        defer self.allocator.free(title);
-        const title_line = try truncateLineAlloc(self.allocator, title, width);
+        defer self.allocator.free(title_line_text);
+        const title_line = try truncateLineAlloc(self.allocator, title_line_text, width);
         defer self.allocator.free(title_line);
         try frame_writer.writer.writeAll(title_line);
         try frame_writer.writer.writeByte('\n');
 
-        const model_line = try std.fmt.allocPrint(
+        const meta_line = try std.fmt.allocPrint(
             self.allocator,
-            "model: {s}/{s}  theme:{s}  ui:{s}  status:{s}",
-            .{ self.app_state.selected_provider_id, self.app_state.selected_model_id, @tagName(self.theme), if (self.compact_mode) "compact" else "comfy", stream_label },
+            "mode:{s} | theme:{s} | density:{s} | conv:{s}",
+            .{ mode_label, @tagName(self.theme), ui_density_label, short_conv_id },
         );
-        defer self.allocator.free(model_line);
-        const model_trimmed = try truncateLineAlloc(self.allocator, model_line, width);
-        defer self.allocator.free(model_trimmed);
-        try frame_writer.writer.writeAll(model_trimmed);
+        defer self.allocator.free(meta_line);
+        const meta_trimmed = try truncateLineAlloc(self.allocator, meta_line, width);
+        defer self.allocator.free(meta_trimmed);
+        try frame_writer.writer.writeAll(meta_trimmed);
         try frame_writer.writer.writeByte('\n');
 
         const note_text = try std.fmt.allocPrint(self.allocator, "note: {s}", .{active_notice});
@@ -716,7 +731,7 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
         try frame_writer.writer.writeByte('\n');
     }
 
-    try frame_writer.writer.splatByteAll('-', width);
+    try writeVaxisRuleLine(&frame_writer.writer, width);
     try frame_writer.writer.writeByte('\n');
 
     var rendered_lines: usize = 0;
@@ -729,7 +744,7 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
         try frame_writer.writer.writeByte('\n');
     }
 
-    try frame_writer.writer.splatByteAll('-', width);
+    try writeVaxisRuleLine(&frame_writer.writer, width);
     try frame_writer.writer.writeByte('\n');
 
     const key_hint = if (self.is_streaming)
@@ -754,13 +769,13 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
     const status_text = if (context_summary) |summary|
         try std.fmt.allocPrint(
             self.allocator,
-            "{s} | {s} | keys:{s} | scroll:{d}/{d}",
+            "status | {s} | {s} | keys:{s} | scroll:{d}/{d}",
             .{ active_notice, summary, key_hint, self.scroll_lines, max_scroll },
         )
     else
         try std.fmt.allocPrint(
             self.allocator,
-            "{s} | keys:{s} | scroll:{d}/{d}",
+            "status | {s} | keys:{s} | scroll:{d}/{d}",
             .{ active_notice, key_hint, self.scroll_lines, max_scroll },
         );
     defer self.allocator.free(status_text);
@@ -797,8 +812,8 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
     var win = vx.window();
     win.clear();
     const style_header: vaxis.Style = switch (self.theme) {
-        .codex => .{ .fg = .{ .index = 110 } },
-        .forest => .{ .fg = .{ .index = 71 } },
+        .codex => .{ .fg = .{ .index = 111 }, .bold = true },
+        .forest => .{ .fg = .{ .index = 78 }, .bold = true },
         .plain => .{},
     };
     const style_dim: vaxis.Style = switch (self.theme) {
@@ -806,8 +821,8 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
         .plain => .{},
     };
     const style_accent: vaxis.Style = switch (self.theme) {
-        .codex => .{ .fg = .{ .index = 117 } },
-        .forest => .{ .fg = .{ .index = 114 } },
+        .codex => .{ .fg = .{ .index = 117 }, .bold = true },
+        .forest => .{ .fg = .{ .index = 114 }, .bold = true },
         .plain => .{},
     };
     const style_user: vaxis.Style = switch (self.theme) {
@@ -825,6 +840,20 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
         .forest => .{ .fg = .{ .index = 145 } },
         .plain => .{},
     };
+    const style_picker_header: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 117 }, .bold = true },
+        .forest => .{ .fg = .{ .index = 114 }, .bold = true },
+        .plain => .{},
+    };
+    const style_status: vaxis.Style = switch (self.theme) {
+        .codex, .forest => .{ .fg = .{ .index = 246 } },
+        .plain => .{},
+    };
+    const style_input: vaxis.Style = switch (self.theme) {
+        .codex => .{ .fg = .{ .index = 117 }, .bold = true },
+        .forest => .{ .fg = .{ .index = 114 }, .bold = true },
+        .plain => .{},
+    };
 
     var row_index: usize = 0;
     var frame_lines = std.mem.splitScalar(u8, frame, '\n');
@@ -833,17 +862,25 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
         if (line.len == 0 and row_index + 1 >= lines) break;
 
         const line_style: vaxis.Style =
-            if (std.mem.startsWith(u8, line, "Zolt  "))
+            if (std.mem.startsWith(u8, line, "Zolt | "))
                 style_header
-            else if (line.len > 0 and std.mem.trim(u8, line, "-").len == 0)
+            else if (std.mem.startsWith(u8, line, "status |"))
+                style_status
+            else if (std.mem.startsWith(u8, line, "note: ") or std.mem.startsWith(u8, line, "mode:"))
                 style_dim
-            else if (std.mem.startsWith(u8, line, "› "))
-                style_user
-            else if (std.mem.startsWith(u8, line, "• "))
-                style_assistant
-            else if (std.mem.startsWith(u8, line, "○ "))
-                style_system
+            else if (line.len > 0 and std.mem.trim(u8, line, "─").len == 0)
+                style_dim
             else if (std.mem.startsWith(u8, line, "[INS]>") or std.mem.startsWith(u8, line, "[NOR]>"))
+                style_input
+            else if (std.mem.startsWith(u8, line, "["))
+                style_picker_header
+            else if (std.mem.startsWith(u8, line, "▸ "))
+                style_user
+            else if (std.mem.startsWith(u8, line, "● "))
+                style_assistant
+            else if (std.mem.startsWith(u8, line, "◦ "))
+                style_system
+            else if (std.mem.startsWith(u8, line, "> "))
                 style_accent
             else if (std.mem.startsWith(u8, line, "```") or std.mem.startsWith(u8, line, "    "))
                 style_accent
@@ -4583,7 +4620,7 @@ const App = struct {
 
         const header_text = try std.fmt.allocPrint(
             self.allocator,
-            "model picker ({d}) provider:{s} query:{s}",
+            "[model picker {d}] provider:{s} query:{s}",
             .{ total, self.app_state.selected_provider_id, if (query.len == 0) "*" else query },
         );
         defer self.allocator.free(header_text);
@@ -4603,7 +4640,7 @@ const App = struct {
         while (index < end_index) : (index += 1) {
             const model = self.modelPickerNthMatch(query, index) orelse continue;
             const selected = index == self.model_picker_index;
-            const marker = if (selected) ">" else " ";
+            const marker = if (selected) "> " else "  ";
             const row_color = if (selected) palette.accent else palette.dim;
 
             const row_text = if (std.mem.eql(u8, model.id, model.name))
@@ -4999,7 +5036,7 @@ const App = struct {
 
         const header_text = try std.fmt.allocPrint(
             self.allocator,
-            "file picker ({d}) query:{s}",
+            "[file picker {d}] query:{s}",
             .{ total, if (query.len == 0) "*" else query },
         );
         defer self.allocator.free(header_text);
@@ -5019,10 +5056,10 @@ const App = struct {
         while (index < end_index) : (index += 1) {
             const selected_path = self.filePickerNthMatch(query, index) orelse continue;
             const selected = index == self.file_picker_index;
-            const marker = if (selected) ">" else " ";
+            const marker = if (selected) "> " else "  ";
             const row_color = if (selected) palette.accent else palette.dim;
 
-            const row_text = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ marker, selected_path });
+            const row_text = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ marker, selected_path });
             defer self.allocator.free(row_text);
             const row_line = try truncateLineAlloc(self.allocator, row_text, width);
             defer self.allocator.free(row_line);
@@ -5066,7 +5103,7 @@ const App = struct {
 
         const header_text = try std.fmt.allocPrint(
             self.allocator,
-            "{s} ({d}) query:{s}",
+            "[{s} {d}] query:{s}",
             .{
                 if (self.command_picker_kind == .conversation_switch)
                     "conversation sessions"
@@ -5099,13 +5136,13 @@ const App = struct {
         var index = self.command_picker_scroll;
         while (index < end_index) : (index += 1) {
             const is_selected = index == self.command_picker_index;
-            const marker = if (is_selected) ">" else " ";
+            const marker = if (is_selected) "> " else "  ";
             const row_color = if (is_selected) palette.accent else palette.dim;
             const row_text = if (self.command_picker_kind == .quick_actions) blk: {
                 const selected_entry = self.quickActionPickerNthMatch(query, index) orelse continue;
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{s} {s}  {s}",
+                    "{s}{s}  {s}",
                     .{ marker, selected_entry.label, selected_entry.description },
                 );
             } else if (self.command_picker_kind == .conversation_switch) blk: {
@@ -5130,7 +5167,7 @@ const App = struct {
                 const selected_entry = self.providerPickerNthMatch(query, index) orelse continue;
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{s} /provider {s}  {s}",
+                    "{s}/provider {s}  {s}",
                     .{ marker, selected_entry.command_suffix, selected_entry.description },
                 );
             } else if (self.command_picker_kind == .skill_options) blk: {
@@ -5138,14 +5175,14 @@ const App = struct {
                 switch (selected_entry) {
                     .refresh => break :blk try std.fmt.allocPrint(
                         self.allocator,
-                        "{s} /skills refresh  reload skills cache",
+                        "{s}/skills refresh  reload skills cache",
                         .{marker},
                     ),
                     .skill => |skill| {
                         const scope = self.skillScopeLabel(skill.scope);
                         break :blk try std.fmt.allocPrint(
                             self.allocator,
-                            "{s} /skills {s}  [{s}] {s}",
+                            "{s}/skills {s}  [{s}] {s}",
                             .{ marker, skill.name, scope, skill.description },
                         );
                     },
@@ -5154,7 +5191,7 @@ const App = struct {
                 const selected_entry = self.commandPickerNthMatch(query, index) orelse continue;
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{s} /{s}  {s}",
+                    "{s}/{s}  {s}",
                     .{ marker, selected_entry.name, selected_entry.description },
                 );
             };
@@ -5314,9 +5351,9 @@ fn appendMessageBlock(
     _ = compact_mode;
 
     const marker, const continuation, const color = switch (message.role) {
-        .user => .{ "› ", "  ", palette.user },
-        .assistant => .{ "• ", "  ", palette.assistant },
-        .system => .{ "○ ", "  ", palette.system },
+        .user => .{ "▸ ", "▸ ", palette.user },
+        .assistant => .{ "● ", "● ", palette.assistant },
+        .system => .{ "◦ ", "◦ ", palette.system },
     };
 
     const rendered_content = content_override orelse messageDisplayContent(message);
