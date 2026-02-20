@@ -117,6 +117,7 @@ const CommandPickerKind = enum {
     quick_actions,
     conversation_switch,
     provider_options,
+    skill_options,
 };
 
 const TerminalMetrics = struct {
@@ -924,10 +925,7 @@ const App = struct {
     fn openCommandPalette(self: *App) !void {
         self.mode = .insert;
         try self.setInputBufferTo(">");
-        self.command_picker_open = false;
-        self.command_picker_index = 0;
-        self.command_picker_scroll = 0;
-        self.command_picker_kind = .quick_actions;
+        self.resetCommandPickerForKind(.quick_actions);
         self.syncPickersFromInput();
         try self.setNotice("Opened command palette (type to filter)");
     }
@@ -935,10 +933,7 @@ const App = struct {
     fn openConversationSwitchPicker(self: *App) !void {
         self.mode = .insert;
         try self.setInputBufferTo("/sessions ");
-        self.command_picker_open = false;
-        self.command_picker_index = 0;
-        self.command_picker_scroll = 0;
-        self.command_picker_kind = .conversation_switch;
+        self.resetCommandPickerForKind(.conversation_switch);
         self.syncPickersFromInput();
         try self.setNotice("Select a conversation session");
     }
@@ -947,6 +942,13 @@ const App = struct {
         self.input_buffer.clearRetainingCapacity();
         try self.input_buffer.appendSlice(self.allocator, text);
         self.input_cursor = self.input_buffer.items.len;
+    }
+
+    fn resetCommandPickerForKind(self: *App, kind: CommandPickerKind) void {
+        self.command_picker_open = false;
+        self.command_picker_kind = kind;
+        self.command_picker_index = 0;
+        self.command_picker_scroll = 0;
     }
 
     fn shouldAutoTitleCurrentConversation(self: *App) bool {
@@ -1009,8 +1011,7 @@ const App = struct {
         self.input_buffer.clearRetainingCapacity();
         self.input_cursor = 0;
         self.model_picker_open = false;
-        self.command_picker_open = false;
-        self.command_picker_kind = .slash_commands;
+        self.resetCommandPickerForKind(.slash_commands);
         self.file_picker_open = false;
 
         if (line.len == 0) return;
@@ -3896,10 +3897,7 @@ const App = struct {
     fn syncPickersFromInput(self: *App) void {
         self.syncModelPickerFromInput();
         if (self.model_picker_open) {
-            self.command_picker_open = false;
-            self.command_picker_kind = .slash_commands;
-            self.command_picker_index = 0;
-            self.command_picker_scroll = 0;
+            self.resetCommandPickerForKind(.slash_commands);
             self.file_picker_open = false;
             self.file_picker_index = 0;
             self.file_picker_scroll = 0;
@@ -3947,6 +3945,7 @@ const App = struct {
             .quick_actions => parseQuickActionPickerQuery(self.input_buffer.items, self.input_cursor),
             .conversation_switch => parseConversationSwitchPickerQuery(self.input_buffer.items, self.input_cursor),
             .provider_options => parseProviderPickerQuery(self.input_buffer.items, self.input_cursor),
+            .skill_options => parseSkillsPickerQuery(self.input_buffer.items, self.input_cursor),
         };
     }
 
@@ -3958,6 +3957,9 @@ const App = struct {
             if (parseProviderPickerQuery(self.input_buffer.items, self.input_cursor)) |query| {
                 break :blk .{ .kind = .provider_options, .query = query };
             }
+            if (parseSkillsPickerQuery(self.input_buffer.items, self.input_cursor)) |query| {
+                break :blk .{ .kind = .skill_options, .query = query };
+            }
             if (parseQuickActionPickerQuery(self.input_buffer.items, self.input_cursor)) |query| {
                 break :blk .{ .kind = .quick_actions, .query = query };
             }
@@ -3968,10 +3970,7 @@ const App = struct {
         };
 
         const kind_query = maybe_kind_query orelse {
-            self.command_picker_open = false;
-            self.command_picker_kind = .slash_commands;
-            self.command_picker_index = 0;
-            self.command_picker_scroll = 0;
+            self.resetCommandPickerForKind(.slash_commands);
             return;
         };
 
@@ -4250,6 +4249,9 @@ const App = struct {
             .provider_options => {
                 count = self.providerPickerMatchCount(query);
             },
+            .skill_options => {
+                count = self.skillPickerMatchCount(query);
+            },
         }
         return count;
     }
@@ -4330,6 +4332,41 @@ const App = struct {
         return null;
     }
 
+    fn ensureSkillsLoadedForPicker(self: *App) void {
+        if (self.skills_loaded) return;
+        const discovered = discoverSkillsAlloc(self.allocator) catch return;
+        self.skills_loaded = true;
+        self.skills = discovered;
+    }
+
+    fn skillPickerMatchCount(self: *App, query: []const u8) usize {
+        self.ensureSkillsLoadedForPicker();
+
+        var count: usize = 0;
+        if (skillPickerRefreshMatchesQuery(query)) count += 1;
+        for (self.skills.items) |*skill| {
+            if (skillPickerSkillMatches(skill, query)) count += 1;
+        }
+        return count;
+    }
+
+    fn skillPickerNthMatch(self: *App, query: []const u8, target_index: usize) ?SkillPickerMatch {
+        self.ensureSkillsLoadedForPicker();
+
+        var seen: usize = 0;
+        if (skillPickerRefreshMatchesQuery(query)) {
+            if (seen == target_index) return .refresh;
+            seen += 1;
+        }
+
+        for (self.skills.items) |*skill| {
+            if (!skillPickerSkillMatches(skill, query)) continue;
+            if (seen == target_index) return .{ .skill = skill };
+            seen += 1;
+        }
+        return null;
+    }
+
     fn moveFilePickerSelection(self: *App, delta: i32) void {
         const query = currentAtTokenQuery(self.input_buffer.items, self.input_cursor) orelse return;
         const total = self.filePickerMatchCount(query);
@@ -4388,6 +4425,8 @@ const App = struct {
                 try self.setNotice("No quick action matches current query");
             } else if (self.command_picker_kind == .conversation_switch) {
                 try self.setNotice("No conversation matches current query");
+            } else if (self.command_picker_kind == .skill_options) {
+                try self.setNotice("No skill matches current query");
             } else {
                 try self.setNotice("No slash command matches current query");
             }
@@ -4442,6 +4481,21 @@ const App = struct {
             self.command_picker_index = 0;
             self.command_picker_scroll = 0;
             try self.setNoticeFmt("Switched to conversation: {s}", .{selected.id});
+        } else if (self.command_picker_kind == .skill_options) {
+            const selected = self.skillPickerNthMatch(query, self.command_picker_index) orelse return;
+            self.input_buffer.clearRetainingCapacity();
+            try self.input_buffer.appendSlice(self.allocator, "/skills ");
+            switch (selected) {
+                .refresh => try self.input_buffer.appendSlice(self.allocator, "refresh"),
+                .skill => |skill| try self.input_buffer.appendSlice(self.allocator, skill.name),
+            }
+            self.input_cursor = self.input_buffer.items.len;
+            self.resetCommandPickerForKind(.slash_commands);
+            switch (selected) {
+                .refresh => try self.setNotice("Inserted /skills refresh"),
+                .skill => |skill| try self.setNoticeFmt("Inserted /skills {s}", .{skill.name}),
+            }
+            self.syncPickersFromInput();
         } else {
             const selected = self.commandPickerNthMatch(query, self.command_picker_index) orelse return;
 
@@ -4616,6 +4670,8 @@ const App = struct {
                     "command palette"
                 else if (self.command_picker_kind == .provider_options)
                     "provider picker"
+                else if (self.command_picker_kind == .skill_options)
+                    "skills picker"
                 else
                     "command picker",
                 total,
@@ -4673,6 +4729,23 @@ const App = struct {
                     "{s} /provider {s}  {s}",
                     .{ marker, selected_entry.command_suffix, selected_entry.description },
                 );
+            } else if (self.command_picker_kind == .skill_options) blk: {
+                const selected_entry = self.skillPickerNthMatch(query, index) orelse continue;
+                switch (selected_entry) {
+                    .refresh => break :blk try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s} /skills refresh  reload skills cache",
+                        .{marker},
+                    ),
+                    .skill => |skill| {
+                        const scope = self.skillScopeLabel(skill.scope);
+                        break :blk try std.fmt.allocPrint(
+                            self.allocator,
+                            "{s} /skills {s}  [{s}] {s}",
+                            .{ marker, skill.name, scope, skill.description },
+                        );
+                    },
+                }
             } else blk: {
                 const selected_entry = self.commandPickerNthMatch(query, index) orelse continue;
                 break :blk try std.fmt.allocPrint(
@@ -5638,6 +5711,11 @@ const ProviderPickerEntry = struct {
     description: []const u8,
 };
 
+const SkillPickerMatch = union(enum) {
+    refresh,
+    skill: *const SkillInfo,
+};
+
 const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "help", .description = "open command palette", .insert_trailing_space = false },
     .{ .name = "commands", .description = "open quick action palette", .insert_trailing_space = false },
@@ -5732,6 +5810,20 @@ fn parseProviderPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
     return null;
 }
 
+fn parseSkillsPickerQuery(input: []const u8, cursor: usize) ?[]const u8 {
+    if (!std.mem.startsWith(u8, input, "/skills")) return null;
+    const command_len: usize = 7;
+    if (cursor < command_len) return null;
+
+    if (input.len == command_len) return "";
+    if (input.len > command_len and input[command_len] == ' ') {
+        const query_start: usize = command_len + 1;
+        const query_cursor = @max(query_start, @min(cursor, input.len));
+        return std.mem.trimLeft(u8, input[query_start..query_cursor], " ");
+    }
+    return null;
+}
+
 fn commandMatchesQuery(entry: BuiltinCommandEntry, query: []const u8) bool {
     if (query.len == 0) return true;
     return containsAsciiIgnoreCase(entry.name, query) or containsAsciiIgnoreCase(entry.description, query);
@@ -5753,6 +5845,24 @@ fn providerPickerEntryMatches(entry: ProviderPickerEntry, query: []const u8) boo
     if (query.len == 0) return true;
     return containsAsciiIgnoreCase(entry.command_suffix, query) or
         containsAsciiIgnoreCase(entry.description, query);
+}
+
+fn skillPickerRefreshMatchesQuery(query: []const u8) bool {
+    if (query.len == 0) return true;
+    return containsAsciiIgnoreCase("refresh", query) or
+        containsAsciiIgnoreCase("reload skills cache", query) or
+        containsAsciiIgnoreCase("/skills refresh", query);
+}
+
+fn skillPickerSkillMatches(skill: *const SkillInfo, query: []const u8) bool {
+    if (query.len == 0) return true;
+    const scope = switch (skill.scope) {
+        .project => "project",
+        .global => "global",
+    };
+    return containsAsciiIgnoreCase(skill.name, query) or
+        containsAsciiIgnoreCase(skill.description, query) or
+        containsAsciiIgnoreCase(scope, query);
 }
 
 const ConversationRelativeAge = struct {
@@ -9384,6 +9494,15 @@ test "parseProviderPickerQuery handles /provider argument edits" {
     try std.testing.expectEqualStrings("openai codex", parseProviderPickerQuery("/provider openai codex", 22).?);
     try std.testing.expect(parseProviderPickerQuery("/provider", 4) == null);
     try std.testing.expect(parseProviderPickerQuery("/providerx", 10) == null);
+}
+
+test "parseSkillsPickerQuery handles /skills argument edits" {
+    try std.testing.expectEqualStrings("", parseSkillsPickerQuery("/skills", 7).?);
+    try std.testing.expectEqualStrings("", parseSkillsPickerQuery("/skills ", 8).?);
+    try std.testing.expectEqualStrings("wea", parseSkillsPickerQuery("/skills wea", 11).?);
+    try std.testing.expectEqualStrings("refresh", parseSkillsPickerQuery("/skills refresh", 15).?);
+    try std.testing.expect(parseSkillsPickerQuery("/skills", 4) == null);
+    try std.testing.expect(parseSkillsPickerQuery("/skillsx", 8) == null);
 }
 
 test "collectConversationSwitchMatchOrder sorts newest conversations first" {
