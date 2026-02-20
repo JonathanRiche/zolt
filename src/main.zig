@@ -145,6 +145,9 @@ pub fn main() !void {
                 .codex => .codex,
             };
         }
+        if (cfg.auto_compact_percent_left) |percent_left| {
+            startup_options.auto_compact_percent_left = percent_left;
+        }
     }
 
     var catalog = blk: {

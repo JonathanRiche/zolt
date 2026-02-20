@@ -27,6 +27,7 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 - Markdown-aware chat rendering (headings, lists, block quotes, fenced code, inline code)
 - Multiple saved conversations (persisted to disk)
 - Codex-style conversation preview title from first prompt (for untitled/new chats)
+- Manual `/compact` plus auto-compaction when context window is low
 - Provider + model selection from `models.dev` cache
 - Context window footer (`used/full` and `% left` when available)
 - Slash command popup (Codex-style picker)
@@ -189,6 +190,7 @@ Supported keys:
 - `ui` (alias: `ui_mode`): `compact` | `comfy`
 - `compact_mode`: `true`/`false` (legacy alias for `ui`)
 - `openai_auth` (alias: `openai_auth_mode`): `auto` | `api_key` | `codex`
+- `auto_compact_percent_left` (alias: `auto_compact_trigger_percent_left`): integer `0..100` (default `15`)
 - `keybindings` (alias: `hotkeys`): optional key overrides for normal/insert mode
 
 Example:
@@ -198,6 +200,7 @@ Example:
   // startup defaults
   "provider": "openai",
   "openai_auth": "codex",
+  "auto_compact_percent_left": 12,
   "model": "gpt-4.1",
   "theme": "codex",
   "ui": "compact",
@@ -291,6 +294,8 @@ Picker triggers:
 - `/files [refresh]`
 - `/new [title]`
 - `/sessions [id]` (no id opens conversation picker)
+- `/compact` (compact current conversation now)
+- `/compact auto [on|off]` (toggle auto-compaction near context limit)
 - `/title <text>`
 - `/theme [codex|plain|forest]`
 - `/ui [compact|comfy]`

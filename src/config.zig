@@ -26,6 +26,7 @@ pub const Config = struct {
     theme: ?Theme = null,
     ui_mode: ?UiMode = null,
     openai_auth_mode: ?OpenAiAuthMode = null,
+    auto_compact_percent_left: ?i64 = null,
     keybindings: ?keybindings.Keybindings = null,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
@@ -47,6 +48,8 @@ const RawConfig = struct {
     compact_mode: ?bool = null,
     openai_auth: ?[]const u8 = null,
     openai_auth_mode: ?[]const u8 = null,
+    auto_compact_percent_left: ?i64 = null,
+    auto_compact_trigger_percent_left: ?i64 = null,
     keybindings: ?RawKeybindings = null,
     hotkeys: ?RawKeybindings = null,
 };
@@ -185,6 +188,11 @@ fn configFromRaw(allocator: std.mem.Allocator, raw: RawConfig) !Config {
     if (raw.openai_auth orelse raw.openai_auth_mode) |auth_mode_name| {
         const parsed = parseOpenAiAuthModeName(auth_mode_name) orelse return error.InvalidOpenAiAuthMode;
         config.openai_auth_mode = parsed;
+    }
+
+    if (raw.auto_compact_percent_left orelse raw.auto_compact_trigger_percent_left) |percent_left| {
+        if (percent_left < 0 or percent_left > 100) return error.InvalidAutoCompactPercentLeft;
+        config.auto_compact_percent_left = percent_left;
     }
 
     if (raw.keybindings orelse raw.hotkeys) |raw_keybindings| {
@@ -471,6 +479,32 @@ test "parse jsonc openai auth aliases" {
 
     try std.testing.expect(config.openai_auth_mode != null);
     try std.testing.expect(config.openai_auth_mode.? == .api_key);
+}
+
+test "parse jsonc auto compact threshold" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  "auto_compact_percent_left": 12
+        \\}
+    ;
+
+    var config = try parseConfigJsonc(allocator, input);
+    defer config.deinit(allocator);
+
+    try std.testing.expect(config.auto_compact_percent_left != null);
+    try std.testing.expectEqual(@as(i64, 12), config.auto_compact_percent_left.?);
+}
+
+test "parse jsonc rejects invalid auto compact threshold" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  "auto_compact_percent_left": 120
+        \\}
+    ;
+
+    try std.testing.expectError(error.InvalidAutoCompactPercentLeft, parseConfigJsonc(allocator, input));
 }
 
 test "setDefaultProviderModelAtPath creates config file" {

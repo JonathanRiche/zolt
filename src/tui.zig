@@ -11,6 +11,7 @@ const tools_runtime = @import("tools/runtime.zig");
 const Paths = @import("paths.zig").Paths;
 const AppState = @import("state.zig").AppState;
 const Conversation = @import("state.zig").Conversation;
+const Message = @import("state.zig").Message;
 const Role = @import("state.zig").Role;
 const TokenUsage = @import("state.zig").TokenUsage;
 const Keybindings = keybindings.Keybindings;
@@ -55,6 +56,7 @@ pub const StartupOptions = struct {
     compact_mode: ?bool = null,
     keybindings: ?Keybindings = null,
     openai_auth_mode: ?OpenAiAuthMode = null,
+    auto_compact_percent_left: ?i64 = null,
 };
 
 pub const RunTaskEvent = union(enum) {
@@ -73,6 +75,7 @@ const StreamTask = enum {
     idle,
     thinking,
     responding,
+    compacting,
     running_read,
     running_list_dir,
     running_read_file,
@@ -259,9 +262,23 @@ const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
 const AGENTS_CONTEXT_HEADER = "[agents-context]";
+const COMPACT_SUMMARY_HEADER = "[compact-summary]";
+const COMPACT_NOTE_HEADER = "[compact]";
 const AGENTS_CONTEXT_MAX_FILE_BYTES: usize = 128 * 1024;
 const AGENTS_CONTEXT_MAX_INSTRUCTIONS_BYTES: usize = 24 * 1024;
 const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const AUTO_COMPACT_PERCENT_LEFT_THRESHOLD: i64 = 15;
+const AUTO_COMPACT_MIN_MESSAGES: usize = 10;
+const COMPACT_KEEP_RECENT_MESSAGES: usize = 8;
+const COMPACT_MIN_SOURCE_MESSAGES: usize = 4;
+const COMPACT_LOCAL_FALLBACK_MAX_LINES: usize = 8;
+const COMPACT_LOCAL_FALLBACK_PREVIEW_CHARS: usize = 200;
+const COMPACT_SUMMARY_SYSTEM_PROMPT =
+    "You are compacting chat history for a coding assistant.\n" ++
+    "Produce a concise summary preserving user goals, constraints, decisions, unresolved questions, and pending tasks.\n" ++
+    "Do not call tools. Do not add XML tags. Use short bullet points.\n";
+const COMPACT_SUMMARY_USER_PROMPT =
+    "Summarize the prior conversation now. Keep it compact and high-signal for continuing work.";
 const KEY_UP_ARROW: u8 = keybindings.KEY_UP_ARROW;
 const KEY_DOWN_ARROW: u8 = keybindings.KEY_DOWN_ARROW;
 const KEY_PAGE_UP: u8 = keybindings.KEY_PAGE_UP;
@@ -374,6 +391,9 @@ pub fn run(
     if (startup_options.openai_auth_mode) |auth_mode| {
         app.openai_auth_mode = auth_mode;
     }
+    if (startup_options.auto_compact_percent_left) |percent_left| {
+        app.auto_compact_percent_left = normalizeAutoCompactPercentLeft(percent_left);
+    }
     app.ensureCurrentConversationVisibleInStrip();
 
     var raw_mode = try RawMode.enable();
@@ -448,6 +468,9 @@ pub fn runTaskPromptWithObserver(
     defer app.deinit();
     if (startup_options.openai_auth_mode) |auth_mode| {
         app.openai_auth_mode = auth_mode;
+    }
+    if (startup_options.auto_compact_percent_left) |percent_left| {
+        app.auto_compact_percent_left = normalizeAutoCompactPercentLeft(percent_left);
     }
     app.ensureCurrentConversationVisibleInStrip();
 
@@ -554,6 +577,8 @@ const App = struct {
     stream_task: StreamTask = .idle,
     suspend_requested: bool = false,
     headless: bool = false,
+    auto_compact_enabled: bool = true,
+    auto_compact_percent_left: i64 = AUTO_COMPACT_PERCENT_LEFT_THRESHOLD,
     openai_auth_mode: OpenAiAuthMode = .auto,
     agents_context_initialized: bool = false,
     agents_context_payload: ?[]u8 = null,
@@ -882,6 +907,27 @@ const App = struct {
     fn handlePrompt(self: *App, prompt: []const u8) !void {
         const inject_result = try buildFileInjectionPayload(self.allocator, prompt);
         defer if (inject_result.payload) |payload| self.allocator.free(payload);
+
+        const provider_id = self.app_state.selected_provider_id;
+        const model_id = self.app_state.selected_model_id;
+        if (self.selectedModelContextWindow()) |window| {
+            self.app_state.currentConversation().model_context_window = window;
+        }
+
+        var maybe_auth: ?ResolvedProviderAuth = null;
+        defer if (maybe_auth) |*auth| auth.deinit(self.allocator);
+
+        if (self.shouldAutoCompactCurrentConversation()) {
+            maybe_auth = try self.resolveProviderAuth(provider_id);
+            _ = try self.compactCurrentConversation(
+                provider_id,
+                model_id,
+                if (maybe_auth) |*auth| auth else null,
+                .automatic,
+                autoCompactPercentLeft(self.app_state.currentConversationConst()),
+            );
+        }
+
         const conversation_was_empty = self.app_state.currentConversationConst().messages.items.len == 0;
 
         if (self.shouldAutoTitleCurrentConversation()) {
@@ -902,13 +948,10 @@ const App = struct {
         }
         try self.app_state.appendMessage(self.allocator, .assistant, "");
 
-        const provider_id = self.app_state.selected_provider_id;
-        const model_id = self.app_state.selected_model_id;
-        if (self.selectedModelContextWindow()) |window| {
-            self.app_state.currentConversation().model_context_window = window;
+        if (maybe_auth == null) {
+            maybe_auth = try self.resolveProviderAuth(provider_id);
         }
 
-        const maybe_auth = try self.resolveProviderAuth(provider_id);
         if (maybe_auth == null) {
             if (std.mem.eql(u8, provider_id, "openai")) {
                 try self.setLastAssistantMessage("[local] Missing OpenAI auth (API key or Codex subscription token).");
@@ -923,8 +966,7 @@ const App = struct {
             try self.app_state.saveToPath(self.allocator, self.paths.state_path);
             return;
         }
-        var auth = maybe_auth.?;
-        defer auth.deinit(self.allocator);
+        const auth = maybe_auth.?;
 
         self.is_streaming = true;
         self.stream_was_interrupted = false;
@@ -1143,6 +1185,304 @@ const App = struct {
             try self.setNoticeFmt("Completed response from {s}/{s}", .{ provider_id, model_id });
         }
         try self.app_state.saveToPath(self.allocator, self.paths.state_path);
+    }
+
+    const CompactionMode = enum {
+        manual,
+        automatic,
+    };
+
+    const CompactionSummaryKind = enum {
+        model,
+        local_fallback,
+    };
+
+    const CompactionTokenCollector = struct {
+        allocator: std.mem.Allocator,
+        output: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *CompactionTokenCollector) void {
+            self.output.deinit(self.allocator);
+        }
+    };
+
+    fn shouldAutoCompactCurrentConversation(self: *App) bool {
+        if (!self.auto_compact_enabled) return false;
+        const conversation = self.app_state.currentConversationConst();
+        if (conversation.messages.items.len < AUTO_COMPACT_MIN_MESSAGES) return false;
+        const percent_left = autoCompactPercentLeft(conversation) orelse return false;
+        return percent_left <= self.auto_compact_percent_left;
+    }
+
+    fn compactCurrentConversation(
+        self: *App,
+        provider_id: []const u8,
+        model_id: []const u8,
+        auth: ?*const ResolvedProviderAuth,
+        mode: CompactionMode,
+        trigger_percent_left: ?i64,
+    ) !bool {
+        var conversation = self.app_state.currentConversation();
+        const total_messages = conversation.messages.items.len;
+        if (total_messages <= COMPACT_KEEP_RECENT_MESSAGES) return false;
+
+        const tail_start = total_messages - COMPACT_KEEP_RECENT_MESSAGES;
+        const source_count = countCompactionSourceMessages(conversation.messages.items[0..tail_start]);
+        if (source_count < COMPACT_MIN_SOURCE_MESSAGES) return false;
+
+        const previous_streaming = self.is_streaming;
+        const previous_started_ms = self.stream_started_ms;
+        const previous_stream_task = self.stream_task;
+        if (!self.headless) {
+            self.is_streaming = true;
+            self.stream_started_ms = std.time.milliTimestamp();
+            self.stream_task = .compacting;
+            if (mode == .automatic) {
+                try self.setNotice("Auto compacting conversation...");
+            } else {
+                try self.setNotice("Compacting conversation...");
+            }
+            try self.render();
+        }
+        defer {
+            if (!self.headless) {
+                self.is_streaming = previous_streaming;
+                self.stream_started_ms = previous_started_ms;
+                self.stream_task = previous_stream_task;
+            }
+        }
+
+        var summary_kind: CompactionSummaryKind = .local_fallback;
+        const summary = try self.buildCompactionSummaryAlloc(
+            provider_id,
+            model_id,
+            auth,
+            conversation,
+            tail_start,
+            &summary_kind,
+        );
+        defer self.allocator.free(summary);
+
+        try self.applyConversationCompaction(summary, summary_kind, tail_start, mode, trigger_percent_left);
+        return true;
+    }
+
+    fn buildCompactionSummaryAlloc(
+        self: *App,
+        provider_id: []const u8,
+        model_id: []const u8,
+        auth: ?*const ResolvedProviderAuth,
+        conversation: *const Conversation,
+        tail_start: usize,
+        out_kind: *CompactionSummaryKind,
+    ) ![]u8 {
+        if (auth) |resolved_auth| {
+            if (try self.buildModelCompactionSummaryAlloc(provider_id, model_id, resolved_auth, conversation, tail_start)) |summary| {
+                out_kind.* = .model;
+                return summary;
+            }
+        }
+
+        out_kind.* = .local_fallback;
+        return self.buildLocalCompactionSummaryAlloc(conversation, tail_start);
+    }
+
+    fn buildModelCompactionSummaryAlloc(
+        self: *App,
+        provider_id: []const u8,
+        model_id: []const u8,
+        auth: *const ResolvedProviderAuth,
+        conversation: *const Conversation,
+        tail_start: usize,
+    ) !?[]u8 {
+        const provider_info = self.catalog.findProviderConst(provider_id);
+        const request_messages = try self.buildCompactionRequestMessages(conversation, tail_start);
+        defer self.allocator.free(request_messages);
+
+        var collector: CompactionTokenCollector = .{
+            .allocator = self.allocator,
+            .output = .empty,
+        };
+        defer collector.deinit();
+
+        provider_client.streamChat(self.allocator, .{
+            .provider_id = provider_id,
+            .model_id = model_id,
+            .api_key = auth.bearer_token,
+            .base_url = auth.base_url_override orelse if (provider_info) |info| info.api_base else null,
+            .chatgpt_account_id = auth.chatgpt_account_id,
+            .prefer_responses_api = auth.prefer_responses_api,
+            .messages = request_messages,
+        }, .{
+            .on_token = onCompactionSummaryToken,
+            .context = &collector,
+        }) catch return null;
+
+        if (collector.output.items.len == 0) return null;
+        const raw = try collector.output.toOwnedSlice(self.allocator);
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) {
+            self.allocator.free(raw);
+            return null;
+        }
+        if (trimmed.ptr == raw.ptr and trimmed.len == raw.len) return raw;
+
+        const owned_trimmed = try self.allocator.dupe(u8, trimmed);
+        self.allocator.free(raw);
+        return owned_trimmed;
+    }
+
+    fn onCompactionSummaryToken(context: ?*anyopaque, token: []const u8) anyerror!void {
+        const collector: *CompactionTokenCollector = @ptrCast(@alignCast(context.?));
+        if (token.len == 0) return;
+        try collector.output.appendSlice(collector.allocator, token);
+    }
+
+    fn buildCompactionRequestMessages(
+        self: *App,
+        conversation: *const Conversation,
+        tail_start: usize,
+    ) ![]provider_client.StreamMessage {
+        const source_slice = conversation.messages.items[0..tail_start];
+        const source_count = countCompactionSourceMessages(source_slice);
+        var messages = try self.allocator.alloc(provider_client.StreamMessage, source_count + 2);
+
+        var index: usize = 0;
+        messages[index] = .{
+            .role = .system,
+            .content = COMPACT_SUMMARY_SYSTEM_PROMPT,
+        };
+        index += 1;
+
+        for (source_slice) |message| {
+            if (!isCompactionSourceMessage(message)) continue;
+            messages[index] = .{
+                .role = message.role,
+                .content = message.content,
+            };
+            index += 1;
+        }
+
+        messages[index] = .{
+            .role = .user,
+            .content = COMPACT_SUMMARY_USER_PROMPT,
+        };
+        index += 1;
+
+        return messages[0..index];
+    }
+
+    fn buildLocalCompactionSummaryAlloc(self: *App, conversation: *const Conversation, tail_start: usize) ![]u8 {
+        var selected_indexes: std.ArrayList(usize) = .empty;
+        defer selected_indexes.deinit(self.allocator);
+
+        var index = tail_start;
+        while (index > 0 and selected_indexes.items.len < COMPACT_LOCAL_FALLBACK_MAX_LINES) {
+            index -= 1;
+            const message = conversation.messages.items[index];
+            if (!isCompactionSourceMessage(message)) continue;
+            try selected_indexes.append(self.allocator, index);
+        }
+
+        var summary_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer summary_writer.deinit();
+        try summary_writer.writer.writeAll("Local fallback summary:\n");
+
+        if (selected_indexes.items.len == 0) {
+            try summary_writer.writer.writeAll("- Prior discussion exists; keep recent messages and continue.\n");
+        } else {
+            var reverse = selected_indexes.items.len;
+            while (reverse > 0) {
+                reverse -= 1;
+                const message = conversation.messages.items[selected_indexes.items[reverse]];
+                const preview = try compactPreviewAlloc(self.allocator, message.content, COMPACT_LOCAL_FALLBACK_PREVIEW_CHARS);
+                defer self.allocator.free(preview);
+                try summary_writer.writer.print(
+                    "- {s}: {s}\n",
+                    .{ roleLabelForCompact(message.role), preview },
+                );
+            }
+        }
+
+        return summary_writer.toOwnedSlice();
+    }
+
+    fn applyConversationCompaction(
+        self: *App,
+        summary: []const u8,
+        summary_kind: CompactionSummaryKind,
+        tail_start: usize,
+        mode: CompactionMode,
+        trigger_percent_left: ?i64,
+    ) !void {
+        var conversation = self.app_state.currentConversation();
+        var compacted_messages: std.ArrayList(Message) = .empty;
+        errdefer {
+            for (compacted_messages.items) |*message| message.deinit(self.allocator);
+            compacted_messages.deinit(self.allocator);
+        }
+
+        const now_ms = std.time.milliTimestamp();
+        const old_messages = conversation.messages.items;
+        const preserve_agents_context = old_messages.len > 0 and
+            old_messages[0].role == .system and
+            std.mem.startsWith(u8, old_messages[0].content, AGENTS_CONTEXT_HEADER);
+
+        if (preserve_agents_context) {
+            try appendCompactedMessageCopy(self.allocator, &compacted_messages, old_messages[0]);
+        }
+
+        const note_text = switch (mode) {
+            .manual => try std.fmt.allocPrint(
+                self.allocator,
+                "{s} manual ({s} summary)",
+                .{ COMPACT_NOTE_HEADER, if (summary_kind == .model) "model" else "local fallback" },
+            ),
+            .automatic => if (trigger_percent_left) |percent_left|
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s} auto at {d}% left ({s} summary)",
+                    .{ COMPACT_NOTE_HEADER, percent_left, if (summary_kind == .model) "model" else "local fallback" },
+                )
+            else
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s} auto ({s} summary)",
+                    .{ COMPACT_NOTE_HEADER, if (summary_kind == .model) "model" else "local fallback" },
+                ),
+        };
+        defer self.allocator.free(note_text);
+        try appendCompactedMessageOwned(self.allocator, &compacted_messages, .system, note_text, now_ms);
+
+        const summary_payload = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}\n{s}",
+            .{ COMPACT_SUMMARY_HEADER, summary },
+        );
+        defer self.allocator.free(summary_payload);
+        try appendCompactedMessageOwned(self.allocator, &compacted_messages, .system, summary_payload, now_ms);
+
+        for (old_messages[tail_start..], tail_start..) |message, old_index| {
+            if (preserve_agents_context and old_index == 0) continue;
+            try appendCompactedMessageCopy(self.allocator, &compacted_messages, message);
+        }
+
+        for (conversation.messages.items) |*message| message.deinit(self.allocator);
+        conversation.messages.deinit(self.allocator);
+        conversation.messages = compacted_messages;
+        conversation.last_token_usage = .{};
+        conversation.updated_ms = now_ms;
+
+        switch (mode) {
+            .manual => try self.setNoticeFmt(
+                "Compacted conversation (kept last {d} messages, {s} summary)",
+                .{ COMPACT_KEEP_RECENT_MESSAGES, if (summary_kind == .model) "model" else "local fallback" },
+            ),
+            .automatic => try self.setNoticeFmt(
+                "Auto compacted conversation (kept last {d} messages, {s} summary)",
+                .{ COMPACT_KEEP_RECENT_MESSAGES, if (summary_kind == .model) "model" else "local fallback" },
+            ),
+        }
     }
 
     fn streamAssistantOnce(self: *App, provider_id: []const u8, model_id: []const u8, auth: ResolvedProviderAuth, include_tool_prompt: bool) !bool {
@@ -2080,6 +2420,57 @@ const App = struct {
                 return;
             }
             try self.setNoticeFmt("file index has {d} files. Use /files refresh after file changes.", .{self.file_index.items.len});
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "compact")) {
+            const action = parts.next();
+            if (action == null) {
+                const provider_id = self.app_state.selected_provider_id;
+                const model_id = self.app_state.selected_model_id;
+                var maybe_auth = try self.resolveProviderAuth(provider_id);
+                defer if (maybe_auth) |*auth| auth.deinit(self.allocator);
+
+                const compacted = try self.compactCurrentConversation(
+                    provider_id,
+                    model_id,
+                    if (maybe_auth) |*auth| auth else null,
+                    .manual,
+                    null,
+                );
+                if (!compacted) {
+                    try self.setNotice("Nothing to compact yet (need more history).");
+                    return;
+                }
+                try self.app_state.saveToPath(self.allocator, self.paths.state_path);
+                return;
+            }
+
+            if (std.mem.eql(u8, action.?, "auto")) {
+                const mode = parts.next();
+                if (mode == null) {
+                    try self.setNoticeFmt("Auto compact: {s} (trigger <= {d}% left)", .{
+                        if (self.auto_compact_enabled) "on" else "off",
+                        self.auto_compact_percent_left,
+                    });
+                    return;
+                }
+                if (std.mem.eql(u8, mode.?, "on")) {
+                    self.auto_compact_enabled = true;
+                    try self.setNoticeFmt("Auto compact enabled (trigger <= {d}% left)", .{self.auto_compact_percent_left});
+                    return;
+                }
+                if (std.mem.eql(u8, mode.?, "off")) {
+                    self.auto_compact_enabled = false;
+                    try self.setNotice("Auto compact disabled");
+                    return;
+                }
+
+                try self.setNotice("Usage: /compact [auto [on|off]]");
+                return;
+            }
+
+            try self.setNotice("Usage: /compact [auto [on|off]]");
             return;
         }
 
@@ -3460,6 +3851,9 @@ const App = struct {
                 self.syncPickersFromInput();
                 try self.setNotice("Inserted /provider");
             },
+            .compact_session => {
+                try self.handleCommand("/compact");
+            },
             .refresh_models_cache => {
                 try self.handleCommand("/models refresh");
             },
@@ -3852,7 +4246,8 @@ fn messageDisplayContent(message: anytype) []const u8 {
 
     if (message.role == .system) {
         if (std.mem.startsWith(u8, message.content, FILE_INJECT_HEADER) or
-            std.mem.startsWith(u8, message.content, AGENTS_CONTEXT_HEADER))
+            std.mem.startsWith(u8, message.content, AGENTS_CONTEXT_HEADER) or
+            std.mem.startsWith(u8, message.content, COMPACT_SUMMARY_HEADER))
         {
             const line_end = std.mem.indexOfScalar(u8, message.content, '\n') orelse message.content.len;
             return message.content[0..line_end];
@@ -3867,6 +4262,7 @@ fn streamTaskTitle(task: StreamTask) []const u8 {
         .idle => "Idle",
         .thinking => "Thinking",
         .responding => "Responding",
+        .compacting => "Compacting",
         .running_read => "Running READ",
         .running_list_dir => "Running LIST_DIR",
         .running_read_file => "Running READ_FILE",
@@ -3924,6 +4320,112 @@ fn buildWorkingPlaceholder(
         "{s} ({d}s • esc to interrupt)",
         .{ header, elapsed_seconds },
     );
+}
+
+fn autoCompactPercentLeft(conversation: *const Conversation) ?i64 {
+    const context_window = conversation.model_context_window orelse return null;
+    if (conversation.last_token_usage.isZero()) return null;
+    return conversation.last_token_usage.percentOfContextWindowRemaining(context_window);
+}
+
+fn normalizeAutoCompactPercentLeft(percent_left: i64) i64 {
+    return std.math.clamp(percent_left, @as(i64, 0), @as(i64, 100));
+}
+
+fn isCompactionSourceMessage(message: anytype) bool {
+    if (message.role != .user and message.role != .assistant) return false;
+    const trimmed = std.mem.trim(u8, message.content, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (std.mem.startsWith(u8, trimmed, COMPACT_NOTE_HEADER)) return false;
+    if (std.mem.startsWith(u8, trimmed, COMPACT_SUMMARY_HEADER)) return false;
+    if (parseAssistantToolCall(trimmed) != null) return false;
+    return true;
+}
+
+fn countCompactionSourceMessages(messages: []const Message) usize {
+    var count: usize = 0;
+    for (messages) |message| {
+        if (isCompactionSourceMessage(message)) count += 1;
+    }
+    return count;
+}
+
+fn appendCompactedMessageOwned(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Message),
+    role: Role,
+    content: []const u8,
+    timestamp_ms: i64,
+) !void {
+    try list.append(allocator, .{
+        .role = role,
+        .content = try allocator.dupe(u8, content),
+        .timestamp_ms = timestamp_ms,
+    });
+}
+
+fn appendCompactedMessageCopy(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Message),
+    message: Message,
+) !void {
+    try appendCompactedMessageOwned(allocator, list, message.role, message.content, message.timestamp_ms);
+}
+
+fn roleLabelForCompact(role: Role) []const u8 {
+    return switch (role) {
+        .user => "User",
+        .assistant => "Assistant",
+        .system => "System",
+    };
+}
+
+fn compactPreviewAlloc(allocator: std.mem.Allocator, text: []const u8, max_chars: usize) ![]u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return allocator.dupe(u8, "(empty)");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var truncated = false;
+    var previous_was_space = false;
+    for (trimmed) |byte| {
+        var normalized = byte;
+        if (normalized == '\n' or normalized == '\r' or normalized == '\t') normalized = ' ';
+        if (normalized < 32) continue;
+
+        if (normalized == ' ') {
+            if (out.items.len == 0 or previous_was_space) continue;
+            if (out.items.len >= max_chars) {
+                truncated = true;
+                break;
+            }
+            try out.append(allocator, ' ');
+            previous_was_space = true;
+            continue;
+        }
+
+        if (out.items.len >= max_chars) {
+            truncated = true;
+            break;
+        }
+        try out.append(allocator, normalized);
+        previous_was_space = false;
+    }
+
+    while (out.items.len > 0 and out.items[out.items.len - 1] == ' ') {
+        _ = out.pop();
+    }
+
+    if (out.items.len == 0) {
+        return allocator.dupe(u8, "(empty)");
+    }
+
+    if (truncated) {
+        try out.appendSlice(allocator, "...");
+    }
+
+    return out.toOwnedSlice(allocator);
 }
 
 fn shouldRenderDiffMode(message: anytype, text: []const u8) bool {
@@ -4484,6 +4986,7 @@ const QuickActionId = enum {
     open_conversation_switch,
     open_model_picker,
     open_provider_command,
+    compact_session,
     refresh_models_cache,
     refresh_file_index,
     toggle_ui_density,
@@ -4510,6 +5013,7 @@ const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "model", .description = "pick or set model id" },
     .{ .name = "models", .description = "list models cache / refresh" },
     .{ .name = "files", .description = "show file index / refresh" },
+    .{ .name = "compact", .description = "compact conversation / auto [on|off]" },
     .{ .name = "new", .description = "create conversation" },
     .{ .name = "sessions", .description = "switch conversation session (picker or id)" },
     .{ .name = "title", .description = "rename conversation" },
@@ -4525,6 +5029,7 @@ const QUICK_ACTIONS = [_]QuickActionEntry{
     .{ .id = .open_conversation_switch, .label = "Switch session", .description = "open conversation sessions picker", .keywords = "conversation sessions /sessions /switch" },
     .{ .id = .open_model_picker, .label = "Switch model", .description = "open /model picker", .keywords = "model provider" },
     .{ .id = .open_provider_command, .label = "Switch provider", .description = "insert /provider command", .keywords = "provider" },
+    .{ .id = .compact_session, .label = "Compact session", .description = "run /compact now", .keywords = "compact context summarize" },
     .{ .id = .refresh_models_cache, .label = "Refresh models cache", .description = "run /models refresh", .keywords = "models cache reload" },
     .{ .id = .refresh_file_index, .label = "Refresh file index", .description = "run /files refresh", .keywords = "files index rg" },
     .{ .id = .toggle_ui_density, .label = "Toggle UI density", .description = "switch compact/comfy UI", .keywords = "compact comfy ui" },
@@ -8051,6 +8556,48 @@ test "messageDisplayContent collapses agents context payload" {
 
     const visible = messageDisplayContent(sample);
     try std.testing.expectEqualStrings("[agents-context]", visible);
+}
+
+test "messageDisplayContent collapses compact summary payload" {
+    const sample = struct {
+        role: Role,
+        content: []const u8,
+    }{
+        .role = .system,
+        .content = "[compact-summary]\n- goal: keep working\n- next: finish tests",
+    };
+
+    const visible = messageDisplayContent(sample);
+    try std.testing.expectEqualStrings("[compact-summary]", visible);
+}
+
+test "isCompactionSourceMessage keeps user-assistant text and skips tool calls" {
+    const user_message = struct {
+        role: Role,
+        content: []const u8,
+    }{
+        .role = .user,
+        .content = "please continue",
+    };
+    try std.testing.expect(isCompactionSourceMessage(user_message));
+
+    const tool_call_message = struct {
+        role: Role,
+        content: []const u8,
+    }{
+        .role = .assistant,
+        .content = "<READ>ls</READ>",
+    };
+    try std.testing.expect(!isCompactionSourceMessage(tool_call_message));
+
+    const system_message = struct {
+        role: Role,
+        content: []const u8,
+    }{
+        .role = .system,
+        .content = "metadata",
+    };
+    try std.testing.expect(!isCompactionSourceMessage(system_message));
 }
 
 test "extractChatgptAccountIdFromJwtAlloc parses nested auth claim" {
