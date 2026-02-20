@@ -133,6 +133,12 @@ Notes:
 zig build install -Doptimize=ReleaseFast --prefix "$HOME/.local"
 ```
 
+To build with the experimental vaxis backend path enabled:
+
+```bash
+zig build install -Doptimize=ReleaseFast -Dvaxis=true --prefix "$HOME/.local"
+```
+
 If `~/.local/bin` is in your `PATH`, you can then run:
 
 ```bash
@@ -318,6 +324,42 @@ Picker triggers:
 - `/quit`
 - `/q` (alias of `/quit`)
 - `/paste-image`
+
+### Backend Fallback
+
+- Default builds (without `-Dvaxis=true`) run ANSI backend only.
+- In ANSI-only builds, `/ui backend vaxis` is rejected with a clear notice.
+- In `-Dvaxis=true` builds, backend switching is available with:
+  - `/ui backend ansi`
+  - `/ui backend vaxis`
+
+### Startup/Perf Checks
+
+Quick manual checks for startup latency:
+
+Linux:
+
+```bash
+time -p zolt --help
+time -p zolt --version
+```
+
+macOS:
+
+```bash
+time zolt --help
+time zolt --version
+```
+
+Compare ANSI vs vaxis-enabled builds:
+
+```bash
+zig build install -Doptimize=ReleaseFast --prefix "$HOME/.local"
+time -p zolt --help
+
+zig build install -Doptimize=ReleaseFast -Dvaxis=true --prefix "$HOME/.local"
+time -p zolt --help
+```
 
 ### Skills
 
