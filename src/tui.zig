@@ -86,6 +86,7 @@ const StreamTask = enum {
     running_write_stdin,
     running_web_search,
     running_view_image,
+    running_skill,
 };
 
 const CommandPickerKind = enum {
@@ -205,6 +206,26 @@ const SessionDrainResult = struct {
     output_limited: bool = false,
 };
 
+const SkillScope = enum {
+    project,
+    global,
+};
+
+const SkillInfo = struct {
+    name: []u8,
+    description: []u8,
+    path: []u8,
+    base_dir: []u8,
+    scope: SkillScope,
+
+    fn deinit(self: *SkillInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.description);
+        allocator.free(self.path);
+        allocator.free(self.base_dir);
+    }
+};
+
 const VisionCaptionResult = struct {
     caption: ?[]u8 = null,
     error_detail: ?[]u8 = null,
@@ -261,11 +282,15 @@ const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const FILE_INJECT_MAX_FILES: usize = 8;
 const FILE_INJECT_MAX_FILE_BYTES: usize = 64 * 1024;
 const FILE_INJECT_HEADER = "[file-inject]";
+const SKILL_INJECT_HEADER = "[skill-inject]";
 const AGENTS_CONTEXT_HEADER = "[agents-context]";
+const SKILLS_CONTEXT_HEADER = "[skills-context]";
 const COMPACT_SUMMARY_HEADER = "[compact-summary]";
 const COMPACT_NOTE_HEADER = "[compact]";
 const AGENTS_CONTEXT_MAX_FILE_BYTES: usize = 128 * 1024;
 const AGENTS_CONTEXT_MAX_INSTRUCTIONS_BYTES: usize = 24 * 1024;
+const SKILL_FILE_MAX_BYTES: usize = 256 * 1024;
+const SKILLS_CONTEXT_MAX_ENTRIES: usize = 32;
 const FILE_INDEX_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const AUTO_COMPACT_PERCENT_LEFT_THRESHOLD: i64 = 15;
 const AUTO_COMPACT_MIN_MESSAGES: usize = 10;
@@ -284,7 +309,7 @@ const KEY_DOWN_ARROW: u8 = keybindings.KEY_DOWN_ARROW;
 const KEY_PAGE_UP: u8 = keybindings.KEY_PAGE_UP;
 const KEY_PAGE_DOWN: u8 = keybindings.KEY_PAGE_DOWN;
 const TOOL_SYSTEM_PROMPT =
-    "You can use ten local tools.\n" ++
+    "You can use eleven local tools.\n" ++
     "When you need to inspect files, reply with ONLY:\n" ++
     "<READ>\n" ++
     "<command>\n" ++
@@ -331,7 +356,12 @@ const TOOL_SYSTEM_PROMPT =
     "<VIEW_IMAGE>\n" ++
     "{\"path\":\"/absolute/or/relative/image.png\"}\n" ++
     "</VIEW_IMAGE>\n" ++
-    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], or [view-image-result], continue the answer normally.";
+    "For skill loading, use:\n" ++
+    "<SKILL>\n" ++
+    "{\"name\":\"skill-name\"}\n" ++
+    "</SKILL>\n" ++
+    "Available skill names/descriptions are provided in [skills-context] messages.\n" ++
+    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], [view-image-result], or [skill-result], continue the answer normally.";
 
 const VIEW_IMAGE_VISION_PROMPT =
     "Describe this image for a coding assistant. Focus on visible UI/text/code, layout, key errors/warnings, and actionable observations. Keep it concise.";
@@ -563,6 +593,8 @@ const App = struct {
     file_index: std.ArrayList([]u8) = .empty,
     file_index_attempted: bool = false,
     file_index_loaded: bool = false,
+    skills_loaded: bool = false,
+    skills: std.ArrayList(SkillInfo) = .empty,
     command_sessions: std.ArrayList(*CommandSession) = .empty,
     next_command_session_id: u32 = 1,
     compact_mode: bool = true,
@@ -595,6 +627,8 @@ const App = struct {
         self.input_buffer.deinit(self.allocator);
         for (self.file_index.items) |path| self.allocator.free(path);
         self.file_index.deinit(self.allocator);
+        for (self.skills.items) |*skill| skill.deinit(self.allocator);
+        self.skills.deinit(self.allocator);
         if (self.agents_context_payload) |payload| self.allocator.free(payload);
         self.allocator.free(self.notice);
     }
@@ -907,6 +941,8 @@ const App = struct {
     fn handlePrompt(self: *App, prompt: []const u8) !void {
         const inject_result = try buildFileInjectionPayload(self.allocator, prompt);
         defer if (inject_result.payload) |payload| self.allocator.free(payload);
+        const skill_inject_result = try self.buildSkillInjectionPayload(prompt);
+        defer if (skill_inject_result.payload) |payload| self.allocator.free(payload);
 
         const provider_id = self.app_state.selected_provider_id;
         const model_id = self.app_state.selected_model_id;
@@ -940,10 +976,14 @@ const App = struct {
 
         if (conversation_was_empty) {
             try self.injectAgentsContextIntoCurrentConversation();
+            try self.injectSkillsContextIntoCurrentConversation();
         }
 
         try self.app_state.appendMessage(self.allocator, .user, prompt);
         if (inject_result.payload) |payload| {
+            try self.app_state.appendMessage(self.allocator, .system, payload);
+        }
+        if (skill_inject_result.payload) |payload| {
             try self.app_state.appendMessage(self.allocator, .system, payload);
         }
         try self.app_state.appendMessage(self.allocator, .assistant, "");
@@ -981,13 +1021,34 @@ const App = struct {
             self.resetStreamInterruptState();
         }
 
-        if (inject_result.referenced_count > 0) {
+        if (inject_result.referenced_count > 0 and skill_inject_result.referenced_count > 0) {
+            try self.setNoticeFmt(
+                "Injected files {d}/{d} (skipped:{d}) + skills {d}/{d} (skipped:{d})",
+                .{
+                    inject_result.included_count,
+                    inject_result.referenced_count,
+                    inject_result.skipped_count,
+                    skill_inject_result.included_count,
+                    skill_inject_result.referenced_count,
+                    skill_inject_result.skipped_count,
+                },
+            );
+        } else if (inject_result.referenced_count > 0) {
             try self.setNoticeFmt(
                 "Injected {d}/{d} @file refs (skipped:{d})",
                 .{
                     inject_result.included_count,
                     inject_result.referenced_count,
                     inject_result.skipped_count,
+                },
+            );
+        } else if (skill_inject_result.referenced_count > 0) {
+            try self.setNoticeFmt(
+                "Injected {d}/{d} $skills (skipped:{d})",
+                .{
+                    skill_inject_result.included_count,
+                    skill_inject_result.referenced_count,
+                    skill_inject_result.skipped_count,
                 },
             );
         }
@@ -1161,6 +1222,22 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran VIEW_IMAGE tool");
+                },
+                .skill => |skill_payload| {
+                    self.stream_task = .running_skill;
+                    try self.render();
+                    const skill_payload_owned = try self.allocator.dupe(u8, skill_payload);
+                    defer self.allocator.free(skill_payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] SKILL");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] SKILL" });
+
+                    const tool_result = try self.runSkillToolPayload(skill_payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran SKILL tool");
                 },
             }
             self.stream_task = .thinking;
@@ -1595,6 +1672,18 @@ const App = struct {
         try self.app_state.appendMessage(self.allocator, .system, payload);
     }
 
+    fn injectSkillsContextIntoCurrentConversation(self: *App) !void {
+        const conversation = self.app_state.currentConversationConst();
+        if (conversation.messages.items.len != 0) return;
+
+        try self.ensureSkillsLoaded();
+        if (self.skills.items.len == 0) return;
+
+        const payload = try buildSkillsContextPayloadAlloc(self.allocator, self.skills.items);
+        defer self.allocator.free(payload);
+        try self.app_state.appendMessage(self.allocator, .system, payload);
+    }
+
     fn ensureAgentsContextPayload(self: *App) !?[]const u8 {
         if (self.agents_context_initialized) {
             return if (self.agents_context_payload) |payload| payload else null;
@@ -1611,6 +1700,38 @@ const App = struct {
         };
         self.agents_context_payload = payload;
         return payload;
+    }
+
+    pub fn ensureSkillsLoaded(self: *App) !void {
+        if (self.skills_loaded) return;
+        self.skills_loaded = true;
+
+        const discovered = try discoverSkillsAlloc(self.allocator);
+        self.skills = discovered;
+    }
+
+    fn refreshSkills(self: *App) !void {
+        for (self.skills.items) |*skill| skill.deinit(self.allocator);
+        self.skills.clearRetainingCapacity();
+        self.skills_loaded = false;
+        try self.ensureSkillsLoaded();
+    }
+
+    pub fn findSkillByName(self: *App, name: []const u8) ?*const SkillInfo {
+        const trimmed = std.mem.trim(u8, name, " \t\r\n");
+        if (trimmed.len == 0) return null;
+
+        for (self.skills.items) |*skill| {
+            if (std.ascii.eqlIgnoreCase(skill.name, trimmed)) return skill;
+        }
+        return null;
+    }
+
+    pub fn skillScopeLabel(_: *App, scope: SkillScope) []const u8 {
+        return switch (scope) {
+            .project => "project",
+            .global => "global",
+        };
     }
 
     fn runReadToolCommand(self: *App, command_text: []const u8) ![]u8 {
@@ -1651,6 +1772,10 @@ const App = struct {
 
     fn runViewImageToolPayload(self: *App, payload: []const u8) ![]u8 {
         return tools_runtime.runViewImageToolPayload(self, payload);
+    }
+
+    fn runSkillToolPayload(self: *App, payload: []const u8) ![]u8 {
+        return tools_runtime.runSkillToolPayload(self, payload);
     }
 
     fn pasteClipboardImageIntoInput(self: *App) !void {
@@ -1698,6 +1823,105 @@ const App = struct {
         self.syncPickersFromInput();
 
         try self.setNoticeFmt("Pasted image from clipboard -> @{s}", .{image_path});
+    }
+
+    fn buildSkillInjectionPayload(self: *App, prompt: []const u8) !SkillInjectResult {
+        var references = try collectDollarSkillReferences(self.allocator, prompt);
+        defer {
+            for (references.items) |entry| self.allocator.free(entry);
+            references.deinit(self.allocator);
+        }
+
+        if (references.items.len == 0) return .{};
+        try self.ensureSkillsLoaded();
+        if (self.skills.items.len == 0) {
+            return .{
+                .referenced_count = references.items.len,
+                .included_count = 0,
+                .skipped_count = references.items.len,
+            };
+        }
+
+        var body_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body_writer.deinit();
+        var included_count: usize = 0;
+        var skipped_count: usize = 0;
+        var summary_names: std.ArrayList([]const u8) = .empty;
+        defer summary_names.deinit(self.allocator);
+
+        for (references.items) |reference| {
+            const skill = self.findSkillByName(reference) orelse {
+                skipped_count += 1;
+                continue;
+            };
+
+            var skill_file = openFileForPath(skill.path, .{}) catch {
+                skipped_count += 1;
+                continue;
+            };
+            defer skill_file.close();
+
+            const content = skill_file.readToEndAlloc(self.allocator, SKILL_FILE_MAX_BYTES) catch {
+                skipped_count += 1;
+                continue;
+            };
+            defer self.allocator.free(content);
+
+            included_count += 1;
+            try summary_names.append(self.allocator, skill.name);
+
+            try body_writer.writer.print(
+                "<skill name=\"{s}\" path=\"{s}\" scope=\"{s}\" base_dir=\"{s}\">\n",
+                .{ skill.name, skill.path, self.skillScopeLabel(skill.scope), skill.base_dir },
+            );
+            try body_writer.writer.writeAll(content);
+            if (content.len == 0 or content[content.len - 1] != '\n') {
+                try body_writer.writer.writeByte('\n');
+            }
+            try body_writer.writer.writeAll("</skill>\n");
+        }
+
+        if (included_count == 0) {
+            return .{
+                .referenced_count = references.items.len,
+                .included_count = 0,
+                .skipped_count = skipped_count,
+            };
+        }
+
+        const body = try body_writer.toOwnedSlice();
+        defer self.allocator.free(body);
+
+        var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer payload_writer.deinit();
+
+        try payload_writer.writer.print(
+            "{s} included:{d} referenced:{d} skipped:{d}",
+            .{ SKILL_INJECT_HEADER, included_count, references.items.len, skipped_count },
+        );
+        if (summary_names.items.len > 0) {
+            try payload_writer.writer.writeAll(" read: ");
+            const shown = @min(summary_names.items.len, @as(usize, 3));
+            for (summary_names.items[0..shown], 0..) |name, idx| {
+                if (idx > 0) try payload_writer.writer.writeAll(", ");
+                try payload_writer.writer.writeAll(name);
+            }
+            if (summary_names.items.len > shown) {
+                try payload_writer.writer.print(" (+{d} more)", .{summary_names.items.len - shown});
+            }
+        }
+        try payload_writer.writer.writeByte('\n');
+        try payload_writer.writer.writeAll(
+            "The user referenced these skills with $name. Treat this as reusable workflow/context guidance.\n",
+        );
+        try payload_writer.writer.writeAll(body);
+
+        return .{
+            .payload = try payload_writer.toOwnedSlice(),
+            .referenced_count = references.items.len,
+            .included_count = included_count,
+            .skipped_count = skipped_count,
+        };
     }
 
     pub fn tryVisionCaptionOpenAiCompatible(
@@ -2420,6 +2644,56 @@ const App = struct {
                 return;
             }
             try self.setNoticeFmt("file index has {d} files. Use /files refresh after file changes.", .{self.file_index.items.len});
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "skills")) {
+            const action = parts.next();
+            if (action != null and std.mem.eql(u8, action.?, "refresh")) {
+                try self.refreshSkills();
+                try self.setNoticeFmt("skills cache refreshed ({d} skills)", .{self.skills.items.len});
+                return;
+            }
+
+            try self.ensureSkillsLoaded();
+            if (self.skills.items.len == 0) {
+                try self.setNotice("No skills discovered. Use .opencode/skills, .agents/skills, .claude/skills, .codex/skills, or global ~/.config/zolt/skills.");
+                return;
+            }
+
+            if (action) |skill_name| {
+                const skill = self.findSkillByName(skill_name) orelse {
+                    try self.setNoticeFmt("Skill not found: {s}", .{skill_name});
+                    return;
+                };
+
+                const cwd = std.process.getCwdAlloc(self.allocator) catch null;
+                defer if (cwd) |path| self.allocator.free(path);
+                const repo_root = findGitTopLevelAlloc(self.allocator) catch null;
+                defer if (repo_root) |path| self.allocator.free(path);
+                const display_path = try formatInjectedPathForSummaryAlloc(self.allocator, skill.path, cwd, repo_root);
+                defer self.allocator.free(display_path);
+
+                try self.setNoticeFmt(
+                    "skill {s} ({s}) path:{s} - {s}",
+                    .{ skill.name, self.skillScopeLabel(skill.scope), display_path, skill.description },
+                );
+                return;
+            }
+
+            var line_writer: std.Io.Writer.Allocating = .init(self.allocator);
+            defer line_writer.deinit();
+            try line_writer.writer.print("skills ({d}): ", .{self.skills.items.len});
+            const shown = @min(self.skills.items.len, @as(usize, 5));
+            for (self.skills.items[0..shown], 0..) |skill, idx| {
+                if (idx > 0) try line_writer.writer.writeAll(", ");
+                try line_writer.writer.writeAll(skill.name);
+            }
+            if (self.skills.items.len > shown) {
+                try line_writer.writer.print(" (+{d} more)", .{self.skills.items.len - shown});
+            }
+            try line_writer.writer.writeAll(". Use /skills <name> to inspect or /skills refresh.");
+            try self.setNoticeOwned(try line_writer.toOwnedSlice());
             return;
         }
 
@@ -4246,7 +4520,9 @@ fn messageDisplayContent(message: anytype) []const u8 {
 
     if (message.role == .system) {
         if (std.mem.startsWith(u8, message.content, FILE_INJECT_HEADER) or
+            std.mem.startsWith(u8, message.content, SKILL_INJECT_HEADER) or
             std.mem.startsWith(u8, message.content, AGENTS_CONTEXT_HEADER) or
+            std.mem.startsWith(u8, message.content, SKILLS_CONTEXT_HEADER) or
             std.mem.startsWith(u8, message.content, COMPACT_SUMMARY_HEADER))
         {
             const line_end = std.mem.indexOfScalar(u8, message.content, '\n') orelse message.content.len;
@@ -4273,6 +4549,7 @@ fn streamTaskTitle(task: StreamTask) []const u8 {
         .running_write_stdin => "Running WRITE_STDIN",
         .running_web_search => "Running WEB_SEARCH",
         .running_view_image => "Running VIEW_IMAGE",
+        .running_skill => "Running SKILL",
     };
 }
 
@@ -5013,6 +5290,7 @@ const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "model", .description = "pick or set model id" },
     .{ .name = "models", .description = "list models cache / refresh" },
     .{ .name = "files", .description = "show file index / refresh" },
+    .{ .name = "skills", .description = "list skill catalog / refresh / inspect" },
     .{ .name = "compact", .description = "compact conversation / auto [on|off]" },
     .{ .name = "new", .description = "create conversation" },
     .{ .name = "sessions", .description = "switch conversation session (picker or id)" },
@@ -5249,6 +5527,7 @@ const AssistantToolCall = union(enum) {
     write_stdin: []const u8,
     web_search: []const u8,
     view_image: []const u8,
+    skill: []const u8,
 };
 
 fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
@@ -5275,6 +5554,9 @@ fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
     }
     if (parseViewImageToolPayload(text)) |payload| {
         return .{ .view_image = payload };
+    }
+    if (parseSkillToolPayload(text)) |payload| {
+        return .{ .skill = payload };
     }
     if (parseReadToolCommand(text)) |command| {
         return .{ .read = command };
@@ -5478,6 +5760,34 @@ fn parseViewImageToolPayload(text: []const u8) ?[]const u8 {
         const body = trimmed[first_newline + 1 ..];
         const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
         return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    return null;
+}
+
+fn parseSkillToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<SKILL>")) {
+        const rest = trimmed["<SKILL>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</SKILL>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```skill")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "[tool]")) {
+        const after_marker = std.mem.trimLeft(u8, trimmed["[tool]".len..], " \t");
+        if (after_marker.len >= 5 and std.mem.startsWith(u8, after_marker, "SKILL")) {
+            const name = std.mem.trimLeft(u8, after_marker["SKILL".len..], " \t:");
+            if (name.len > 0) return name;
+        }
     }
 
     return null;
@@ -6391,6 +6701,13 @@ const FileInjectResult = struct {
     skipped_count: usize = 0,
 };
 
+const SkillInjectResult = struct {
+    payload: ?[]u8 = null,
+    referenced_count: usize = 0,
+    included_count: usize = 0,
+    skipped_count: usize = 0,
+};
+
 fn buildFileInjectionPayload(allocator: std.mem.Allocator, prompt: []const u8) !FileInjectResult {
     var references = try collectAtFileReferences(allocator, prompt);
     defer {
@@ -6550,6 +6867,39 @@ fn collectAtFileReferences(allocator: std.mem.Allocator, text: []const u8) !std.
     }
 
     return refs;
+}
+
+fn collectDollarSkillReferences(allocator: std.mem.Allocator, text: []const u8) !std.ArrayList([]u8) {
+    var refs: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (refs.items) |entry| allocator.free(entry);
+        refs.deinit(allocator);
+    }
+
+    var dedupe: std.StringHashMapUnmanaged(void) = .empty;
+    defer dedupe.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < text.len) : (index += 1) {
+        if (text[index] != '$') continue;
+        if (index > 0 and !std.ascii.isWhitespace(text[index - 1]) and text[index - 1] != '(' and text[index - 1] != '[') continue;
+
+        var end = index + 1;
+        while (end < text.len and isSkillNameChar(text[end])) : (end += 1) {}
+        if (end <= index + 1) continue;
+
+        const normalized = text[index + 1 .. end];
+        if (dedupe.contains(normalized)) continue;
+        try dedupe.put(allocator, normalized, {});
+        try refs.append(allocator, try allocator.dupe(u8, normalized));
+        index = end - 1;
+    }
+
+    return refs;
+}
+
+fn isSkillNameChar(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_';
 }
 
 fn trimMatchingOuterQuotes(text: []const u8) []const u8 {
@@ -7233,6 +7583,331 @@ fn extractChatgptAccountIdFromClaims(claims: std.json.ObjectMap) ?[]const u8 {
     return null;
 }
 
+const SkillRoot = struct {
+    path: []u8,
+    scope: SkillScope,
+};
+
+fn discoverSkillsAlloc(allocator: std.mem.Allocator) !std.ArrayList(SkillInfo) {
+    var skills: std.ArrayList(SkillInfo) = .empty;
+    errdefer {
+        for (skills.items) |*skill| skill.deinit(allocator);
+        skills.deinit(allocator);
+    }
+
+    var roots = try collectSkillRootsAlloc(allocator);
+    defer {
+        for (roots.items) |root| allocator.free(root.path);
+        roots.deinit(allocator);
+    }
+
+    for (roots.items) |root| {
+        try discoverSkillsUnderRoot(allocator, &skills, root);
+    }
+
+    return skills;
+}
+
+fn collectSkillRootsAlloc(allocator: std.mem.Allocator) !std.ArrayList(SkillRoot) {
+    var roots: std.ArrayList(SkillRoot) = .empty;
+    errdefer {
+        for (roots.items) |root| allocator.free(root.path);
+        roots.deinit(allocator);
+    }
+
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (home_dir) |value| allocator.free(value);
+
+    const xdg_config_home = try resolveXdgConfigHomeAlloc(allocator);
+    defer if (xdg_config_home) |value| allocator.free(value);
+
+    const codex_home = std.process.getEnvVarOwned(allocator, "CODEX_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (codex_home) |value| allocator.free(value);
+
+    if (xdg_config_home) |config_home| {
+        try appendSkillRootFromParts(allocator, &roots, config_home, "opencode/skill", .global);
+        try appendSkillRootFromParts(allocator, &roots, config_home, "opencode/skills", .global);
+        try appendSkillRootFromParts(allocator, &roots, config_home, "zolt/skill", .global);
+        try appendSkillRootFromParts(allocator, &roots, config_home, "zolt/skills", .global);
+    }
+
+    if (home_dir) |home| {
+        try appendSkillRootFromParts(allocator, &roots, home, ".claude/skills", .global);
+        try appendSkillRootFromParts(allocator, &roots, home, ".agents/skills", .global);
+        try appendSkillRootFromParts(allocator, &roots, home, ".zolt/skill", .global);
+        try appendSkillRootFromParts(allocator, &roots, home, ".zolt/skills", .global);
+    }
+    if (codex_home) |codex| {
+        try appendSkillRootFromParts(allocator, &roots, codex, "skills", .global);
+    } else if (home_dir) |home| {
+        try appendSkillRootFromParts(allocator, &roots, home, ".codex/skills", .global);
+    }
+
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    const repo_root = try findGitTopLevelAlloc(allocator);
+    defer if (repo_root) |path| allocator.free(path);
+
+    var ancestors = try collectAncestorsUpToRepoAlloc(allocator, cwd, repo_root);
+    defer {
+        for (ancestors.items) |dir| allocator.free(dir);
+        ancestors.deinit(allocator);
+    }
+
+    var idx = ancestors.items.len;
+    while (idx > 0) : (idx -= 1) {
+        const base = ancestors.items[idx - 1];
+        try appendSkillRootFromParts(allocator, &roots, base, ".opencode/skill", .project);
+        try appendSkillRootFromParts(allocator, &roots, base, ".opencode/skills", .project);
+        try appendSkillRootFromParts(allocator, &roots, base, ".claude/skills", .project);
+        try appendSkillRootFromParts(allocator, &roots, base, ".agents/skills", .project);
+        try appendSkillRootFromParts(allocator, &roots, base, ".codex/skills", .project);
+    }
+
+    return roots;
+}
+
+fn resolveXdgConfigHomeAlloc(allocator: std.mem.Allocator) !?[]u8 {
+    const from_env = std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    if (from_env) |value| return value;
+
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    if (home_dir) |home| {
+        defer allocator.free(home);
+        return try std.fs.path.join(allocator, &.{ home, ".config" });
+    }
+    return null;
+}
+
+fn collectAncestorsUpToRepoAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    repo_root: ?[]const u8,
+) !std.ArrayList([]u8) {
+    var dirs: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (dirs.items) |dir| allocator.free(dir);
+        dirs.deinit(allocator);
+    }
+
+    var current = try allocator.dupe(u8, cwd);
+    while (true) {
+        try dirs.append(allocator, current);
+        if (repo_root) |root| {
+            if (std.mem.eql(u8, current, root)) break;
+        }
+
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (parent.len == current.len) break;
+        current = try allocator.dupe(u8, parent);
+    }
+
+    return dirs;
+}
+
+fn appendSkillRootFromParts(
+    allocator: std.mem.Allocator,
+    roots: *std.ArrayList(SkillRoot),
+    base: []const u8,
+    relative: []const u8,
+    scope: SkillScope,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ base, relative });
+    errdefer allocator.free(path);
+
+    var dir = openDirForPath(path, .{}) catch {
+        allocator.free(path);
+        return;
+    };
+    dir.close();
+
+    for (roots.items) |existing| {
+        if (std.mem.eql(u8, existing.path, path)) {
+            allocator.free(path);
+            return;
+        }
+    }
+
+    try roots.append(allocator, .{
+        .path = path,
+        .scope = scope,
+    });
+}
+
+fn discoverSkillsUnderRoot(
+    allocator: std.mem.Allocator,
+    skills: *std.ArrayList(SkillInfo),
+    root: SkillRoot,
+) !void {
+    var dir = openDirForPath(root.path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(entry.path), "SKILL.md")) continue;
+
+        const full_path = try std.fs.path.join(allocator, &.{ root.path, entry.path });
+        defer allocator.free(full_path);
+
+        const skill = try parseSkillFileAlloc(allocator, full_path, root.scope) orelse continue;
+        try upsertSkill(allocator, skills, skill);
+    }
+}
+
+fn parseSkillFileAlloc(
+    allocator: std.mem.Allocator,
+    skill_path: []const u8,
+    scope: SkillScope,
+) !?SkillInfo {
+    var file = openFileForPath(skill_path, .{}) catch return null;
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, SKILL_FILE_MAX_BYTES) catch return null;
+    defer allocator.free(content);
+
+    const frontmatter = parseSkillFrontmatter(content) orelse return null;
+    const name = frontmatter.name;
+    const description = frontmatter.description;
+    if (!isValidSkillName(name)) return null;
+
+    const base_dir = std.fs.path.dirname(skill_path) orelse return null;
+    const dir_name = std.fs.path.basename(base_dir);
+    if (!std.ascii.eqlIgnoreCase(name, dir_name)) return null;
+
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .description = try allocator.dupe(u8, description),
+        .path = try allocator.dupe(u8, skill_path),
+        .base_dir = try allocator.dupe(u8, base_dir),
+        .scope = scope,
+    };
+}
+
+const ParsedSkillFrontmatter = struct {
+    name: []const u8,
+    description: []const u8,
+};
+
+fn parseSkillFrontmatter(content: []const u8) ?ParsedSkillFrontmatter {
+    var text = content;
+    if (text.len >= 3 and text[0] == 0xef and text[1] == 0xbb and text[2] == 0xbf) {
+        text = text[3..];
+    }
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const first_raw = lines.next() orelse return null;
+    const first = std.mem.trimRight(u8, first_raw, "\r");
+    if (!std.mem.eql(u8, std.mem.trim(u8, first, " \t"), "---")) return null;
+
+    var name: ?[]const u8 = null;
+    var description: ?[]const u8 = null;
+
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
+        if (std.mem.eql(u8, line, "---")) break;
+        if (std.mem.startsWith(u8, line, "name:")) {
+            name = trimFrontmatterValue(line["name:".len..]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "description:")) {
+            description = trimFrontmatterValue(line["description:".len..]);
+            continue;
+        }
+    }
+
+    const parsed_name = name orelse return null;
+    const parsed_description = description orelse return null;
+    if (parsed_name.len == 0 or parsed_description.len == 0) return null;
+    return .{
+        .name = parsed_name,
+        .description = parsed_description,
+    };
+}
+
+fn trimFrontmatterValue(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    return trimMatchingOuterQuotes(trimmed);
+}
+
+fn isValidSkillName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    if (name[0] == '-' or name[name.len - 1] == '-') return false;
+
+    var previous_dash = false;
+    for (name) |byte| {
+        const is_dash = byte == '-';
+        if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or is_dash)) return false;
+        if (is_dash and previous_dash) return false;
+        previous_dash = is_dash;
+    }
+    return true;
+}
+
+fn upsertSkill(
+    allocator: std.mem.Allocator,
+    skills: *std.ArrayList(SkillInfo),
+    skill: SkillInfo,
+) !void {
+    for (skills.items, 0..) |*existing, index| {
+        if (!std.ascii.eqlIgnoreCase(existing.name, skill.name)) continue;
+        existing.deinit(allocator);
+        skills.items[index] = skill;
+        return;
+    }
+    try skills.append(allocator, skill);
+}
+
+fn buildSkillsContextPayloadAlloc(allocator: std.mem.Allocator, skills: []const SkillInfo) ![]u8 {
+    if (skills.len == 0) return allocator.dupe(u8, "");
+
+    const cwd = std.process.getCwdAlloc(allocator) catch null;
+    defer if (cwd) |path| allocator.free(path);
+    const repo_root = findGitTopLevelAlloc(allocator) catch null;
+    defer if (repo_root) |path| allocator.free(path);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try out.writer.print(
+        "{s} available:{d}\nUse $skill-name mention or <SKILL>{{\"name\":\"...\"}}</SKILL> to load full instructions.\n<available_skills>\n",
+        .{ SKILLS_CONTEXT_HEADER, skills.len },
+    );
+
+    const shown = @min(skills.len, SKILLS_CONTEXT_MAX_ENTRIES);
+    for (skills[0..shown]) |skill| {
+        const display_path = try formatInjectedPathForSummaryAlloc(allocator, skill.path, cwd, repo_root);
+        defer allocator.free(display_path);
+        try out.writer.print(
+            "- {s}: {s} (scope:{s} path:{s})\n",
+            .{ skill.name, skill.description, switch (skill.scope) {
+                .project => "project",
+                .global => "global",
+            }, display_path },
+        );
+    }
+    if (skills.len > shown) {
+        try out.writer.print("- ... (+{d} more)\n", .{skills.len - shown});
+    }
+    try out.writer.writeAll("</available_skills>\n");
+
+    return out.toOwnedSlice();
+}
+
 fn findNearestAgentsFilePathAlloc(allocator: std.mem.Allocator) !?[]u8 {
     var current_dir = try std.process.getCwdAlloc(allocator);
     const file_names = [_][]const u8{ "AGENTS.md", "agents.md" };
@@ -7626,6 +8301,22 @@ test "parseViewImageToolPayload extracts xml and fenced formats" {
     try std.testing.expect(parseViewImageToolPayload("no tool") == null);
 }
 
+test "parseSkillToolPayload extracts xml fenced and bracket formats" {
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"release\"}",
+        parseSkillToolPayload("<SKILL>\n{\"name\":\"release\"}\n</SKILL>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"workspace-bootstrap\"}",
+        parseSkillToolPayload("```skill\n{\"name\":\"workspace-bootstrap\"}\n```").?,
+    );
+    try std.testing.expectEqualStrings(
+        "lint-fix",
+        parseSkillToolPayload("[tool] SKILL lint-fix").?,
+    );
+    try std.testing.expect(parseSkillToolPayload("no tool") == null);
+}
+
 test "parseExecCommandInput parses json and plain command" {
     const allocator = std.testing.allocator;
 
@@ -7951,7 +8642,7 @@ test "diffRenderColorForLine tracks fenced diff and code blocks" {
     _ = diffRenderColorForLine(&state, "```", palette);
 }
 
-test "parseAssistantToolCall detects discovery/edit/exec/web/image tools" {
+test "parseAssistantToolCall detects discovery/edit/exec/web/image/skill tools" {
     const read_tool = parseAssistantToolCall("<READ>ls</READ>").?;
     switch (read_tool) {
         .read => |command| try std.testing.expectEqualStrings("ls", command),
@@ -8011,6 +8702,12 @@ test "parseAssistantToolCall detects discovery/edit/exec/web/image tools" {
     const view_image_call = parseAssistantToolCall("<VIEW_IMAGE>{\"path\":\"image.png\"}</VIEW_IMAGE>").?;
     switch (view_image_call) {
         .view_image => |payload| try std.testing.expectEqualStrings("{\"path\":\"image.png\"}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const skill_call = parseAssistantToolCall("<SKILL>{\"name\":\"release\"}</SKILL>").?;
+    switch (skill_call) {
+        .skill => |payload| try std.testing.expectEqualStrings("{\"name\":\"release\"}", payload),
         else => return error.TestUnexpectedResult,
     }
 
@@ -8306,6 +9003,22 @@ test "collectAtFileReferences parses unique @path tokens" {
     try std.testing.expectEqual(@as(usize, 2), refs.items.len);
     try std.testing.expectEqualStrings("src/main.zig", refs.items[0]);
     try std.testing.expectEqualStrings("src/tui.zig", refs.items[1]);
+}
+
+test "collectDollarSkillReferences parses unique $skill mentions" {
+    const allocator = std.testing.allocator;
+    const text = "use $release-note then ($lint_fix), [$test-suite], and $release-note again";
+
+    var refs = try collectDollarSkillReferences(allocator, text);
+    defer {
+        for (refs.items) |entry| allocator.free(entry);
+        refs.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), refs.items.len);
+    try std.testing.expectEqualStrings("release-note", refs.items[0]);
+    try std.testing.expectEqualStrings("lint_fix", refs.items[1]);
+    try std.testing.expectEqualStrings("test-suite", refs.items[2]);
 }
 
 test "collectAtFileReferences parses quoted @path with spaces" {

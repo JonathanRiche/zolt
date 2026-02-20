@@ -10,6 +10,7 @@ const exec_command_tool = @import("exec_command_tool.zig");
 const write_stdin_tool = @import("write_stdin_tool.zig");
 const web_search_tool = @import("web_search_tool.zig");
 const view_image_tool = @import("view_image_tool.zig");
+const skill_tool = @import("skill_tool.zig");
 
 pub fn runReadToolCommand(app: anytype, command_text: []const u8) ![]u8 {
     return read_tool.run(app, command_text);
@@ -49,4 +50,8 @@ pub fn runWebSearchToolPayload(app: anytype, payload: []const u8) ![]u8 {
 
 pub fn runViewImageToolPayload(app: anytype, payload: []const u8) ![]u8 {
     return view_image_tool.run(app, payload);
+}
+
+pub fn runSkillToolPayload(app: anytype, payload: []const u8) ![]u8 {
+    return skill_tool.run(app, payload);
 }

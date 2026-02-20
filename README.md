@@ -35,10 +35,11 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 - `@` file popup picker
 - `@path` file content injection into prompt context
 - Clipboard image paste into `@path` references (`Ctrl-V` or `/paste-image`)
+- Skill discovery/injection from Codex/OpenCode-style directories (`$skill-name`, `/skills`, `SKILL` tool)
 - Tool loop with discovery/edit/exec primitives:
   - `READ` (allowlisted shell read commands)
   - `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`
-  - `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH` (DuckDuckGo default, Exa optional), `VIEW_IMAGE`
+  - `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH` (DuckDuckGo default, Exa optional), `VIEW_IMAGE`, `SKILL`
 
 ## Requirements
 
@@ -116,7 +117,7 @@ Notes:
   - `usage.total_tokens` (`number|null`)
 - Existing top-level fields remain unchanged: `provider`, `model`, `session_id`, `prompt`, `response`, `events`.
 - `usage` is normalized across providers (`input_tokens`/`output_tokens` map to `prompt_tokens`/`completion_tokens`).
-- Tool loop is enabled in run mode (`READ`, `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`, `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`, `VIEW_IMAGE`).
+- Tool loop is enabled in run mode (`READ`, `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`, `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`, `VIEW_IMAGE`, `SKILL`).
 - In `text` mode, stdout is only the final assistant response (tool call placeholders are not returned as final output).
 
 3. Install to `~/.local` (puts binary at `~/.local/bin/zolt`):
@@ -298,6 +299,7 @@ Picker triggers:
 - `/model [id]`
 - `/models [refresh]`
 - `/files [refresh]`
+- `/skills [name|refresh]` (list, inspect, or reload discovered skills)
 - `/new [title]`
 - `/sessions [id]` (no id opens conversation picker)
 - `/compact` (compact current conversation now)
@@ -308,6 +310,35 @@ Picker triggers:
 - `/quit`
 - `/q` (alias of `/quit`)
 - `/paste-image`
+
+### Skills
+
+Zolt discovers `SKILL.md` files using Codex/OpenCode-compatible roots.
+
+Global roots:
+- `$XDG_CONFIG_HOME/opencode/skill/*/SKILL.md` (fallback: `~/.config/opencode/skill/*/SKILL.md`)
+- `$XDG_CONFIG_HOME/opencode/skills/*/SKILL.md` (fallback: `~/.config/opencode/skills/*/SKILL.md`)
+- `$XDG_CONFIG_HOME/zolt/skill/*/SKILL.md` (fallback: `~/.config/zolt/skill/*/SKILL.md`)
+- `$XDG_CONFIG_HOME/zolt/skills/*/SKILL.md` (fallback: `~/.config/zolt/skills/*/SKILL.md`)
+- `~/.agents/skills/*/SKILL.md`
+- `~/.claude/skills/*/SKILL.md`
+- `~/.zolt/skill/*/SKILL.md` and `~/.zolt/skills/*/SKILL.md` (legacy/local convenience)
+- `$CODEX_HOME/skills/*/SKILL.md` (fallback: `~/.codex/skills/*/SKILL.md`)
+
+Project roots (searched from repo root -> cwd, so deeper paths override):
+- `.opencode/skill/*/SKILL.md`
+- `.opencode/skills/*/SKILL.md`
+- `.agents/skills/*/SKILL.md`
+- `.claude/skills/*/SKILL.md`
+- `.codex/skills/*/SKILL.md`
+
+Yes: skills in the directory where Zolt is currently running are included (if they are under one of the project roots above).
+
+Usage:
+- Mention `$skill-name` in your prompt to inject that skill’s full `SKILL.md` content.
+- Use `/skills` to list cached skills.
+- Use `/skills <name>` to inspect a specific skill entry.
+- Use `/skills refresh` after adding/changing skill files.
 
 ### File Mentions
 
