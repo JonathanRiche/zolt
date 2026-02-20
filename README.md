@@ -320,18 +320,15 @@ Picker triggers:
 - `/title <text>`
 - `/theme [codex|plain|forest]`
 - `/ui [compact|comfy]`
-- `/ui backend [ansi|vaxis]` (vaxis requires building with `-Dvaxis=true`)
 - `/quit`
 - `/q` (alias of `/quit`)
 - `/paste-image`
 
 ### Backend Fallback
 
-- Default builds (without `-Dvaxis=true`) run ANSI backend only.
-- In ANSI-only builds, `/ui backend vaxis` is rejected with a clear notice.
-- In `-Dvaxis=true` builds, backend switching is available with:
-  - `/ui backend ansi`
-  - `/ui backend vaxis`
+- `-Dvaxis=true` builds use the vaxis backend by default.
+- ANSI backend remains only as a deprecated fallback path when built without vaxis.
+- Runtime backend switching via `/ui backend ...` is deprecated and removed.
 
 ### Startup/Perf Checks
 

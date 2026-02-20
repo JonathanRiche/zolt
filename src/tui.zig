@@ -3528,56 +3528,14 @@ const App = struct {
 
         if (std.mem.eql(u8, command, "ui")) {
             const mode_name = parts.next() orelse {
-                try self.setNoticeFmt("UI mode: {s} (backend:{s})", .{
+                try self.setNoticeFmt("UI mode: {s}", .{
                     if (self.compact_mode) "compact" else "comfy",
-                    uiBackendLabel(self.selected_backend),
                 });
                 return;
             };
 
             if (std.mem.eql(u8, mode_name, "backend")) {
-                const backend_name = parts.next() orelse {
-                    if (build_options.enable_vaxis_backend) {
-                        try self.setNoticeFmt("UI backend: {s}. Use /ui backend [ansi|vaxis]", .{
-                            uiBackendLabel(self.selected_backend),
-                        });
-                    } else {
-                        try self.setNotice("UI backend fixed to ansi (build without -Dvaxis=true).");
-                    }
-                    return;
-                };
-                if (parts.next() != null) {
-                    try self.setNotice("Usage: /ui backend [ansi|vaxis]");
-                    return;
-                }
-
-                if (std.mem.eql(u8, backend_name, "ansi")) {
-                    if (self.selected_backend == .ansi) {
-                        try self.setNotice("UI backend already ansi");
-                        return;
-                    }
-                    self.selected_backend = .ansi;
-                    self.restart_interactive_loop = true;
-                    try self.setNotice("Switching UI backend to ansi");
-                    return;
-                }
-
-                if (std.mem.eql(u8, backend_name, "vaxis")) {
-                    if (!build_options.enable_vaxis_backend) {
-                        try self.setNotice("Vaxis backend is unavailable in this build (rebuild with -Dvaxis=true).");
-                        return;
-                    }
-                    if (self.selected_backend == .vaxis) {
-                        try self.setNotice("UI backend already vaxis");
-                        return;
-                    }
-                    self.selected_backend = .vaxis;
-                    self.restart_interactive_loop = true;
-                    try self.setNotice("Switching UI backend to vaxis");
-                    return;
-                }
-
-                try self.setNotice("Usage: /ui backend [ansi|vaxis]");
+                try self.setNotice("`/ui backend` is deprecated. Build with -Dvaxis=true to use the vaxis UI backend.");
                 return;
             }
 
@@ -3592,7 +3550,7 @@ const App = struct {
                 return;
             }
 
-            try self.setNotice("Usage: /ui [compact|comfy] or /ui backend [ansi|vaxis]");
+            try self.setNotice("Usage: /ui [compact|comfy]");
             return;
         }
 
@@ -6177,7 +6135,7 @@ const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "sessions", .description = "switch conversation session (picker or id)" },
     .{ .name = "title", .description = "rename conversation" },
     .{ .name = "theme", .description = "set theme (codex/plain/forest)" },
-    .{ .name = "ui", .description = "set ui mode or backend (compact/comfy, backend ansi/vaxis)" },
+    .{ .name = "ui", .description = "set ui mode (compact/comfy)" },
     .{ .name = "paste-image", .description = "paste clipboard image into @path" },
     .{ .name = "quit", .description = "exit app", .insert_trailing_space = false },
     .{ .name = "q", .description = "exit app", .insert_trailing_space = false },

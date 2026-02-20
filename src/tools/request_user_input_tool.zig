@@ -40,7 +40,7 @@ const RequestUserInputPayload = struct {
 };
 
 pub fn run(app: anytype, payload: []const u8) ![]u8 {
-    const parsed = parseRequestUserInputPayload(app.allocator, payload) catch |err| {
+    var parsed = parseRequestUserInputPayload(app.allocator, payload) catch |err| {
         return switch (err) {
             error.InvalidToolPayload => app.allocator.dupe(
                 u8,

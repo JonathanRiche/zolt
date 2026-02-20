@@ -16,9 +16,19 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
   - [x] model/command/file/skills pickers
   - [x] markdown line styling parity
 - [x] keep non-interactive `zolt run` path independent of vaxis backend (headless path bypasses interactive backend loops)
-- [x] add A/B toggle command (`/ui backend ansi|vaxis`) for runtime testing when vaxis is enabled
+- [x] remove runtime backend toggle; keep vaxis default and treat ansi as deprecated fallback only
 - [x] add regression tests for parsing/key behavior that should remain backend-agnostic
 - [x] add perf/startup checks for Linux/macOS and document fallback behavior in README
+
+## Vaxis UI Polish (Active)
+- [ ] redesign header/status typography to feel less ANSI-era (spacing, separators, hierarchy)
+- [ ] improve message block layout (role markers, indentation, vertical rhythm)
+- [ ] add richer color theming for vaxis styles (semantic palette for user/assistant/system/tool)
+- [ ] polish picker surfaces (borders, highlight bar, selected-row contrast)
+- [ ] improve code/diff rendering in vaxis (fence chrome, gutter/line accents)
+- [ ] add subtle animated affordances in vaxis (streaming cursor/spinner polish)
+- [ ] tighten status/footer information density and truncation behavior
+- [ ] add screenshots/golden snapshots for visual regression checks
 
 ## Core Tooling (Foundation)
 - [x] `exec_command` + `write_stdin` (interactive shell sessions)
