@@ -113,6 +113,7 @@ const StreamTask = enum {
     running_view_image,
     running_skill,
     running_update_plan,
+    running_request_user_input,
 };
 
 const CommandPickerKind = enum {
@@ -356,7 +357,7 @@ const KEY_DOWN_ARROW: u8 = keybindings.KEY_DOWN_ARROW;
 const KEY_PAGE_UP: u8 = keybindings.KEY_PAGE_UP;
 const KEY_PAGE_DOWN: u8 = keybindings.KEY_PAGE_DOWN;
 const TOOL_SYSTEM_PROMPT =
-    "You can use twelve local tools.\n" ++
+    "You can use thirteen local tools.\n" ++
     "When you need to inspect files, reply with ONLY:\n" ++
     "<READ>\n" ++
     "<command>\n" ++
@@ -412,8 +413,13 @@ const TOOL_SYSTEM_PROMPT =
     "{\"explanation\":\"optional note\",\"plan\":[{\"step\":\"name\",\"status\":\"pending|in_progress|completed\"}]}\n" ++
     "</UPDATE_PLAN>\n" ++
     "At most one plan item may have status in_progress.\n" ++
+    "To request structured user decisions, use:\n" ++
+    "<REQUEST_USER_INPUT>\n" ++
+    "{\"questions\":[{\"header\":\"short\",\"id\":\"stable_id\",\"question\":\"prompt\",\"options\":[{\"label\":\"choice\",\"description\":\"tradeoff\"}]}]}\n" ++
+    "</REQUEST_USER_INPUT>\n" ++
+    "Use one to three questions. Each question should include two to four mutually exclusive options.\n" ++
     "Available skill names/descriptions are provided in [skills-context] messages.\n" ++
-    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], [view-image-result], [skill-result], or [update-plan-result], continue the answer normally.";
+    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], [view-image-result], [skill-result], [update-plan-result], or [request-user-input-result], continue the answer normally.";
 
 const VIEW_IMAGE_VISION_PROMPT =
     "Describe this image for a coding assistant. Focus on visible UI/text/code, layout, key errors/warnings, and actionable observations. Keep it concise.";
@@ -1841,6 +1847,25 @@ const App = struct {
                         break :tool_loop;
                     }
                 },
+                .request_user_input => |request_payload| {
+                    self.stream_task = .running_request_user_input;
+                    try self.render();
+                    const payload_owned = try self.allocator.dupe(u8, request_payload);
+                    defer self.allocator.free(payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] REQUEST_USER_INPUT");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] REQUEST_USER_INPUT" });
+
+                    const tool_result = try self.runRequestUserInputToolPayload(payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] REQUEST_USER_INPUT", tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("REQUEST_USER_INPUT tool requested user choice");
+                    executed_any_tool = true;
+                    break :tool_loop;
+                },
             }
             self.stream_task = .thinking;
             try self.render();
@@ -2454,6 +2479,10 @@ const App = struct {
 
     fn runUpdatePlanToolPayload(self: *App, payload: []const u8) ![]u8 {
         return tools_runtime.runUpdatePlanToolPayload(self, payload);
+    }
+
+    fn runRequestUserInputToolPayload(self: *App, payload: []const u8) ![]u8 {
+        return tools_runtime.runRequestUserInputToolPayload(self, payload);
     }
 
     fn pasteClipboardImageIntoInput(self: *App) !void {
@@ -5396,6 +5425,7 @@ fn streamTaskTitle(task: StreamTask) []const u8 {
         .running_view_image => "Running VIEW_IMAGE",
         .running_skill => "Running SKILL",
         .running_update_plan => "Running UPDATE_PLAN",
+        .running_request_user_input => "Running REQUEST_USER_INPUT",
     };
 }
 
@@ -6412,6 +6442,7 @@ const AssistantToolCall = union(enum) {
     view_image: []const u8,
     skill: []const u8,
     update_plan: []const u8,
+    request_user_input: []const u8,
 };
 
 fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
@@ -6444,6 +6475,9 @@ fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
     }
     if (parseUpdatePlanToolPayload(text)) |payload| {
         return .{ .update_plan = payload };
+    }
+    if (parseRequestUserInputToolPayload(text)) |payload| {
+        return .{ .request_user_input = payload };
     }
     if (parseReadToolCommand(text)) |command| {
         return .{ .read = command };
@@ -6701,6 +6735,34 @@ fn parseUpdatePlanToolPayload(text: []const u8) ?[]const u8 {
         const after_marker = std.mem.trimLeft(u8, trimmed["[tool]".len..], " \t");
         if (after_marker.len >= "UPDATE_PLAN".len and std.mem.startsWith(u8, after_marker, "UPDATE_PLAN")) {
             const payload = std.mem.trimLeft(u8, after_marker["UPDATE_PLAN".len..], " \t:");
+            if (payload.len > 0) return payload;
+        }
+    }
+
+    return null;
+}
+
+fn parseRequestUserInputToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<REQUEST_USER_INPUT>")) {
+        const rest = trimmed["<REQUEST_USER_INPUT>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</REQUEST_USER_INPUT>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```request_user_input")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "[tool]")) {
+        const after_marker = std.mem.trimLeft(u8, trimmed["[tool]".len..], " \t");
+        if (after_marker.len >= "REQUEST_USER_INPUT".len and std.mem.startsWith(u8, after_marker, "REQUEST_USER_INPUT")) {
+            const payload = std.mem.trimLeft(u8, after_marker["REQUEST_USER_INPUT".len..], " \t:");
             if (payload.len > 0) return payload;
         }
     }
@@ -9442,6 +9504,28 @@ test "parseUpdatePlanToolPayload extracts xml fenced and bracket formats" {
     try std.testing.expect(parseUpdatePlanToolPayload("no tool") == null);
 }
 
+test "parseRequestUserInputToolPayload extracts xml fenced and bracket formats" {
+    try std.testing.expectEqualStrings(
+        "{\"questions\":[{\"header\":\"One\",\"id\":\"q1\",\"question\":\"Pick\",\"options\":[{\"label\":\"A\",\"description\":\"aa\"},{\"label\":\"B\",\"description\":\"bb\"}]}]}",
+        parseRequestUserInputToolPayload(
+            "<REQUEST_USER_INPUT>\n{\"questions\":[{\"header\":\"One\",\"id\":\"q1\",\"question\":\"Pick\",\"options\":[{\"label\":\"A\",\"description\":\"aa\"},{\"label\":\"B\",\"description\":\"bb\"}]}]}\n</REQUEST_USER_INPUT>",
+        ).?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"questions\":[{\"header\":\"Two\",\"id\":\"q2\",\"question\":\"Pick\",\"options\":[{\"label\":\"A\",\"description\":\"aa\"},{\"label\":\"B\",\"description\":\"bb\"}]}]}",
+        parseRequestUserInputToolPayload(
+            "```request_user_input\n{\"questions\":[{\"header\":\"Two\",\"id\":\"q2\",\"question\":\"Pick\",\"options\":[{\"label\":\"A\",\"description\":\"aa\"},{\"label\":\"B\",\"description\":\"bb\"}]}]}\n```",
+        ).?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"questions\":[{\"header\":\"Three\",\"id\":\"q3\",\"question\":\"Pick\",\"options\":[{\"label\":\"A\",\"description\":\"aa\"},{\"label\":\"B\",\"description\":\"bb\"}]}]}",
+        parseRequestUserInputToolPayload(
+            "[tool] REQUEST_USER_INPUT {\"questions\":[{\"header\":\"Three\",\"id\":\"q3\",\"question\":\"Pick\",\"options\":[{\"label\":\"A\",\"description\":\"aa\"},{\"label\":\"B\",\"description\":\"bb\"}]}]}",
+        ).?,
+    );
+    try std.testing.expect(parseRequestUserInputToolPayload("no tool") == null);
+}
+
 test "parseExecCommandInput parses json and plain command" {
     const allocator = std.testing.allocator;
 
@@ -9851,7 +9935,7 @@ test "diffRenderColorForLine tracks fenced diff and code blocks" {
     _ = diffRenderColorForLine(&state, "```", palette);
 }
 
-test "parseAssistantToolCall detects discovery/edit/exec/web/image/skill/update tools" {
+test "parseAssistantToolCall detects discovery/edit/exec/web/image/skill/update/request tools" {
     const read_tool = parseAssistantToolCall("<READ>ls</READ>").?;
     switch (read_tool) {
         .read => |command| try std.testing.expectEqualStrings("ls", command),
@@ -9923,6 +10007,19 @@ test "parseAssistantToolCall detects discovery/edit/exec/web/image/skill/update 
     const update_plan_call = parseAssistantToolCall("<UPDATE_PLAN>{\"plan\":[{\"step\":\"do\",\"status\":\"pending\"}]}</UPDATE_PLAN>").?;
     switch (update_plan_call) {
         .update_plan => |payload| try std.testing.expectEqualStrings("{\"plan\":[{\"step\":\"do\",\"status\":\"pending\"}]}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const request_user_input_call = parseAssistantToolCall(
+        "<REQUEST_USER_INPUT>{\"questions\":[{\"header\":\"One\",\"id\":\"q1\",\"question\":\"Pick\",\"options\":[{\"label\":\"A\",\"description\":\"a\"},{\"label\":\"B\",\"description\":\"b\"}]}]}</REQUEST_USER_INPUT>",
+    ).?;
+    switch (request_user_input_call) {
+        .request_user_input => |payload| {
+            try std.testing.expectEqualStrings(
+                "{\"questions\":[{\"header\":\"One\",\"id\":\"q1\",\"question\":\"Pick\",\"options\":[{\"label\":\"A\",\"description\":\"a\"},{\"label\":\"B\",\"description\":\"b\"}]}]}",
+                payload,
+            );
+        },
         else => return error.TestUnexpectedResult,
     }
 

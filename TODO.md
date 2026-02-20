@@ -33,9 +33,9 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 
 ## Planning and UX Control (High Priority)
 - [x] `update_plan` equivalent
-- [ ] `request_user_input` equivalent
-  - [ ] define blocking vs non-blocking behavior
-  - [ ] specify UI surface (modal, inline prompt, status bar, etc.)
+- [x] `request_user_input` equivalent
+  - [x] define blocking vs non-blocking behavior (`non_blocking_inline`)
+  - [x] specify UI surface (inline `[request-user-input-result]` system block + assistant follow-up)
 - [x] auto-load `agents.md` at start of each new chat; lazily load skill names/descriptions so the LLM knows when to use a skill
 - [x] OpenAI provider: allow user to choose between Codex/ChatGPT subscription vs API key option
 
