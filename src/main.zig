@@ -7,6 +7,7 @@ const app_config = @import("config.zig");
 const models = @import("models.zig");
 const Paths = @import("paths.zig").Paths;
 const AppState = @import("state.zig").AppState;
+const Conversation = @import("state.zig").Conversation;
 const TokenUsage = @import("state.zig").TokenUsage;
 const tui = @import("tui.zig");
 const APP_VERSION = "0.1.0-dev";
@@ -32,6 +33,12 @@ const RunTaskJsonUsage = struct {
     prompt_tokens: ?u64 = null,
     completion_tokens: ?u64 = null,
     total_tokens: ?u64 = null,
+};
+
+const RunTaskJsonContext = struct {
+    context_window_tokens: ?u64 = null,
+    context_left_percent: ?u64 = null,
+    compact_count: ?u64 = null,
 };
 
 const CliListModelsOptions = struct {
@@ -289,12 +296,14 @@ fn runSinglePromptTask(
             const usage_after = app_state.currentConversationConst().total_token_usage;
             const usage_delta = tokenUsageDelta(usage_before, usage_after);
             const usage = runTaskJsonUsageFromTokenUsage(usage_delta);
+            const context = runTaskJsonContextFromConversation(app_state.currentConversationConst());
             try writeRunTaskJsonOutputToStdout(
                 allocator,
                 app_state,
                 prompt,
                 assistant_text,
                 usage,
+                context,
                 collector.events.items,
             );
         },
@@ -440,9 +449,10 @@ fn writeRunTaskJsonOutputToStdout(
     prompt: []const u8,
     response: []const u8,
     usage: RunTaskJsonUsage,
+    context: RunTaskJsonContext,
     events: []const RunTaskCapturedEvent,
 ) !void {
-    const payload = try buildRunTaskJsonPayloadAlloc(allocator, app_state, prompt, response, usage, events);
+    const payload = try buildRunTaskJsonPayloadAlloc(allocator, app_state, prompt, response, usage, context, events);
     defer allocator.free(payload);
     try writeRunTaskOutputToStdout(payload);
 }
@@ -453,6 +463,7 @@ fn buildRunTaskJsonPayloadAlloc(
     prompt: []const u8,
     response: []const u8,
     usage: RunTaskJsonUsage,
+    context: RunTaskJsonContext,
     events: []const RunTaskCapturedEvent,
 ) ![]u8 {
     var payload_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -482,6 +493,12 @@ fn buildRunTaskJsonPayloadAlloc(
     try jw.objectField("total_tokens");
     try jw.write(usage.total_tokens);
     try jw.endObject();
+    try jw.objectField("context_window_tokens");
+    try jw.write(context.context_window_tokens);
+    try jw.objectField("context_left_percent");
+    try jw.write(context.context_left_percent);
+    try jw.objectField("compact_count");
+    try jw.write(context.compact_count);
     try jw.objectField("events");
     try jw.beginArray();
     for (events) |event| {
@@ -514,6 +531,37 @@ fn runTaskJsonUsageFromTokenUsage(usage: TokenUsage) RunTaskJsonUsage {
         .completion_tokens = optionalPositiveU64(usage.output_tokens),
         .total_tokens = optionalPositiveU64(usage.total_tokens),
     };
+}
+
+fn runTaskJsonContextFromConversation(conversation: *const Conversation) RunTaskJsonContext {
+    var context_window_tokens: ?u64 = null;
+    var context_left_percent: ?u64 = null;
+    if (conversation.model_context_window) |window| {
+        if (optionalPositiveU64(window)) |window_tokens| {
+            context_window_tokens = window_tokens;
+            const percent = conversation.total_token_usage.percentOfContextWindowRemaining(window);
+            context_left_percent = @as(u64, @intCast(std.math.clamp(percent, @as(i64, 0), @as(i64, 100))));
+        }
+    }
+
+    return .{
+        .context_window_tokens = context_window_tokens,
+        .context_left_percent = context_left_percent,
+        .compact_count = countConversationCompactions(conversation),
+    };
+}
+
+fn countConversationCompactions(conversation: *const Conversation) u64 {
+    const compact_note_prefix = "[compact]";
+    var count: u64 = 0;
+    for (conversation.messages.items) |message| {
+        if (message.role != .system) continue;
+        const trimmed = std.mem.trim(u8, message.content, " \t\r\n");
+        if (std.mem.startsWith(u8, trimmed, compact_note_prefix)) {
+            count += 1;
+        }
+    }
+    return count;
 }
 
 fn optionalPositiveU64(value: i64) ?u64 {
@@ -1392,7 +1440,108 @@ test "runTaskJsonUsageFromTokenUsage returns null fields when usage missing" {
     try std.testing.expectEqual(@as(?u64, null), usage.total_tokens);
 }
 
-test "buildRunTaskJsonPayloadAlloc includes usage for provider-error style response" {
+test "runTaskJsonContextFromConversation maps session health fields" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    app_state.currentConversation().model_context_window = 400_000;
+    app_state.currentConversation().total_token_usage = .{
+        .input_tokens = 123,
+        .output_tokens = 45,
+        .total_tokens = 168,
+    };
+    try app_state.appendMessage(allocator, .system, "[compact] summarized prior turns");
+
+    const context = runTaskJsonContextFromConversation(app_state.currentConversationConst());
+    try std.testing.expectEqual(@as(?u64, 400_000), context.context_window_tokens);
+    try std.testing.expectEqual(@as(?u64, 99), context.context_left_percent);
+    try std.testing.expectEqual(@as(?u64, 1), context.compact_count);
+}
+
+test "runTaskJsonContextFromConversation returns null for unknown context window" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    const context = runTaskJsonContextFromConversation(app_state.currentConversationConst());
+    try std.testing.expectEqual(@as(?u64, null), context.context_window_tokens);
+    try std.testing.expectEqual(@as(?u64, null), context.context_left_percent);
+    try std.testing.expectEqual(@as(?u64, 0), context.compact_count);
+}
+
+test "buildRunTaskJsonPayloadAlloc includes usage and context for normal response" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    try app_state.setActiveProvider(allocator, "openai");
+    try app_state.setActiveModel(allocator, "gpt-5.2-codex");
+    app_state.currentConversation().model_context_window = 400_000;
+    app_state.currentConversation().total_token_usage = .{
+        .input_tokens = 123,
+        .output_tokens = 45,
+        .total_tokens = 168,
+    };
+
+    const usage = runTaskJsonUsageFromTokenUsage(.{
+        .input_tokens = 123,
+        .output_tokens = 45,
+        .total_tokens = 168,
+    });
+    const context = runTaskJsonContextFromConversation(app_state.currentConversationConst());
+
+    const payload = try buildRunTaskJsonPayloadAlloc(
+        allocator,
+        &app_state,
+        "hi",
+        "hello",
+        usage,
+        context,
+        &.{},
+    );
+    defer allocator.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const usage_value = root.get("usage") orelse return error.TestUnexpectedResult;
+    const usage_object = switch (usage_value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+
+    try std.testing.expectEqual(@as(i64, 123), switch (usage_object.get("prompt_tokens").?) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(i64, 45), switch (usage_object.get("completion_tokens").?) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(i64, 168), switch (usage_object.get("total_tokens").?) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(i64, 400_000), switch (root.get("context_window_tokens").?) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(i64, 99), switch (root.get("context_left_percent").?) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(i64, 0), switch (root.get("compact_count").?) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+}
+
+test "buildRunTaskJsonPayloadAlloc includes usage and context for provider-error style response" {
     const allocator = std.testing.allocator;
     var app_state = try AppState.init(allocator);
     defer app_state.deinit(allocator);
@@ -1400,11 +1549,19 @@ test "buildRunTaskJsonPayloadAlloc includes usage for provider-error style respo
     try app_state.setActiveProvider(allocator, "openai");
     try app_state.setActiveModel(allocator, "gpt-5");
 
+    app_state.currentConversation().model_context_window = 400_000;
+    app_state.currentConversation().total_token_usage = .{
+        .input_tokens = 7,
+        .output_tokens = 0,
+        .total_tokens = 7,
+    };
+
     const usage = runTaskJsonUsageFromTokenUsage(.{
         .input_tokens = 7,
         .output_tokens = 0,
         .total_tokens = 7,
     });
+    const context = runTaskJsonContextFromConversation(app_state.currentConversationConst());
 
     const payload = try buildRunTaskJsonPayloadAlloc(
         allocator,
@@ -1412,6 +1569,7 @@ test "buildRunTaskJsonPayloadAlloc includes usage for provider-error style respo
         "hi",
         "[local] Request failed.",
         usage,
+        context,
         &.{},
     );
     defer allocator.free(payload);
@@ -1439,6 +1597,64 @@ test "buildRunTaskJsonPayloadAlloc includes usage for provider-error style respo
     });
     try std.testing.expect(completion_tokens == .null);
     try std.testing.expectEqual(@as(i64, 7), switch (total_tokens) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+
+    const context_window_tokens = root.get("context_window_tokens") orelse return error.TestUnexpectedResult;
+    const context_left_percent = root.get("context_left_percent") orelse return error.TestUnexpectedResult;
+    const compact_count = root.get("compact_count") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 400_000), switch (context_window_tokens) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(i64, 99), switch (context_left_percent) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(i64, 0), switch (compact_count) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+}
+
+test "buildRunTaskJsonPayloadAlloc emits null usage/context fields when unknown" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    const usage = runTaskJsonUsageFromTokenUsage(.{});
+    const context = runTaskJsonContextFromConversation(app_state.currentConversationConst());
+
+    const payload = try buildRunTaskJsonPayloadAlloc(
+        allocator,
+        &app_state,
+        "hi",
+        "hello",
+        usage,
+        context,
+        &.{},
+    );
+    defer allocator.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const usage_value = root.get("usage") orelse return error.TestUnexpectedResult;
+    const usage_object = switch (usage_value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(usage_object.get("prompt_tokens").? == .null);
+    try std.testing.expect(usage_object.get("completion_tokens").? == .null);
+    try std.testing.expect(usage_object.get("total_tokens").? == .null);
+    try std.testing.expect(root.get("context_window_tokens").? == .null);
+    try std.testing.expect(root.get("context_left_percent").? == .null);
+    try std.testing.expectEqual(@as(i64, 0), switch (root.get("compact_count").?) {
         .integer => |value| value,
         else => return error.TestUnexpectedResult,
     });
