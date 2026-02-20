@@ -32,7 +32,7 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [x] richer project search (`search_tool_bm25` style)
 
 ## Planning and UX Control (High Priority)
-- [ ] `update_plan` equivalent
+- [x] `update_plan` equivalent
 - [ ] `request_user_input` equivalent
   - [ ] define blocking vs non-blocking behavior
   - [ ] specify UI surface (modal, inline prompt, status bar, etc.)

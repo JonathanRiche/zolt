@@ -112,6 +112,7 @@ const StreamTask = enum {
     running_web_search,
     running_view_image,
     running_skill,
+    running_update_plan,
 };
 
 const CommandPickerKind = enum {
@@ -355,7 +356,7 @@ const KEY_DOWN_ARROW: u8 = keybindings.KEY_DOWN_ARROW;
 const KEY_PAGE_UP: u8 = keybindings.KEY_PAGE_UP;
 const KEY_PAGE_DOWN: u8 = keybindings.KEY_PAGE_DOWN;
 const TOOL_SYSTEM_PROMPT =
-    "You can use eleven local tools.\n" ++
+    "You can use twelve local tools.\n" ++
     "When you need to inspect files, reply with ONLY:\n" ++
     "<READ>\n" ++
     "<command>\n" ++
@@ -406,8 +407,13 @@ const TOOL_SYSTEM_PROMPT =
     "<SKILL>\n" ++
     "{\"name\":\"skill-name\"}\n" ++
     "</SKILL>\n" ++
+    "For plan updates, use:\n" ++
+    "<UPDATE_PLAN>\n" ++
+    "{\"explanation\":\"optional note\",\"plan\":[{\"step\":\"name\",\"status\":\"pending|in_progress|completed\"}]}\n" ++
+    "</UPDATE_PLAN>\n" ++
+    "At most one plan item may have status in_progress.\n" ++
     "Available skill names/descriptions are provided in [skills-context] messages.\n" ++
-    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], [view-image-result], or [skill-result], continue the answer normally.";
+    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], [view-image-result], [skill-result], or [update-plan-result], continue the answer normally.";
 
 const VIEW_IMAGE_VISION_PROMPT =
     "Describe this image for a coding assistant. Focus on visible UI/text/code, layout, key errors/warnings, and actionable observations. Keep it concise.";
@@ -1807,6 +1813,34 @@ const App = struct {
                         break :tool_loop;
                     }
                 },
+                .update_plan => |update_plan_payload| {
+                    self.stream_task = .running_update_plan;
+                    try self.render();
+                    const payload_owned = try self.allocator.dupe(u8, update_plan_payload);
+                    defer self.allocator.free(payload_owned);
+
+                    try self.setLastAssistantMessage("[tool] UPDATE_PLAN");
+                    try self.emitRunTaskEvent(.{ .tool_call = "[tool] UPDATE_PLAN" });
+
+                    const tool_result = try self.runUpdatePlanToolPayload(payload_owned);
+                    defer self.allocator.free(tool_result);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] UPDATE_PLAN", tool_result);
+                    try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    try self.app_state.appendMessage(self.allocator, .assistant, "");
+                    try self.setNotice("Ran UPDATE_PLAN tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "UPDATE_PLAN",
+                        payload_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                },
             }
             self.stream_task = .thinking;
             try self.render();
@@ -2416,6 +2450,10 @@ const App = struct {
 
     fn runSkillToolPayload(self: *App, payload: []const u8) ![]u8 {
         return tools_runtime.runSkillToolPayload(self, payload);
+    }
+
+    fn runUpdatePlanToolPayload(self: *App, payload: []const u8) ![]u8 {
+        return tools_runtime.runUpdatePlanToolPayload(self, payload);
     }
 
     fn pasteClipboardImageIntoInput(self: *App) !void {
@@ -5357,6 +5395,7 @@ fn streamTaskTitle(task: StreamTask) []const u8 {
         .running_web_search => "Running WEB_SEARCH",
         .running_view_image => "Running VIEW_IMAGE",
         .running_skill => "Running SKILL",
+        .running_update_plan => "Running UPDATE_PLAN",
     };
 }
 
@@ -6372,6 +6411,7 @@ const AssistantToolCall = union(enum) {
     web_search: []const u8,
     view_image: []const u8,
     skill: []const u8,
+    update_plan: []const u8,
 };
 
 fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
@@ -6401,6 +6441,9 @@ fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
     }
     if (parseSkillToolPayload(text)) |payload| {
         return .{ .skill = payload };
+    }
+    if (parseUpdatePlanToolPayload(text)) |payload| {
+        return .{ .update_plan = payload };
     }
     if (parseReadToolCommand(text)) |command| {
         return .{ .read = command };
@@ -6631,6 +6674,34 @@ fn parseSkillToolPayload(text: []const u8) ?[]const u8 {
         if (after_marker.len >= 5 and std.mem.startsWith(u8, after_marker, "SKILL")) {
             const name = std.mem.trimLeft(u8, after_marker["SKILL".len..], " \t:");
             if (name.len > 0) return name;
+        }
+    }
+
+    return null;
+}
+
+fn parseUpdatePlanToolPayload(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.startsWith(u8, trimmed, "<UPDATE_PLAN>")) {
+        const rest = trimmed["<UPDATE_PLAN>".len..];
+        const close_index = std.mem.indexOf(u8, rest, "</UPDATE_PLAN>") orelse return null;
+        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "```update_plan")) {
+        const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        const body = trimmed[first_newline + 1 ..];
+        const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
+        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "[tool]")) {
+        const after_marker = std.mem.trimLeft(u8, trimmed["[tool]".len..], " \t");
+        if (after_marker.len >= "UPDATE_PLAN".len and std.mem.startsWith(u8, after_marker, "UPDATE_PLAN")) {
+            const payload = std.mem.trimLeft(u8, after_marker["UPDATE_PLAN".len..], " \t:");
+            if (payload.len > 0) return payload;
         }
     }
 
@@ -9355,6 +9426,22 @@ test "parseSkillToolPayload extracts xml fenced and bracket formats" {
     try std.testing.expect(parseSkillToolPayload("no tool") == null);
 }
 
+test "parseUpdatePlanToolPayload extracts xml fenced and bracket formats" {
+    try std.testing.expectEqualStrings(
+        "{\"plan\":[{\"step\":\"one\",\"status\":\"pending\"}]}",
+        parseUpdatePlanToolPayload("<UPDATE_PLAN>\n{\"plan\":[{\"step\":\"one\",\"status\":\"pending\"}]}\n</UPDATE_PLAN>").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"plan\":[{\"step\":\"two\",\"status\":\"completed\"}]}",
+        parseUpdatePlanToolPayload("```update_plan\n{\"plan\":[{\"step\":\"two\",\"status\":\"completed\"}]}\n```").?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"plan\":[{\"step\":\"three\",\"status\":\"in_progress\"}]}",
+        parseUpdatePlanToolPayload("[tool] UPDATE_PLAN {\"plan\":[{\"step\":\"three\",\"status\":\"in_progress\"}]}").?,
+    );
+    try std.testing.expect(parseUpdatePlanToolPayload("no tool") == null);
+}
+
 test "parseExecCommandInput parses json and plain command" {
     const allocator = std.testing.allocator;
 
@@ -9764,7 +9851,7 @@ test "diffRenderColorForLine tracks fenced diff and code blocks" {
     _ = diffRenderColorForLine(&state, "```", palette);
 }
 
-test "parseAssistantToolCall detects discovery/edit/exec/web/image/skill tools" {
+test "parseAssistantToolCall detects discovery/edit/exec/web/image/skill/update tools" {
     const read_tool = parseAssistantToolCall("<READ>ls</READ>").?;
     switch (read_tool) {
         .read => |command| try std.testing.expectEqualStrings("ls", command),
@@ -9830,6 +9917,12 @@ test "parseAssistantToolCall detects discovery/edit/exec/web/image/skill tools" 
     const skill_call = parseAssistantToolCall("<SKILL>{\"name\":\"release\"}</SKILL>").?;
     switch (skill_call) {
         .skill => |payload| try std.testing.expectEqualStrings("{\"name\":\"release\"}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const update_plan_call = parseAssistantToolCall("<UPDATE_PLAN>{\"plan\":[{\"step\":\"do\",\"status\":\"pending\"}]}</UPDATE_PLAN>").?;
+    switch (update_plan_call) {
+        .update_plan => |payload| try std.testing.expectEqualStrings("{\"plan\":[{\"step\":\"do\",\"status\":\"pending\"}]}", payload),
         else => return error.TestUnexpectedResult,
     }
 

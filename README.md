@@ -39,7 +39,7 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
 - Tool loop with discovery/edit/exec primitives:
   - `READ` (allowlisted shell read commands)
   - `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`
-  - `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH` (DuckDuckGo default, Exa optional), `VIEW_IMAGE`, `SKILL`
+  - `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH` (DuckDuckGo default, Exa optional), `VIEW_IMAGE`, `SKILL`, `UPDATE_PLAN`
 
 ## Requirements
 
@@ -124,7 +124,7 @@ Notes:
   - object on failure with `code`, `message`, `retryable`, `source`
 - Existing top-level fields remain unchanged: `provider`, `model`, `session_id`, `prompt`, `response`, `events`.
 - `usage` is normalized across providers (`input_tokens`/`output_tokens` map to `prompt_tokens`/`completion_tokens`).
-- Tool loop is enabled in run mode (`READ`, `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`, `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`, `VIEW_IMAGE`, `SKILL`).
+- Tool loop is enabled in run mode (`READ`, `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`, `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`, `VIEW_IMAGE`, `SKILL`, `UPDATE_PLAN`).
 - In `text` mode, stdout is only the final assistant response (tool call placeholders are not returned as final output).
 
 3. Install to `~/.local` (puts binary at `~/.local/bin/zolt`):
