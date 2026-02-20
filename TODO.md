@@ -26,9 +26,9 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [x] add richer color theming for vaxis styles (semantic palette for user/assistant/system/tool)
 - [x] polish picker surfaces (borders, highlight bar, selected-row contrast)
 - [x] improve code/diff rendering in vaxis (fence chrome, gutter/line accents)
-- [ ] add subtle animated affordances in vaxis (streaming cursor/spinner polish)
-- [ ] tighten status/footer information density and truncation behavior
-- [ ] add screenshots/golden snapshots for visual regression checks
+- [x] add subtle animated affordances in vaxis (streaming cursor/spinner polish)
+- [x] tighten status/footer information density and truncation behavior
+- [x] add screenshots/golden snapshots for visual regression checks (text-snapshot coverage added for header/footer builders)
 
 ## Core Tooling (Foundation)
 - [x] `exec_command` + `write_stdin` (interactive shell sessions)

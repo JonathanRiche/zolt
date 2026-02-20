@@ -608,6 +608,64 @@ fn writeVaxisRuleLine(writer: *std.Io.Writer, width: usize) !void {
     }
 }
 
+fn shortConversationId(conversation_id: []const u8) []const u8 {
+    return if (conversation_id.len > 10) conversation_id[0..10] else conversation_id;
+}
+
+fn buildCompactHeaderLineAlloc(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+    model_id: []const u8,
+    mode: Mode,
+    stream_label: []const u8,
+    conversation_id: []const u8,
+) ![]u8 {
+    const mode_badge = if (mode == .insert) "INSERT" else "NORMAL";
+    return std.fmt.allocPrint(
+        allocator,
+        "Zolt | {s}/{s} | {s} | {s} | conv:{s}",
+        .{
+            provider_id,
+            model_id,
+            mode_badge,
+            stream_label,
+            shortConversationId(conversation_id),
+        },
+    );
+}
+
+fn buildComfyHeaderPrimaryLineAlloc(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+    model_id: []const u8,
+    stream_label: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "Zolt | {s}/{s} | {s}",
+        .{ provider_id, model_id, stream_label },
+    );
+}
+
+fn buildComfyHeaderMetaLineAlloc(
+    allocator: std.mem.Allocator,
+    mode: Mode,
+    theme: Theme,
+    compact_mode: bool,
+    conversation_id: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "mode:{s} | theme:{s} | density:{s} | conv:{s}",
+        .{
+            if (mode == .insert) "insert" else "normal",
+            @tagName(theme),
+            if (compact_mode) "compact" else "comfy",
+            shortConversationId(conversation_id),
+        },
+    );
+}
+
 fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
     if (self.headless) return;
 
@@ -677,23 +735,16 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
     var frame_writer: std.Io.Writer.Allocating = .init(self.allocator);
     defer frame_writer.deinit();
 
-    const mode_label = if (self.mode == .insert) "insert" else "normal";
-    const mode_badge = if (self.mode == .insert) "INSERT" else "NORMAL";
     const stream_label = if (self.is_streaming) "streaming" else "idle";
-    const short_conv_id = if (conversation.id.len > 10) conversation.id[0..10] else conversation.id;
-    const ui_density_label = if (self.compact_mode) "compact" else "comfy";
 
     if (self.compact_mode) {
-        const compact = try std.fmt.allocPrint(
+        const compact = try buildCompactHeaderLineAlloc(
             self.allocator,
-            "Zolt | {s}/{s} | {s} | {s} | conv:{s}",
-            .{
-                self.app_state.selected_provider_id,
-                self.app_state.selected_model_id,
-                mode_badge,
-                stream_label,
-                short_conv_id,
-            },
+            self.app_state.selected_provider_id,
+            self.app_state.selected_model_id,
+            self.mode,
+            stream_label,
+            conversation.id,
         );
         defer self.allocator.free(compact);
         const compact_line = try truncateLineAlloc(self.allocator, compact, width);
@@ -701,10 +752,11 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
         try frame_writer.writer.writeAll(compact_line);
         try frame_writer.writer.writeByte('\n');
     } else {
-        const title_line_text = try std.fmt.allocPrint(
+        const title_line_text = try buildComfyHeaderPrimaryLineAlloc(
             self.allocator,
-            "Zolt | {s}/{s} | {s}",
-            .{ self.app_state.selected_provider_id, self.app_state.selected_model_id, stream_label },
+            self.app_state.selected_provider_id,
+            self.app_state.selected_model_id,
+            stream_label,
         );
         defer self.allocator.free(title_line_text);
         const title_line = try truncateLineAlloc(self.allocator, title_line_text, width);
@@ -712,10 +764,12 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
         try frame_writer.writer.writeAll(title_line);
         try frame_writer.writer.writeByte('\n');
 
-        const meta_line = try std.fmt.allocPrint(
+        const meta_line = try buildComfyHeaderMetaLineAlloc(
             self.allocator,
-            "mode:{s} | theme:{s} | density:{s} | conv:{s}",
-            .{ mode_label, @tagName(self.theme), ui_density_label, short_conv_id },
+            self.mode,
+            self.theme,
+            self.compact_mode,
+            conversation.id,
         );
         defer self.allocator.free(meta_line);
         const meta_trimmed = try truncateLineAlloc(self.allocator, meta_line, width);
@@ -747,37 +801,18 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
     try writeVaxisRuleLine(&frame_writer.writer, width);
     try frame_writer.writer.writeByte('\n');
 
-    const key_hint = if (self.is_streaming)
-        "esc esc stop pgup/pgdn"
-    else if (self.model_picker_open)
-        "ctrl-n/p or up/down, enter/tab select, esc close"
-    else if (self.command_picker_open)
-        if (self.command_picker_kind == .quick_actions)
-            "ctrl-n/p or up/down, enter/tab run, esc close"
-        else if (self.command_picker_kind == .conversation_switch)
-            "ctrl-n/p or up/down, enter/tab switch, esc close"
-        else
-            "ctrl-n/p or up/down, enter/tab insert, esc close"
-    else if (self.file_picker_open)
-        "ctrl-n/p or up/down, enter/tab insert, esc close"
-    else if (self.mode == .insert)
-        "enter esc / ctrl-p ctrl-v pgup/pgdn"
-    else
-        "i j/k pgup/pgdn / ctrl-p q";
+    const key_hint = footerKeyHint(self);
     const context_summary = try self.contextUsageSummary(conversation);
     defer if (context_summary) |summary| self.allocator.free(summary);
-    const status_text = if (context_summary) |summary|
-        try std.fmt.allocPrint(
-            self.allocator,
-            "status | {s} | {s} | keys:{s} | scroll:{d}/{d}",
-            .{ active_notice, summary, key_hint, self.scroll_lines, max_scroll },
-        )
-    else
-        try std.fmt.allocPrint(
-            self.allocator,
-            "status | {s} | keys:{s} | scroll:{d}/{d}",
-            .{ active_notice, key_hint, self.scroll_lines, max_scroll },
-        );
+    const status_text = try buildFooterStatusLineAlloc(
+        self.allocator,
+        width,
+        active_notice,
+        context_summary,
+        key_hint,
+        self.scroll_lines,
+        max_scroll,
+    );
     defer self.allocator.free(status_text);
     const status_line = try truncateLineAlloc(self.allocator, status_text, width);
     defer self.allocator.free(status_line);
@@ -4105,35 +4140,39 @@ const App = struct {
 
         try screen_writer.writer.writeAll("\x1b[2J\x1b[H");
 
-        const mode_label = if (self.mode == .insert) "insert" else "normal";
         const stream_label = if (self.is_streaming) "streaming" else "idle";
-        const short_conv_id = if (conversation.id.len > 10) conversation.id[0..10] else conversation.id;
 
         if (self.compact_mode) {
-            const compact = try std.fmt.allocPrint(
+            const compact = try buildCompactHeaderLineAlloc(
                 self.allocator,
-                "Zolt  {s}/{s}  mode:{s}  conv:{s}  {s}",
-                .{ self.app_state.selected_provider_id, self.app_state.selected_model_id, mode_label, short_conv_id, stream_label },
+                self.app_state.selected_provider_id,
+                self.app_state.selected_model_id,
+                self.mode,
+                stream_label,
+                conversation.id,
             );
             defer self.allocator.free(compact);
             const compact_line = try truncateLineAlloc(self.allocator, compact, width);
             defer self.allocator.free(compact_line);
             try screen_writer.writer.print("{s}{s}{s}\n", .{ palette.header, compact_line, palette.reset });
         } else {
-            const title = try std.fmt.allocPrint(
+            const title = try buildComfyHeaderPrimaryLineAlloc(
                 self.allocator,
-                "Zolt  mode:{s}  conv:{s}",
-                .{ mode_label, conversation.id },
+                self.app_state.selected_provider_id,
+                self.app_state.selected_model_id,
+                stream_label,
             );
             defer self.allocator.free(title);
             const title_line = try truncateLineAlloc(self.allocator, title, width);
             defer self.allocator.free(title_line);
             try screen_writer.writer.print("{s}{s}{s}\n", .{ palette.header, title_line, palette.reset });
 
-            const model_line = try std.fmt.allocPrint(
+            const model_line = try buildComfyHeaderMetaLineAlloc(
                 self.allocator,
-                "model: {s}/{s}  theme:{s}  ui:{s}  status:{s}",
-                .{ self.app_state.selected_provider_id, self.app_state.selected_model_id, @tagName(self.theme), if (self.compact_mode) "compact" else "comfy", stream_label },
+                self.mode,
+                self.theme,
+                self.compact_mode,
+                conversation.id,
             );
             defer self.allocator.free(model_line);
             const model_trimmed = try truncateLineAlloc(self.allocator, model_line, width);
@@ -4162,37 +4201,18 @@ const App = struct {
 
         try writeRule(&screen_writer.writer, width, palette, self.compact_mode);
 
-        const key_hint = if (self.is_streaming)
-            "esc esc stop pgup/pgdn"
-        else if (self.model_picker_open)
-            "ctrl-n/p or up/down, enter/tab select, esc close"
-        else if (self.command_picker_open)
-            if (self.command_picker_kind == .quick_actions)
-                "ctrl-n/p or up/down, enter/tab run, esc close"
-            else if (self.command_picker_kind == .conversation_switch)
-                "ctrl-n/p or up/down, enter/tab switch, esc close"
-            else
-                "ctrl-n/p or up/down, enter/tab insert, esc close"
-        else if (self.file_picker_open)
-            "ctrl-n/p or up/down, enter/tab insert, esc close"
-        else if (self.mode == .insert)
-            "enter esc / ctrl-p ctrl-v pgup/pgdn"
-        else
-            "i j/k pgup/pgdn / ctrl-p q";
+        const key_hint = footerKeyHint(self);
         const context_summary = try self.contextUsageSummary(conversation);
         defer if (context_summary) |summary| self.allocator.free(summary);
-        const status_text = if (context_summary) |summary|
-            try std.fmt.allocPrint(
-                self.allocator,
-                "{s} | {s} | keys:{s} | scroll:{d}/{d}",
-                .{ active_notice, summary, key_hint, self.scroll_lines, max_scroll },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "{s} | keys:{s} | scroll:{d}/{d}",
-                .{ active_notice, key_hint, self.scroll_lines, max_scroll },
-            );
+        const status_text = try buildFooterStatusLineAlloc(
+            self.allocator,
+            width,
+            active_notice,
+            context_summary,
+            key_hint,
+            self.scroll_lines,
+            max_scroll,
+        );
         defer self.allocator.free(status_text);
         const status_line = try truncateLineAlloc(self.allocator, status_text, width);
         defer self.allocator.free(status_line);
@@ -5471,6 +5491,12 @@ fn streamElapsedMs(started_ms: i64, now_ms: i64) i64 {
     return @max(@as(i64, 0), now_ms - started_ms);
 }
 
+fn streamSpinnerGlyph(elapsed_ms: i64) []const u8 {
+    const frames = [_][]const u8{ "|", "/", "-", "\\" };
+    const tick: usize = @intCast(@divFloor(@max(@as(i64, 0), elapsed_ms), 120));
+    return frames[tick % frames.len];
+}
+
 fn streamStatusHeader(task_title: []const u8) []const u8 {
     if (std.mem.eql(u8, task_title, "Idle")) return "Working";
     if (std.mem.eql(u8, task_title, "Thinking")) return "Working";
@@ -5486,12 +5512,13 @@ fn buildStreamingNotice(
 ) ![]u8 {
     const elapsed_ms = streamElapsedMs(started_ms, now_ms);
     const elapsed_seconds = @divFloor(elapsed_ms, 1000);
+    const spinner = streamSpinnerGlyph(elapsed_ms);
     const header = streamStatusHeader(task_title);
 
     return std.fmt.allocPrint(
         allocator,
-        "{s} ({d}s • esc to interrupt)",
-        .{ header, elapsed_seconds },
+        "{s} {s} ({d}s • esc to interrupt)",
+        .{ spinner, header, elapsed_seconds },
     );
 }
 
@@ -5503,12 +5530,92 @@ fn buildWorkingPlaceholder(
 ) ![]u8 {
     const elapsed_ms = streamElapsedMs(started_ms, now_ms);
     const elapsed_seconds = @divFloor(elapsed_ms, 1000);
+    const spinner = streamSpinnerGlyph(elapsed_ms);
     const header = streamStatusHeader(task_title);
 
     return std.fmt.allocPrint(
         allocator,
-        "{s} ({d}s • esc to interrupt)",
-        .{ header, elapsed_seconds },
+        "{s} {s} ({d}s • esc to interrupt)",
+        .{ spinner, header, elapsed_seconds },
+    );
+}
+
+fn footerKeyHint(self: *const App) []const u8 {
+    if (self.is_streaming) return "esc esc • pgup/pgdn";
+    if (self.model_picker_open or self.command_picker_open or self.file_picker_open) {
+        return "↑/↓ or ctrl-n/p • enter/tab • esc";
+    }
+    if (self.mode == .insert) return "enter • esc • / • ctrl-p • ctrl-v • pgup/pgdn";
+    return "i • j/k • pgup/pgdn • / • ctrl-p • q";
+}
+
+fn compactStatusSegmentAlloc(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    max_chars: usize,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0 or max_chars == 0) return allocator.dupe(u8, "");
+
+    var normalized: std.Io.Writer.Allocating = .init(allocator);
+    defer normalized.deinit();
+
+    var previous_space = false;
+    for (trimmed) |byte| {
+        const is_space = byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+        if (is_space) {
+            if (previous_space) continue;
+            try normalized.writer.writeByte(' ');
+            previous_space = true;
+            continue;
+        }
+        try normalized.writer.writeByte(byte);
+        previous_space = false;
+    }
+
+    const normalized_text = try normalized.toOwnedSlice();
+    defer allocator.free(normalized_text);
+
+    return truncateLineAlloc(allocator, normalized_text, max_chars);
+}
+
+fn buildFooterStatusLineAlloc(
+    allocator: std.mem.Allocator,
+    width: usize,
+    active_notice: []const u8,
+    context_summary: ?[]const u8,
+    key_hint: []const u8,
+    scroll_lines: usize,
+    max_scroll: usize,
+) ![]u8 {
+    const safe_width = @max(@as(usize, 32), width);
+
+    const notice_max = std.math.clamp(safe_width / 3, @as(usize, 18), @as(usize, 60));
+    const compact_notice = try compactStatusSegmentAlloc(allocator, active_notice, notice_max);
+    defer allocator.free(compact_notice);
+
+    const keys_max = std.math.clamp(safe_width / 3, @as(usize, 16), @as(usize, 56));
+    const compact_keys = try compactStatusSegmentAlloc(allocator, key_hint, keys_max);
+    defer allocator.free(compact_keys);
+
+    const compact_ctx = if (context_summary) |summary|
+        try compactStatusSegmentAlloc(allocator, summary, 28)
+    else
+        null;
+    defer if (compact_ctx) |value| allocator.free(value);
+
+    if (compact_ctx) |ctx| {
+        return std.fmt.allocPrint(
+            allocator,
+            "status | {s} | {s} | k:{s} | sc:{d}/{d}",
+            .{ compact_notice, ctx, compact_keys, scroll_lines, max_scroll },
+        );
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "status | {s} | k:{s} | sc:{d}/{d}",
+        .{ compact_notice, compact_keys, scroll_lines, max_scroll },
     );
 }
 
@@ -10601,6 +10708,14 @@ test "buildWorkingPlaceholder includes task timer and interrupt hint" {
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "esc to interrupt") != null);
 }
 
+test "streamSpinnerGlyph cycles frames over elapsed time" {
+    try std.testing.expectEqualStrings("|", streamSpinnerGlyph(0));
+    try std.testing.expectEqualStrings("/", streamSpinnerGlyph(120));
+    try std.testing.expectEqualStrings("-", streamSpinnerGlyph(240));
+    try std.testing.expectEqualStrings("\\", streamSpinnerGlyph(360));
+    try std.testing.expectEqualStrings("|", streamSpinnerGlyph(480));
+}
+
 test "buildStreamingNotice includes task and elapsed timer" {
     const allocator = std.testing.allocator;
 
@@ -10609,6 +10724,65 @@ test "buildStreamingNotice includes task and elapsed timer" {
 
     try std.testing.expect(std.mem.indexOf(u8, notice, "Running READ (5s") != null);
     try std.testing.expect(std.mem.indexOf(u8, notice, "esc to interrupt") != null);
+}
+
+test "header line builders provide stable snapshot strings" {
+    const allocator = std.testing.allocator;
+
+    const compact = try buildCompactHeaderLineAlloc(
+        allocator,
+        "openai",
+        "gpt-5.3-codex",
+        .insert,
+        "streaming",
+        "abcdef123456",
+    );
+    defer allocator.free(compact);
+    try std.testing.expectEqualStrings(
+        "Zolt | openai/gpt-5.3-codex | INSERT | streaming | conv:abcdef1234",
+        compact,
+    );
+
+    const comfy_primary = try buildComfyHeaderPrimaryLineAlloc(
+        allocator,
+        "openai",
+        "gpt-5.3-codex",
+        "idle",
+    );
+    defer allocator.free(comfy_primary);
+    try std.testing.expectEqualStrings("Zolt | openai/gpt-5.3-codex | idle", comfy_primary);
+
+    const comfy_meta = try buildComfyHeaderMetaLineAlloc(
+        allocator,
+        .normal,
+        .codex,
+        false,
+        "abcdef123456",
+    );
+    defer allocator.free(comfy_meta);
+    try std.testing.expectEqualStrings(
+        "mode:normal | theme:codex | density:comfy | conv:abcdef1234",
+        comfy_meta,
+    );
+}
+
+test "buildFooterStatusLineAlloc compacts segments and includes keys/scroll labels" {
+    const allocator = std.testing.allocator;
+
+    const status_line = try buildFooterStatusLineAlloc(
+        allocator,
+        80,
+        "This is an intentionally long status message with extra details that should compact down",
+        "ctx:123.4k/400k 69% left",
+        "enter • esc • / • ctrl-p • ctrl-v • pgup/pgdn",
+        3,
+        17,
+    );
+    defer allocator.free(status_line);
+
+    try std.testing.expect(std.mem.startsWith(u8, status_line, "status | "));
+    try std.testing.expect(std.mem.indexOf(u8, status_line, "k:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_line, "sc:3/17") != null);
 }
 
 test "parseOpenAiAuthModeName supports known values" {
