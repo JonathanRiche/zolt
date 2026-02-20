@@ -314,6 +314,7 @@ Picker triggers:
 - `/title <text>`
 - `/theme [codex|plain|forest]`
 - `/ui [compact|comfy]`
+- `/ui backend [ansi|vaxis]` (vaxis requires building with `-Dvaxis=true`)
 - `/quit`
 - `/q` (alias of `/quit`)
 - `/paste-image`
