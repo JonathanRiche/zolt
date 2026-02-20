@@ -117,6 +117,7 @@ fn streamOpenAiCompatible(
             return streamOpenAiLegacyCompletions(allocator, request, callbacks, use_referrer_headers);
         }
 
+        try emitErrorUsageIfAvailable(allocator, error_body, callbacks);
         std.log.err("openai-compatible request failed: status={s} body={s}", .{ @tagName(response.head.status), error_body });
         setLastProviderErrorDetail(response.head.status, error_body);
         return error.ProviderRequestFailed;
@@ -177,6 +178,7 @@ fn streamOpenAiLegacyCompletions(
             return streamOpenAiResponses(allocator, request, callbacks, use_referrer_headers);
         }
 
+        try emitErrorUsageIfAvailable(allocator, error_body, callbacks);
         std.log.err("openai legacy completions request failed: status={s} body={s}", .{ @tagName(response.head.status), error_body });
         setLastProviderErrorDetail(response.head.status, error_body);
         return error.ProviderRequestFailed;
@@ -232,6 +234,7 @@ fn streamOpenAiResponses(
     if (response.head.status != .ok) {
         const error_body = readResponseBodyAlloc(allocator, &response) catch "";
         defer if (error_body.len > 0) allocator.free(error_body);
+        try emitErrorUsageIfAvailable(allocator, error_body, callbacks);
         std.log.err("openai responses request failed: status={s} body={s}", .{ @tagName(response.head.status), error_body });
         setLastProviderErrorDetail(response.head.status, error_body);
         return error.ProviderRequestFailed;
@@ -284,6 +287,7 @@ fn streamAnthropic(
     if (response.head.status != .ok) {
         const error_body = readResponseBodyAlloc(allocator, &response) catch "";
         defer if (error_body.len > 0) allocator.free(error_body);
+        try emitErrorUsageIfAvailable(allocator, error_body, callbacks);
         std.log.err("anthropic request failed: status={s} body={s}", .{ @tagName(response.head.status), error_body });
         setLastProviderErrorDetail(response.head.status, error_body);
         return error.ProviderRequestFailed;
@@ -334,6 +338,7 @@ fn streamGoogle(
     if (response.head.status != .ok) {
         const error_body = readResponseBodyAlloc(allocator, &response) catch "";
         defer if (error_body.len > 0) allocator.free(error_body);
+        try emitErrorUsageIfAvailable(allocator, error_body, callbacks);
         std.log.err("google request failed: status={s} body={s}", .{ @tagName(response.head.status), error_body });
         setLastProviderErrorDetail(response.head.status, error_body);
         return error.ProviderRequestFailed;
@@ -418,6 +423,18 @@ fn readResponseBodyAlloc(allocator: std.mem.Allocator, response: *std.http.Clien
     };
 
     return body_writer.toOwnedSlice();
+}
+
+fn emitErrorUsageIfAvailable(
+    allocator: std.mem.Allocator,
+    error_body: []const u8,
+    callbacks: StreamCallbacks,
+) !void {
+    const on_usage = callbacks.on_usage orelse return;
+    const usage = try extractUsageFromErrorBodyAlloc(allocator, error_body);
+    if (usage) |value| {
+        try on_usage(callbacks.context, value);
+    }
 }
 
 fn setLastProviderErrorDetail(status: std.http.Status, body: []const u8) void {
@@ -855,6 +872,44 @@ fn extractOpenAiResponsesUsageAlloc(allocator: std.mem.Allocator, data_text: []c
     return tokenUsageFromValue(usage);
 }
 
+fn extractUsageFromErrorBodyAlloc(allocator: std.mem.Allocator, error_body: []const u8) !?TokenUsage {
+    const trimmed = std.mem.trim(u8, error_body, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return null;
+    defer parsed.deinit();
+
+    if (tokenUsageFromValue(parsed.value)) |usage| return usage;
+
+    if (objectField(parsed.value, "usage")) |usage_value| {
+        if (tokenUsageFromValue(usage_value)) |usage| return usage;
+    }
+
+    if (objectField(parsed.value, "usageMetadata")) |usage_value| {
+        if (tokenUsageFromValue(usage_value)) |usage| return usage;
+    }
+
+    if (objectField(parsed.value, "response")) |response_value| {
+        if (objectField(response_value, "usage")) |usage_value| {
+            if (tokenUsageFromValue(usage_value)) |usage| return usage;
+        }
+    }
+
+    if (objectField(parsed.value, "message")) |message_value| {
+        if (objectField(message_value, "usage")) |usage_value| {
+            if (tokenUsageFromValue(usage_value)) |usage| return usage;
+        }
+    }
+
+    if (objectField(parsed.value, "error")) |error_value| {
+        if (objectField(error_value, "usage")) |usage_value| {
+            if (tokenUsageFromValue(usage_value)) |usage| return usage;
+        }
+    }
+
+    return null;
+}
+
 fn tokenUsageFromValue(value: std.json.Value) ?TokenUsage {
     const object = switch (value) {
         .object => |obj| obj,
@@ -1087,6 +1142,32 @@ test "extractGoogleUsageAlloc parses usageMetadata totals" {
     try std.testing.expectEqual(@as(i64, 11), usage.?.input_tokens);
     try std.testing.expectEqual(@as(i64, 7), usage.?.output_tokens);
     try std.testing.expectEqual(@as(i64, 18), usage.?.total_tokens);
+}
+
+test "extractUsageFromErrorBodyAlloc parses top-level usage" {
+    const allocator = std.testing.allocator;
+
+    const body =
+        "{\"error\":\"failed\",\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":34,\"total_tokens\":46}}";
+
+    const usage = try extractUsageFromErrorBodyAlloc(allocator, body);
+    try std.testing.expect(usage != null);
+    try std.testing.expectEqual(@as(i64, 12), usage.?.input_tokens);
+    try std.testing.expectEqual(@as(i64, 34), usage.?.output_tokens);
+    try std.testing.expectEqual(@as(i64, 46), usage.?.total_tokens);
+}
+
+test "extractUsageFromErrorBodyAlloc normalizes input/output aliases in nested error usage" {
+    const allocator = std.testing.allocator;
+
+    const body =
+        "{\"error\":{\"message\":\"x\",\"usage\":{\"input_tokens\":5,\"output_tokens\":9,\"total_tokens\":14}}}";
+
+    const usage = try extractUsageFromErrorBodyAlloc(allocator, body);
+    try std.testing.expect(usage != null);
+    try std.testing.expectEqual(@as(i64, 5), usage.?.input_tokens);
+    try std.testing.expectEqual(@as(i64, 9), usage.?.output_tokens);
+    try std.testing.expectEqual(@as(i64, 14), usage.?.total_tokens);
 }
 
 test "shouldRetryWithLegacyCompletions detects non-chat model errors" {

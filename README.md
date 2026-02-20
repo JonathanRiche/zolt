@@ -108,8 +108,14 @@ Notes:
 - `--output` controls formatting:
   - `text`: final assistant response only (default)
   - `logs`: tool call/result log lines + final response
-  - `json`: one JSON object with metadata, final response, and captured events
+  - `json`: one JSON object with metadata, final response, stable token usage, and captured events
   - `json-stream` (`ndjson`/`jsonl` alias): newline-delimited JSON events while running
+- `json` output always includes:
+  - `usage.prompt_tokens` (`number|null`)
+  - `usage.completion_tokens` (`number|null`)
+  - `usage.total_tokens` (`number|null`)
+- Existing top-level fields remain unchanged: `provider`, `model`, `session_id`, `prompt`, `response`, `events`.
+- `usage` is normalized across providers (`input_tokens`/`output_tokens` map to `prompt_tokens`/`completion_tokens`).
 - Tool loop is enabled in run mode (`READ`, `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`, `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`, `VIEW_IMAGE`).
 - In `text` mode, stdout is only the final assistant response (tool call placeholders are not returned as final output).
 

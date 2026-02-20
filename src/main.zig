@@ -7,6 +7,7 @@ const app_config = @import("config.zig");
 const models = @import("models.zig");
 const Paths = @import("paths.zig").Paths;
 const AppState = @import("state.zig").AppState;
+const TokenUsage = @import("state.zig").TokenUsage;
 const tui = @import("tui.zig");
 const APP_VERSION = "0.1.0-dev";
 
@@ -25,6 +26,12 @@ const CliRunTaskOptions = struct {
     session_id: ?[]const u8 = null,
     output_format: CliRunTaskOutputFormat = .text,
     prompt_parts: []const []const u8,
+};
+
+const RunTaskJsonUsage = struct {
+    prompt_tokens: ?u64 = null,
+    completion_tokens: ?u64 = null,
+    total_tokens: ?u64 = null,
 };
 
 const CliListModelsOptions = struct {
@@ -265,6 +272,7 @@ fn runSinglePromptTask(
             try collector.init(allocator);
             defer collector.deinit();
 
+            const usage_before = app_state.currentConversationConst().total_token_usage;
             const assistant_text = try tui.runTaskPromptWithObserver(
                 allocator,
                 paths,
@@ -278,11 +286,15 @@ fn runSinglePromptTask(
                 },
             );
             defer allocator.free(assistant_text);
+            const usage_after = app_state.currentConversationConst().total_token_usage;
+            const usage_delta = tokenUsageDelta(usage_before, usage_after);
+            const usage = runTaskJsonUsageFromTokenUsage(usage_delta);
             try writeRunTaskJsonOutputToStdout(
                 allocator,
                 app_state,
                 prompt,
                 assistant_text,
+                usage,
                 collector.events.items,
             );
         },
@@ -427,8 +439,22 @@ fn writeRunTaskJsonOutputToStdout(
     app_state: *const AppState,
     prompt: []const u8,
     response: []const u8,
+    usage: RunTaskJsonUsage,
     events: []const RunTaskCapturedEvent,
 ) !void {
+    const payload = try buildRunTaskJsonPayloadAlloc(allocator, app_state, prompt, response, usage, events);
+    defer allocator.free(payload);
+    try writeRunTaskOutputToStdout(payload);
+}
+
+fn buildRunTaskJsonPayloadAlloc(
+    allocator: std.mem.Allocator,
+    app_state: *const AppState,
+    prompt: []const u8,
+    response: []const u8,
+    usage: RunTaskJsonUsage,
+    events: []const RunTaskCapturedEvent,
+) ![]u8 {
     var payload_writer: std.Io.Writer.Allocating = .init(allocator);
     defer payload_writer.deinit();
 
@@ -447,6 +473,15 @@ fn writeRunTaskJsonOutputToStdout(
     try jw.write(prompt);
     try jw.objectField("response");
     try jw.write(response);
+    try jw.objectField("usage");
+    try jw.beginObject();
+    try jw.objectField("prompt_tokens");
+    try jw.write(usage.prompt_tokens);
+    try jw.objectField("completion_tokens");
+    try jw.write(usage.completion_tokens);
+    try jw.objectField("total_tokens");
+    try jw.write(usage.total_tokens);
+    try jw.endObject();
     try jw.objectField("events");
     try jw.beginArray();
     for (events) |event| {
@@ -460,9 +495,30 @@ fn writeRunTaskJsonOutputToStdout(
     try jw.endArray();
     try jw.endObject();
 
-    const payload = try payload_writer.toOwnedSlice();
-    defer allocator.free(payload);
-    try writeRunTaskOutputToStdout(payload);
+    return payload_writer.toOwnedSlice();
+}
+
+fn tokenUsageDelta(before: TokenUsage, after: TokenUsage) TokenUsage {
+    return .{
+        .input_tokens = @max(@as(i64, 0), after.input_tokens - before.input_tokens),
+        .cached_input_tokens = @max(@as(i64, 0), after.cached_input_tokens - before.cached_input_tokens),
+        .output_tokens = @max(@as(i64, 0), after.output_tokens - before.output_tokens),
+        .reasoning_output_tokens = @max(@as(i64, 0), after.reasoning_output_tokens - before.reasoning_output_tokens),
+        .total_tokens = @max(@as(i64, 0), after.total_tokens - before.total_tokens),
+    };
+}
+
+fn runTaskJsonUsageFromTokenUsage(usage: TokenUsage) RunTaskJsonUsage {
+    return .{
+        .prompt_tokens = optionalPositiveU64(usage.input_tokens),
+        .completion_tokens = optionalPositiveU64(usage.output_tokens),
+        .total_tokens = optionalPositiveU64(usage.total_tokens),
+    };
+}
+
+fn optionalPositiveU64(value: i64) ?u64 {
+    if (value <= 0) return null;
+    return @as(u64, @intCast(value));
 }
 
 fn writeStdoutRaw(text: []const u8) !void {
@@ -724,7 +780,7 @@ fn writeHelpToStdout() !void {
             "Run output modes:\n" ++
             "  text        final assistant response only (default)\n" ++
             "  logs        tool call/result logs + final response\n" ++
-            "  json        one JSON object with response + events\n" ++
+            "  json        one JSON object with response + usage + events\n" ++
             "  json-stream newline-delimited JSON events while running\n" ++
             "\n" ++
             "Models listing:\n" ++
@@ -1315,6 +1371,77 @@ test "selectStartupConversationWithoutSession creates blank when all conversatio
 
     try std.testing.expectEqual(before_count + 1, app_state.conversations.items.len);
     try std.testing.expectEqual(@as(usize, 0), app_state.currentConversationConst().messages.items.len);
+}
+
+test "runTaskJsonUsageFromTokenUsage maps normal success usage" {
+    const usage = runTaskJsonUsageFromTokenUsage(.{
+        .input_tokens = 12,
+        .output_tokens = 34,
+        .total_tokens = 46,
+    });
+
+    try std.testing.expectEqual(@as(?u64, 12), usage.prompt_tokens);
+    try std.testing.expectEqual(@as(?u64, 34), usage.completion_tokens);
+    try std.testing.expectEqual(@as(?u64, 46), usage.total_tokens);
+}
+
+test "runTaskJsonUsageFromTokenUsage returns null fields when usage missing" {
+    const usage = runTaskJsonUsageFromTokenUsage(.{});
+    try std.testing.expectEqual(@as(?u64, null), usage.prompt_tokens);
+    try std.testing.expectEqual(@as(?u64, null), usage.completion_tokens);
+    try std.testing.expectEqual(@as(?u64, null), usage.total_tokens);
+}
+
+test "buildRunTaskJsonPayloadAlloc includes usage for provider-error style response" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    try app_state.setActiveProvider(allocator, "openai");
+    try app_state.setActiveModel(allocator, "gpt-5");
+
+    const usage = runTaskJsonUsageFromTokenUsage(.{
+        .input_tokens = 7,
+        .output_tokens = 0,
+        .total_tokens = 7,
+    });
+
+    const payload = try buildRunTaskJsonPayloadAlloc(
+        allocator,
+        &app_state,
+        "hi",
+        "[local] Request failed.",
+        usage,
+        &.{},
+    );
+    defer allocator.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const usage_value = root.get("usage") orelse return error.TestUnexpectedResult;
+    const usage_object = switch (usage_value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const prompt_tokens = usage_object.get("prompt_tokens") orelse return error.TestUnexpectedResult;
+    const completion_tokens = usage_object.get("completion_tokens") orelse return error.TestUnexpectedResult;
+    const total_tokens = usage_object.get("total_tokens") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(i64, 7), switch (prompt_tokens) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expect(completion_tokens == .null);
+    try std.testing.expectEqual(@as(i64, 7), switch (total_tokens) {
+        .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
 }
 
 test {
