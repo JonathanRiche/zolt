@@ -26,6 +26,8 @@ const CliRunTaskOutputFormat = enum {
 const CliRunTaskOptions = struct {
     session_id: ?[]const u8 = null,
     output_format: CliRunTaskOutputFormat = .text,
+    provider_id: ?[]const u8 = null,
+    model_id: ?[]const u8 = null,
     prompt_parts: []const []const u8,
 };
 
@@ -209,7 +211,10 @@ pub fn main() !void {
             try app_state.saveToPath(allocator, paths.state_path);
         },
         .run_task => |task_options| {
-            try runSinglePromptTask(allocator, &paths, &app_state, &catalog, task_options, startup_options);
+            runSinglePromptTask(allocator, &paths, &app_state, &catalog, task_options, startup_options) catch |err| switch (err) {
+                error.InvalidRunTaskSelection => std.process.exit(1),
+                else => return err,
+            };
         },
         .list_models => |options| {
             try writeModelsListToStdout(allocator, &catalog, options, paths.config_path);
@@ -229,18 +234,20 @@ fn runSinglePromptTask(
     if (options.session_id) |session_id| {
         if (!(try app_state.switchConversation(allocator, session_id))) {
             try writeSessionNotFoundToStderr(session_id);
-            return;
+            return error.InvalidRunTaskSelection;
         }
     } else {
         try selectStartupConversationWithoutSession(allocator, app_state);
     }
+
+    try validateAndApplyRunTaskSelection(allocator, app_state, catalog, options);
 
     const prompt_full = try joinPromptPartsAlloc(allocator, options.prompt_parts);
     defer allocator.free(prompt_full);
     const prompt = std.mem.trim(u8, prompt_full, " \t\r\n");
     if (prompt.len == 0) {
         try writeRunTaskMissingPromptToStderr();
-        return;
+        return error.InvalidRunTaskSelection;
     }
 
     switch (options.output_format) {
@@ -333,6 +340,41 @@ fn joinPromptPartsAlloc(allocator: std.mem.Allocator, prompt_parts: []const []co
         try writer.writer.writeAll(part);
     }
     return writer.toOwnedSlice();
+}
+
+fn validateAndApplyRunTaskSelection(
+    allocator: std.mem.Allocator,
+    app_state: *AppState,
+    catalog: *const models.Catalog,
+    options: CliRunTaskOptions,
+) !void {
+    if (options.model_id != null and options.provider_id == null) {
+        try writeRunTaskModelRequiresProviderToStderr();
+        return error.InvalidRunTaskSelection;
+    }
+
+    if (options.provider_id) |provider_id| {
+        const provider = catalog.findProviderConst(provider_id) orelse {
+            try writeRunTaskProviderNotFoundToStderr(catalog, provider_id);
+            return error.InvalidRunTaskSelection;
+        };
+
+        try app_state.setSelectedProvider(allocator, provider.id);
+
+        if (options.model_id) |model_id| {
+            if (!catalog.hasModel(provider.id, model_id)) {
+                try writeRunTaskModelNotFoundToStderr(provider, model_id);
+                return error.InvalidRunTaskSelection;
+            }
+            try app_state.setSelectedModel(allocator, model_id);
+            return;
+        }
+
+        if (!catalog.hasModel(provider.id, app_state.selected_model_id)) {
+            try writeRunTaskModelRequiredForProviderToStderr(provider.id, app_state.selected_model_id);
+            return error.InvalidRunTaskSelection;
+        }
+    }
 }
 
 const RunTaskCapturedEventKind = enum {
@@ -630,7 +672,7 @@ fn writeRunTaskMissingPromptToStderr() !void {
     defer stderr_writer.interface.flush() catch {};
     try stderr_writer.interface.writeAll(
         "missing prompt\n" ++
-            "Usage: zolt run [--session <id>] [--output <text|logs|json|json-stream>] \"<prompt>\"\n",
+            "Usage: zolt run [--session <id>] [--provider <id> --model <id>] [--output <text|logs|json|json-stream>] \"<prompt>\"\n",
     );
 }
 
@@ -771,6 +813,8 @@ fn parseListModelsCliAction(args: []const []const u8) CliAction {
 fn parseRunTaskCliAction(args: []const []const u8) CliAction {
     var run_options: CliRunOptions = .{};
     var output_format: CliRunTaskOutputFormat = .text;
+    var provider_id: ?[]const u8 = null;
+    var model_id: ?[]const u8 = null;
     var index: usize = 0;
 
     while (index < args.len) {
@@ -813,6 +857,44 @@ fn parseRunTaskCliAction(args: []const []const u8) CliAction {
             continue;
         }
 
+        if (std.mem.eql(u8, arg, "--provider")) {
+            if (index + 1 >= args.len) return .{ .invalid = arg };
+            if (provider_id != null) return .{ .invalid = arg };
+            const value = args[index + 1];
+            if (value.len == 0 or value[0] == '-') return .{ .invalid = arg };
+            provider_id = value;
+            index += 2;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--model")) {
+            if (index + 1 >= args.len) return .{ .invalid = arg };
+            if (model_id != null) return .{ .invalid = arg };
+            const value = args[index + 1];
+            if (value.len == 0 or value[0] == '-') return .{ .invalid = arg };
+            model_id = value;
+            index += 2;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--provider=")) {
+            if (provider_id != null) return .{ .invalid = arg };
+            const value = arg["--provider=".len..];
+            if (value.len == 0) return .{ .invalid = arg };
+            provider_id = value;
+            index += 1;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--model=")) {
+            if (model_id != null) return .{ .invalid = arg };
+            const value = arg["--model=".len..];
+            if (value.len == 0) return .{ .invalid = arg };
+            model_id = value;
+            index += 1;
+            continue;
+        }
+
         return .{ .invalid = arg };
     }
 
@@ -821,6 +903,8 @@ fn parseRunTaskCliAction(args: []const []const u8) CliAction {
         .run_task = .{
             .session_id = run_options.session_id,
             .output_format = output_format,
+            .provider_id = provider_id,
+            .model_id = model_id,
             .prompt_parts = args[index..],
         },
     };
@@ -846,6 +930,8 @@ fn writeHelpToStdout() !void {
             "Usage:\n" ++
             "  zolt\n" ++
             "  zolt run \"<prompt>\"\n" ++
+            "  zolt run --provider <provider-id> --model <model-id> \"<prompt>\"\n" ++
+            "  zolt run --session <conversation-id> --provider <provider-id> --model <model-id> \"<prompt>\"\n" ++
             "  zolt run --output <text|logs|json|json-stream> \"<prompt>\"\n" ++
             "  zolt models [provider-id]\n" ++
             "  zolt models --provider <provider-id>\n" ++
@@ -871,7 +957,11 @@ fn writeHelpToStdout() !void {
             "  zolt models opencode        list model IDs for provider\n" ++
             "  zolt models -p openai       same as above\n" ++
             "  zolt models -p openai -q codex  filter provider models\n" ++
-            "  zolt models -p openai --select  choose and save default model\n",
+            "  zolt models -p openai --select  choose and save default model\n" ++
+            "\n" ++
+            "Run examples:\n" ++
+            "  zolt run --provider openai --model gpt-5-chat-latest \"hello\"\n" ++
+            "  zolt run --session <id> --provider openai --model gpt-5-chat-latest \"continue\"\n",
     );
 }
 
@@ -1127,6 +1217,50 @@ fn writeModelsSelectionInvalidToStderr() !void {
     try stderr_writer.interface.writeAll("invalid model selection input\n");
 }
 
+fn writeRunTaskModelRequiresProviderToStderr() !void {
+    var output_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
+    defer stderr_writer.interface.flush() catch {};
+    try stderr_writer.interface.writeAll("run error: --model requires --provider\n");
+}
+
+fn writeRunTaskProviderNotFoundToStderr(catalog: *const models.Catalog, provider_id: []const u8) !void {
+    var output_buffer: [2048]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
+    defer stderr_writer.interface.flush() catch {};
+
+    try stderr_writer.interface.print("run error: unknown provider `{s}`\n", .{provider_id});
+    try stderr_writer.interface.writeAll("available providers:\n");
+    for (catalog.providers.items) |provider| {
+        try stderr_writer.interface.print("- {s}\n", .{provider.id});
+    }
+}
+
+fn writeRunTaskModelNotFoundToStderr(provider: *const models.ProviderInfo, model_id: []const u8) !void {
+    var output_buffer: [2048]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
+    defer stderr_writer.interface.flush() catch {};
+
+    try stderr_writer.interface.print(
+        "run error: unknown model `{s}` for provider `{s}`\n",
+        .{ model_id, provider.id },
+    );
+    try stderr_writer.interface.writeAll("try: zolt models --provider ");
+    try stderr_writer.interface.writeAll(provider.id);
+    try stderr_writer.interface.writeAll("\n");
+}
+
+fn writeRunTaskModelRequiredForProviderToStderr(provider_id: []const u8, current_model: []const u8) !void {
+    var output_buffer: [2048]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
+    defer stderr_writer.interface.flush() catch {};
+
+    try stderr_writer.interface.print(
+        "run error: current model `{s}` is not available for provider `{s}`; pass --model <id>\n",
+        .{ current_model, provider_id },
+    );
+}
+
 fn writeModelProviderNotFoundToStderr(catalog: *const models.Catalog, provider_id: []const u8) !void {
     var output_buffer: [2048]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
@@ -1365,6 +1499,8 @@ test "parseCliAction parses run subcommand prompt and session flags" {
         .run_task => |options| {
             try std.testing.expect(options.session_id == null);
             try std.testing.expect(options.output_format == .text);
+            try std.testing.expect(options.provider_id == null);
+            try std.testing.expect(options.model_id == null);
             try std.testing.expectEqual(@as(usize, 2), options.prompt_parts.len);
             try std.testing.expectEqualStrings("hello", options.prompt_parts[0]);
             try std.testing.expectEqualStrings("world", options.prompt_parts[1]);
@@ -1377,6 +1513,8 @@ test "parseCliAction parses run subcommand prompt and session flags" {
         .run_task => |options| {
             try std.testing.expectEqualStrings("abc123", options.session_id.?);
             try std.testing.expect(options.output_format == .text);
+            try std.testing.expect(options.provider_id == null);
+            try std.testing.expect(options.model_id == null);
             try std.testing.expectEqual(@as(usize, 2), options.prompt_parts.len);
             try std.testing.expectEqualStrings("explain", options.prompt_parts[0]);
             try std.testing.expectEqualStrings("this", options.prompt_parts[1]);
@@ -1408,6 +1546,40 @@ test "parseCliAction parses run output format flags" {
     }
 }
 
+test "parseCliAction parses run provider and model flags" {
+    const run_with_provider_model = parseCliAction(&.{
+        "run",
+        "--provider",
+        "openai",
+        "--model",
+        "gpt-5-chat-latest",
+        "hello",
+    });
+    switch (run_with_provider_model) {
+        .run_task => |options| {
+            try std.testing.expectEqualStrings("openai", options.provider_id.?);
+            try std.testing.expectEqualStrings("gpt-5-chat-latest", options.model_id.?);
+            try std.testing.expectEqualStrings("hello", options.prompt_parts[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const run_with_equals_flags = parseCliAction(&.{
+        "run",
+        "--provider=openai",
+        "--model=gpt-5-chat-latest",
+        "hello",
+    });
+    switch (run_with_equals_flags) {
+        .run_task => |options| {
+            try std.testing.expectEqualStrings("openai", options.provider_id.?);
+            try std.testing.expectEqualStrings("gpt-5-chat-latest", options.model_id.?);
+            try std.testing.expectEqualStrings("hello", options.prompt_parts[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "parseCliAction rejects invalid run usage" {
     const missing_prompt = parseCliAction(&.{"run"});
     switch (missing_prompt) {
@@ -1426,6 +1598,164 @@ test "parseCliAction rejects invalid run usage" {
         .invalid => |arg| try std.testing.expectEqualStrings("--output", arg),
         else => return error.TestUnexpectedResult,
     }
+
+    const duplicate_provider = parseCliAction(&.{ "run", "--provider", "openai", "--provider", "anthropic", "test" });
+    switch (duplicate_provider) {
+        .invalid => |arg| try std.testing.expectEqualStrings("--provider", arg),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const duplicate_model = parseCliAction(&.{ "run", "--model", "a", "--model", "b", "test" });
+    switch (duplicate_model) {
+        .invalid => |arg| try std.testing.expectEqualStrings("--model", arg),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn makeRunTaskTestCatalog(allocator: std.mem.Allocator) !models.Catalog {
+    var catalog: models.Catalog = .{};
+    errdefer catalog.deinit(allocator);
+
+    var openai: models.ProviderInfo = .{
+        .id = try allocator.dupe(u8, "openai"),
+        .name = try allocator.dupe(u8, "OpenAI"),
+        .api_base = null,
+    };
+    errdefer openai.deinit(allocator);
+    try openai.models.append(allocator, .{
+        .id = try allocator.dupe(u8, "gpt-5-chat-latest"),
+        .name = try allocator.dupe(u8, "GPT-5 Chat Latest"),
+        .context_window = 400_000,
+    });
+    try openai.models.append(allocator, .{
+        .id = try allocator.dupe(u8, "gpt-4.1"),
+        .name = try allocator.dupe(u8, "GPT-4.1"),
+        .context_window = 128_000,
+    });
+
+    var anthropic: models.ProviderInfo = .{
+        .id = try allocator.dupe(u8, "anthropic"),
+        .name = try allocator.dupe(u8, "Anthropic"),
+        .api_base = null,
+    };
+    errdefer anthropic.deinit(allocator);
+    try anthropic.models.append(allocator, .{
+        .id = try allocator.dupe(u8, "claude-opus-4-1"),
+        .name = try allocator.dupe(u8, "Claude Opus 4.1"),
+        .context_window = 200_000,
+    });
+
+    try catalog.providers.append(allocator, openai);
+    try catalog.providers.append(allocator, anthropic);
+    return catalog;
+}
+
+test "validateAndApplyRunTaskSelection accepts valid provider and model" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    var catalog = try makeRunTaskTestCatalog(allocator);
+    defer catalog.deinit(allocator);
+
+    try validateAndApplyRunTaskSelection(allocator, &app_state, &catalog, .{
+        .provider_id = "openai",
+        .model_id = "gpt-5-chat-latest",
+        .prompt_parts = &.{"hello"},
+    });
+
+    try std.testing.expectEqualStrings("openai", app_state.selected_provider_id);
+    try std.testing.expectEqualStrings("gpt-5-chat-latest", app_state.selected_model_id);
+}
+
+test "validateAndApplyRunTaskSelection rejects unknown provider" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    var catalog = try makeRunTaskTestCatalog(allocator);
+    defer catalog.deinit(allocator);
+
+    try std.testing.expectError(
+        error.InvalidRunTaskSelection,
+        validateAndApplyRunTaskSelection(allocator, &app_state, &catalog, .{
+            .provider_id = "does-not-exist",
+            .model_id = "gpt-5-chat-latest",
+            .prompt_parts = &.{"hello"},
+        }),
+    );
+}
+
+test "validateAndApplyRunTaskSelection rejects unknown model for provider" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    var catalog = try makeRunTaskTestCatalog(allocator);
+    defer catalog.deinit(allocator);
+
+    try std.testing.expectError(
+        error.InvalidRunTaskSelection,
+        validateAndApplyRunTaskSelection(allocator, &app_state, &catalog, .{
+            .provider_id = "openai",
+            .model_id = "does-not-exist",
+            .prompt_parts = &.{"hello"},
+        }),
+    );
+}
+
+test "validateAndApplyRunTaskSelection rejects model without provider" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    var catalog = try makeRunTaskTestCatalog(allocator);
+    defer catalog.deinit(allocator);
+
+    try std.testing.expectError(
+        error.InvalidRunTaskSelection,
+        validateAndApplyRunTaskSelection(allocator, &app_state, &catalog, .{
+            .model_id = "gpt-5-chat-latest",
+            .prompt_parts = &.{"hello"},
+        }),
+    );
+}
+
+test "validateAndApplyRunTaskSelection session resume respects explicit provider model" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    var catalog = try makeRunTaskTestCatalog(allocator);
+    defer catalog.deinit(allocator);
+
+    try app_state.setSelectedProvider(allocator, "openai");
+    try app_state.setSelectedModel(allocator, "gpt-4.1");
+    try app_state.appendMessage(allocator, .user, "seed");
+    const first_id = try allocator.dupe(u8, app_state.currentConversationConst().id);
+    defer allocator.free(first_id);
+
+    _ = try app_state.createConversation(allocator, "Second");
+    try app_state.setSelectedProvider(allocator, "anthropic");
+    try app_state.setSelectedModel(allocator, "claude-opus-4-1");
+    try app_state.appendMessage(allocator, .user, "seed 2");
+    const second_id = try allocator.dupe(u8, app_state.currentConversationConst().id);
+    defer allocator.free(second_id);
+
+    try std.testing.expect(try app_state.switchConversation(allocator, second_id));
+    try std.testing.expectEqualStrings("anthropic", app_state.selected_provider_id);
+    try std.testing.expectEqualStrings("claude-opus-4-1", app_state.selected_model_id);
+
+    try validateAndApplyRunTaskSelection(allocator, &app_state, &catalog, .{
+        .provider_id = "openai",
+        .model_id = "gpt-5-chat-latest",
+        .prompt_parts = &.{"continue"},
+    });
+
+    try std.testing.expectEqualStrings("openai", app_state.selected_provider_id);
+    try std.testing.expectEqualStrings("gpt-5-chat-latest", app_state.selected_model_id);
+    try std.testing.expectEqualStrings("openai", app_state.currentConversationConst().selected_provider_id.?);
+    try std.testing.expectEqualStrings("gpt-5-chat-latest", app_state.currentConversationConst().selected_model_id.?);
 }
 
 test "selectStartupConversationWithoutSession chooses newest blank conversation" {
@@ -1566,6 +1896,14 @@ test "buildRunTaskJsonPayloadAlloc includes usage and context for normal respons
         .object => |object| object,
         else => return error.TestUnexpectedResult,
     };
+    try std.testing.expectEqualStrings("openai", switch (root.get("provider").?) {
+        .string => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqualStrings("gpt-5.2-codex", switch (root.get("model").?) {
+        .string => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
 
     const usage_value = root.get("usage") orelse return error.TestUnexpectedResult;
     const usage_object = switch (usage_value) {
@@ -1645,6 +1983,14 @@ test "buildRunTaskJsonPayloadAlloc includes usage and context for provider-error
         .object => |object| object,
         else => return error.TestUnexpectedResult,
     };
+    try std.testing.expectEqualStrings("openai", switch (root.get("provider").?) {
+        .string => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqualStrings("gpt-5", switch (root.get("model").?) {
+        .string => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
 
     const usage_value = root.get("usage") orelse return error.TestUnexpectedResult;
     const usage_object = switch (usage_value) {
@@ -1704,6 +2050,8 @@ test "buildRunTaskJsonPayloadAlloc emits null usage/context fields when unknown"
     const allocator = std.testing.allocator;
     var app_state = try AppState.init(allocator);
     defer app_state.deinit(allocator);
+    try app_state.setActiveProvider(allocator, "openai");
+    try app_state.setActiveModel(allocator, "gpt-5");
 
     const usage = runTaskJsonUsageFromTokenUsage(.{});
     const context = runTaskJsonContextFromConversation(app_state.currentConversationConst());
@@ -1726,6 +2074,14 @@ test "buildRunTaskJsonPayloadAlloc emits null usage/context fields when unknown"
         .object => |object| object,
         else => return error.TestUnexpectedResult,
     };
+    try std.testing.expectEqualStrings("openai", switch (root.get("provider").?) {
+        .string => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqualStrings("gpt-5", switch (root.get("model").?) {
+        .string => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
 
     const usage_value = root.get("usage") orelse return error.TestUnexpectedResult;
     const usage_object = switch (usage_value) {

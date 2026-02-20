@@ -96,6 +96,8 @@ Use `zolt run` when another tool/script needs a one-shot answer on stdout (no TU
 ```bash
 zolt run "<prompt>"
 zolt run --session <conversation-id> "<prompt>"
+zolt run --provider openai --model gpt-5-chat-latest "<prompt>"
+zolt run --session <conversation-id> --provider openai --model gpt-5-chat-latest "<prompt>"
 zolt run -s <conversation-id> "<prompt>"
 zolt run --output text "<prompt>"
 zolt run --output logs "<prompt>"
@@ -105,6 +107,8 @@ zolt run --output json-stream "<prompt>"
 
 Notes:
 - `zolt run` uses the same model/provider selection as normal mode.
+- Pass `--provider` and `--model` to force an explicit run-scoped selection.
+- `--model` requires `--provider`.
 - `--session` resumes that conversation context first, then appends your prompt.
 - `--output` controls formatting:
   - `text`: final assistant response only (default)
