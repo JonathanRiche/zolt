@@ -2107,5 +2107,6 @@ test {
     _ = @import("provider_client.zig");
     _ = @import("config.zig");
     _ = @import("keybindings.zig");
+    _ = @import("terminal_backend.zig");
     _ = @import("tui.zig");
 }

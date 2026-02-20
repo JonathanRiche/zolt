@@ -2,11 +2,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 const keybindings = @import("keybindings.zig");
 const models = @import("models.zig");
 const patch_tool = @import("patch_tool.zig");
 const provider_client = @import("provider_client.zig");
+const terminal_backend = @import("terminal_backend.zig");
 const tools_runtime = @import("tools/runtime.zig");
 const Paths = @import("paths.zig").Paths;
 const AppState = @import("state.zig").AppState;
@@ -123,6 +125,11 @@ const CommandPickerKind = enum {
 const TerminalMetrics = struct {
     width: usize,
     lines: usize,
+};
+
+const UiBackendKind = enum {
+    ansi,
+    vaxis,
 };
 
 const CommandSession = struct {
@@ -398,34 +405,6 @@ const TOOL_SYSTEM_PROMPT =
 const VIEW_IMAGE_VISION_PROMPT =
     "Describe this image for a coding assistant. Focus on visible UI/text/code, layout, key errors/warnings, and actionable observations. Keep it concise.";
 
-const RawMode = struct {
-    original_termios: std.posix.termios,
-
-    pub fn enable() !RawMode {
-        const stdin_handle = std.fs.File.stdin().handle;
-        const original = try std.posix.tcgetattr(stdin_handle);
-
-        var raw = original;
-        raw.iflag.ICRNL = false;
-        raw.iflag.IXON = false;
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.ISIG = false;
-        raw.lflag.IEXTEN = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-
-        try std.posix.tcsetattr(stdin_handle, .NOW, raw);
-
-        return .{ .original_termios = original };
-    }
-
-    pub fn disable(self: *const RawMode) void {
-        const stdin_handle = std.fs.File.stdin().handle;
-        std.posix.tcsetattr(stdin_handle, .NOW, self.original_termios) catch {};
-    }
-};
-
 pub fn run(
     allocator: std.mem.Allocator,
     paths: *const Paths,
@@ -457,8 +436,22 @@ pub fn run(
         app.auto_compact_percent_left = normalizeAutoCompactPercentLeft(percent_left);
     }
     app.ensureCurrentConversationVisibleInStrip();
+    try runInteractiveLoop(&app, selectedUiBackendKind());
+}
 
-    var raw_mode = try RawMode.enable();
+fn selectedUiBackendKind() UiBackendKind {
+    return if (build_options.enable_vaxis_backend) .vaxis else .ansi;
+}
+
+fn runInteractiveLoop(app: *App, backend_kind: UiBackendKind) !void {
+    switch (backend_kind) {
+        .ansi => try runInteractiveAnsiLoop(app),
+        .vaxis => try runInteractiveVaxisLoop(app),
+    }
+}
+
+fn runInteractiveAnsiLoop(app: *App) !void {
+    var raw_mode = try terminal_backend.RawMode.enable();
     defer raw_mode.disable();
 
     try app.render();
@@ -473,11 +466,11 @@ pub fn run(
         }
 
         if (app.suspend_requested) {
-            try suspendForJobControl(&raw_mode, &app);
+            try suspendForJobControl(&raw_mode, app);
             continue;
         }
 
-        const mapped_key = if (byte_buf[0] == 27) try mapEscapeSequenceToKey() else null;
+        const mapped_key = if (byte_buf[0] == 27) try terminal_backend.mapEscapeSequenceToKey() else null;
         if (mapped_key) |key| {
             try app.handleByte(key);
         } else {
@@ -485,7 +478,7 @@ pub fn run(
         }
 
         if (app.suspend_requested) {
-            try suspendForJobControl(&raw_mode, &app);
+            try suspendForJobControl(&raw_mode, app);
             continue;
         }
 
@@ -493,6 +486,19 @@ pub fn run(
             try app.render();
         }
     }
+}
+
+fn runInteractiveVaxisLoop(app: *App) !void {
+    if (comptime build_options.enable_vaxis_backend) {
+        const vaxis = @import("vaxis");
+        _ = vaxis.Vaxis;
+        _ = vaxis.Loop;
+        _ = vaxis.Event;
+        std.log.info("vaxis backend selected; low-level event/render adapter pending, using ANSI compatibility loop", .{});
+        try runInteractiveAnsiLoop(app);
+        return;
+    }
+    unreachable;
 }
 
 pub fn runTaskPrompt(
@@ -592,59 +598,18 @@ pub fn runTaskPromptOutcomeWithObserver(
     return outcome;
 }
 
-fn suspendForJobControl(raw_mode: *RawMode, app: *App) !void {
+fn suspendForJobControl(raw_mode: *terminal_backend.RawMode, app: *App) !void {
     app.suspend_requested = false;
     app.stream_stop_for_suspend = false;
 
     raw_mode.disable();
     try std.posix.raise(std.posix.SIG.TSTP);
-    raw_mode.* = try RawMode.enable();
+    raw_mode.* = try terminal_backend.RawMode.enable();
 
     try app.setNotice("Resumed (fg)");
     if (!app.should_exit) {
         try app.render();
     }
-}
-
-fn mapEscapeSequenceToKey() !?u8 {
-    if (!try stdinHasPendingByte(2)) return null;
-
-    var second: [1]u8 = undefined;
-    const second_read = try std.posix.read(std.fs.File.stdin().handle, second[0..]);
-    if (second_read == 0) return null;
-    if (second[0] != '[' and second[0] != 'O') return null;
-
-    if (!try stdinHasPendingByte(2)) return null;
-
-    var third: [1]u8 = undefined;
-    const third_read = try std.posix.read(std.fs.File.stdin().handle, third[0..]);
-    if (third_read == 0) return null;
-
-    switch (third[0]) {
-        'A' => return KEY_UP_ARROW,
-        'B' => return KEY_DOWN_ARROW,
-        '5', '6' => {
-            if (second[0] != '[') return null;
-            if (!try stdinHasPendingByte(2)) return null;
-
-            var fourth: [1]u8 = undefined;
-            const fourth_read = try std.posix.read(std.fs.File.stdin().handle, fourth[0..]);
-            if (fourth_read == 0 or fourth[0] != '~') return null;
-
-            return if (third[0] == '5') KEY_PAGE_UP else KEY_PAGE_DOWN;
-        },
-        else => return null,
-    }
-}
-
-fn stdinHasPendingByte(timeout_ms: i32) !bool {
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = std.fs.File.stdin().handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready_count = try std.posix.poll(&poll_fds, timeout_ms);
-    return ready_count > 0 and (poll_fds[0].revents & std.posix.POLL.IN) == std.posix.POLL.IN;
 }
 
 const App = struct {
@@ -2714,7 +2679,7 @@ const App = struct {
     fn pollStreamInterrupt(self: *App) !bool {
         if (self.headless) return false;
 
-        while (try stdinHasPendingByte(0)) {
+        while (try terminal_backend.stdinHasPendingByte(0)) {
             var byte_buf: [1]u8 = undefined;
             const read_len = try std.posix.read(std.fs.File.stdin().handle, byte_buf[0..]);
             if (read_len == 0) break;
