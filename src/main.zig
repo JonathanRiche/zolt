@@ -27,9 +27,14 @@ const CliRunTaskOptions = struct {
     prompt_parts: []const []const u8,
 };
 
+const CliListModelsOptions = struct {
+    provider_id: ?[]const u8 = null,
+};
+
 const CliAction = union(enum) {
     run_tui: CliRunOptions,
     run_task: CliRunTaskOptions,
+    list_models: CliListModelsOptions,
     show_help,
     show_version,
     invalid: []const u8,
@@ -45,7 +50,7 @@ pub fn main() !void {
 
     const cli_action = parseCliAction(args[1..]);
     switch (cli_action) {
-        .run_tui, .run_task => {},
+        .run_tui, .run_task, .list_models => {},
         .show_help => {
             try writeHelpToStdout();
             return;
@@ -61,6 +66,20 @@ pub fn main() !void {
     }
 
     var paths = try Paths.init(allocator);
+    if (cli_action == .list_models) {
+        var catalog = blk: {
+            const loaded = models.loadOrRefresh(allocator, paths.models_cache_path) catch |err| {
+                try writeModelsLoadFailedToStderr(err);
+                return;
+            };
+            break :blk loaded.catalog;
+        };
+        defer catalog.deinit(allocator);
+        defer paths.deinit(allocator);
+
+        try writeModelsListToStdout(&catalog, cli_action.list_models);
+        return;
+    }
 
     paths.ensureDirs() catch |err| switch (err) {
         error.AccessDenied, error.PermissionDenied => {
@@ -164,6 +183,9 @@ pub fn main() !void {
         },
         .run_task => |task_options| {
             try runSinglePromptTask(allocator, &paths, &app_state, &catalog, task_options, startup_options);
+        },
+        .list_models => |options| {
+            try writeModelsListToStdout(&catalog, options);
         },
         else => unreachable,
     }
@@ -483,6 +505,9 @@ fn parseCliAction(args: []const []const u8) CliAction {
     if (std.mem.eql(u8, args[0], "run")) {
         return parseRunTaskCliAction(args[1..]);
     }
+    if (std.mem.eql(u8, args[0], "models") or std.mem.eql(u8, args[0], "list-models")) {
+        return parseListModelsCliAction(args[1..]);
+    }
 
     var run_options: CliRunOptions = .{};
     var index: usize = 0;
@@ -513,6 +538,41 @@ fn parseCliAction(args: []const []const u8) CliAction {
     }
 
     return .{ .run_tui = run_options };
+}
+
+fn parseListModelsCliAction(args: []const []const u8) CliAction {
+    var options: CliListModelsOptions = .{};
+    var index: usize = 0;
+
+    while (index < args.len) {
+        const arg = args[index];
+
+        if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--provider")) {
+            if (index + 1 >= args.len) return .{ .invalid = arg };
+            if (options.provider_id != null) return .{ .invalid = arg };
+            const provider_id = args[index + 1];
+            if (provider_id.len == 0 or provider_id[0] == '-') return .{ .invalid = arg };
+            options.provider_id = provider_id;
+            index += 2;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--provider=")) {
+            if (options.provider_id != null) return .{ .invalid = arg };
+            const provider_id = arg["--provider=".len..];
+            if (provider_id.len == 0) return .{ .invalid = arg };
+            options.provider_id = provider_id;
+            index += 1;
+            continue;
+        }
+
+        if (arg.len > 0 and arg[0] == '-') return .{ .invalid = arg };
+        if (options.provider_id != null) return .{ .invalid = arg };
+        options.provider_id = arg;
+        index += 1;
+    }
+
+    return .{ .list_models = options };
 }
 
 fn parseRunTaskCliAction(args: []const []const u8) CliAction {
@@ -594,6 +654,8 @@ fn writeHelpToStdout() !void {
             "  zolt\n" ++
             "  zolt run \"<prompt>\"\n" ++
             "  zolt run --output <text|logs|json|json-stream> \"<prompt>\"\n" ++
+            "  zolt models [provider-id]\n" ++
+            "  zolt models --provider <provider-id>\n" ++
             "  zolt -s <conversation-id>\n" ++
             "  zolt --session <conversation-id>\n" ++
             "  zolt run --session <conversation-id> \"<prompt>\"\n" ++
@@ -606,7 +668,85 @@ fn writeHelpToStdout() !void {
             "  text        final assistant response only (default)\n" ++
             "  logs        tool call/result logs + final response\n" ++
             "  json        one JSON object with response + events\n" ++
-            "  json-stream newline-delimited JSON events while running\n",
+            "  json-stream newline-delimited JSON events while running\n" ++
+            "\n" ++
+            "Models listing:\n" ++
+            "  zolt models                 list providers and model counts\n" ++
+            "  zolt models opencode        list model IDs for provider\n" ++
+            "  zolt models -p openai       same as above\n",
+    );
+}
+
+fn writeModelsListToStdout(catalog: *const models.Catalog, options: CliListModelsOptions) !void {
+    var output_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&output_buffer);
+    defer stdout_writer.interface.flush() catch {};
+
+    if (options.provider_id) |provider_id| {
+        const provider = catalog.findProviderConst(provider_id) orelse {
+            try writeModelProviderNotFoundToStderr(catalog, provider_id);
+            return;
+        };
+
+        try stdout_writer.interface.print(
+            "provider: {s} ({s})\nmodels: {d}\n",
+            .{ provider.id, provider.name, provider.models.items.len },
+        );
+        if (provider.env_vars.items.len > 0) {
+            try stdout_writer.interface.print("api_key_env: {s}\n", .{provider.env_vars.items[0]});
+        }
+        try stdout_writer.interface.writeAll("\nmodel ids:\n");
+        for (provider.models.items) |model| {
+            if (model.context_window) |window| {
+                try stdout_writer.interface.print("- {s}  (ctx:{d})\n", .{ model.id, window });
+            } else {
+                try stdout_writer.interface.print("- {s}\n", .{model.id});
+            }
+        }
+        if (provider.models.items.len > 0) {
+            try stdout_writer.interface.print(
+                "\nconfig.jsonc example:\n{{\n  \"provider\": \"{s}\",\n  \"model\": \"{s}\"\n}}\n",
+                .{ provider.id, provider.models.items[0].id },
+            );
+        }
+        return;
+    }
+
+    try stdout_writer.interface.print("providers: {d}\n", .{catalog.providers.items.len});
+    try stdout_writer.interface.writeAll("usage: zolt models <provider-id>\n\n");
+    for (catalog.providers.items) |provider| {
+        if (provider.env_vars.items.len > 0) {
+            try stdout_writer.interface.print(
+                "- {s} ({s}) models:{d} key:{s}\n",
+                .{ provider.id, provider.name, provider.models.items.len, provider.env_vars.items[0] },
+            );
+        } else {
+            try stdout_writer.interface.print(
+                "- {s} ({s}) models:{d}\n",
+                .{ provider.id, provider.name, provider.models.items.len },
+            );
+        }
+    }
+}
+
+fn writeModelProviderNotFoundToStderr(catalog: *const models.Catalog, provider_id: []const u8) !void {
+    var output_buffer: [2048]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
+    defer stderr_writer.interface.flush() catch {};
+
+    try stderr_writer.interface.print("provider not found: {s}\navailable providers:\n", .{provider_id});
+    for (catalog.providers.items) |provider| {
+        try stderr_writer.interface.print("- {s}\n", .{provider.id});
+    }
+}
+
+fn writeModelsLoadFailedToStderr(err: anyerror) !void {
+    var output_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&output_buffer);
+    defer stderr_writer.interface.flush() catch {};
+    try stderr_writer.interface.print(
+        "failed to load models cache: {s}\nTry: zolt run \"/models refresh\" (inside TUI) or ensure cache path is writable.\n",
+        .{@errorName(err)},
     );
 }
 
@@ -708,6 +848,46 @@ test "parseCliAction handles invalid and empty args" {
     const invalid = parseCliAction(&.{"--wat"});
     switch (invalid) {
         .invalid => |arg| try std.testing.expectEqualStrings("--wat", arg),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliAction parses models subcommand variants" {
+    const basic = parseCliAction(&.{"models"});
+    switch (basic) {
+        .list_models => |options| try std.testing.expect(options.provider_id == null),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const positional = parseCliAction(&.{ "models", "opencode" });
+    switch (positional) {
+        .list_models => |options| try std.testing.expectEqualStrings("opencode", options.provider_id.?),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const long_flag = parseCliAction(&.{ "models", "--provider", "openai" });
+    switch (long_flag) {
+        .list_models => |options| try std.testing.expectEqualStrings("openai", options.provider_id.?),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const short_flag = parseCliAction(&.{ "models", "-p", "anthropic" });
+    switch (short_flag) {
+        .list_models => |options| try std.testing.expectEqualStrings("anthropic", options.provider_id.?),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliAction rejects invalid models subcommand args" {
+    const missing_provider = parseCliAction(&.{ "models", "--provider" });
+    switch (missing_provider) {
+        .invalid => |arg| try std.testing.expectEqualStrings("--provider", arg),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const duplicate_provider = parseCliAction(&.{ "models", "openai", "opencode" });
+    switch (duplicate_provider) {
+        .invalid => |arg| try std.testing.expectEqualStrings("opencode", arg),
         else => return error.TestUnexpectedResult,
     }
 }

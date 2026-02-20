@@ -75,6 +75,9 @@ CLI helpers:
 zolt -h
 zolt --help
 zolt --version
+zolt models
+zolt models opencode
+zolt models --provider openai
 zolt -s <conversation-id>
 zolt --session <conversation-id>
 zolt run "<prompt>"
@@ -225,6 +228,9 @@ Commands:
 
 - `/models` shows cache status
 - `/models refresh` is recommended regularly to keep latest OpenAI models from `models.dev`
+- CLI model listing:
+  - `zolt models` shows provider IDs + model counts
+  - `zolt models <provider-id>` prints exact model IDs (plus config snippet)
 
 ## Core Usage
 
