@@ -491,14 +491,87 @@ fn runInteractiveAnsiLoop(app: *App) !void {
 fn runInteractiveVaxisLoop(app: *App) !void {
     if (comptime build_options.enable_vaxis_backend) {
         const vaxis = @import("vaxis");
-        _ = vaxis.Vaxis;
-        _ = vaxis.Loop;
-        _ = vaxis.Event;
-        std.log.info("vaxis backend selected; low-level event/render adapter pending, using ANSI compatibility loop", .{});
-        try runInteractiveAnsiLoop(app);
+        const VaxisEvent = union(enum) {
+            key_press: vaxis.Key,
+            winsize: vaxis.Winsize,
+        };
+
+        var tty_buffer: [4096]u8 = undefined;
+        var tty = try vaxis.Tty.init(&tty_buffer);
+        defer tty.deinit();
+
+        var vx = try vaxis.init(app.allocator, .{});
+        defer vx.deinit(app.allocator, tty.writer());
+
+        var loop: vaxis.Loop(VaxisEvent) = .{ .tty = &tty, .vaxis = &vx };
+        try loop.init();
+        try loop.start();
+        defer loop.stop();
+
+        try vx.enterAltScreen(tty.writer());
+        try vx.queryTerminal(tty.writer(), 100 * std.time.ns_per_ms);
+        try app.render();
+
+        while (!app.should_exit) {
+            switch (loop.nextEvent()) {
+                .winsize => {
+                    try app.render();
+                },
+                .key_press => |key| {
+                    const mapped_key = mapVaxisKeyToByte(key) orelse continue;
+                    if (mapped_key == 26) {
+                        try suspendForJobControlVaxis(&vx, &tty, app);
+                        continue;
+                    }
+                    try app.handleByte(mapped_key);
+                    if (!app.should_exit) {
+                        try app.render();
+                    }
+                },
+            }
+        }
         return;
     }
     unreachable;
+}
+
+fn mapVaxisKeyToByte(key: anytype) ?u8 {
+    const mods = key.mods;
+    const codepoint = key.codepoint;
+
+    if (codepoint == 57352) return KEY_UP_ARROW;
+    if (codepoint == 57353) return KEY_DOWN_ARROW;
+    if (codepoint == 57354) return KEY_PAGE_UP;
+    if (codepoint == 57355) return KEY_PAGE_DOWN;
+    if (codepoint == 0x1B) return 27;
+    if (codepoint == 0x09) return '\t';
+    if (codepoint == 0x0D) return '\n';
+    if (codepoint == 0x7F) return 127;
+
+    if (mods.ctrl and codepoint >= 'a' and codepoint <= 'z') {
+        return @as(u8, @intCast(codepoint - 'a' + 1));
+    }
+    if (mods.ctrl and codepoint >= 'A' and codepoint <= 'Z') {
+        return @as(u8, @intCast(codepoint - 'A' + 1));
+    }
+
+    if (codepoint <= 0xFF) {
+        return @as(u8, @intCast(codepoint));
+    }
+
+    return null;
+}
+
+fn suspendForJobControlVaxis(vx: anytype, tty: anytype, app: *App) !void {
+    if (builtin.os.tag == .windows) {
+        return;
+    }
+
+    try vx.resetState(tty.writer());
+    try std.posix.raise(std.posix.SIG.TSTP);
+    try vx.enterAltScreen(tty.writer());
+    try app.setNotice("Resumed (fg)");
+    try app.render();
 }
 
 pub fn runTaskPrompt(
@@ -9468,6 +9541,26 @@ test "parseSkillsPickerQuery handles /skills argument edits" {
     try std.testing.expectEqualStrings("refresh", parseSkillsPickerQuery("/skills refresh", 15).?);
     try std.testing.expect(parseSkillsPickerQuery("/skills", 4) == null);
     try std.testing.expect(parseSkillsPickerQuery("/skillsx", 8) == null);
+}
+
+test "mapVaxisKeyToByte maps special, ctrl, and ascii keys" {
+    const Mods = struct {
+        shift: bool = false,
+        alt: bool = false,
+        ctrl: bool = false,
+        super: bool = false,
+    };
+    const Key = struct {
+        codepoint: u21,
+        mods: Mods = .{},
+    };
+
+    try std.testing.expectEqual(@as(?u8, KEY_UP_ARROW), mapVaxisKeyToByte(Key{ .codepoint = 57352 }));
+    try std.testing.expectEqual(@as(?u8, KEY_PAGE_DOWN), mapVaxisKeyToByte(Key{ .codepoint = 57355 }));
+    try std.testing.expectEqual(@as(?u8, 16), mapVaxisKeyToByte(Key{ .codepoint = 'p', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?u8, 26), mapVaxisKeyToByte(Key{ .codepoint = 'Z', .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqual(@as(?u8, 'i'), mapVaxisKeyToByte(Key{ .codepoint = 'i' }));
+    try std.testing.expectEqual(@as(?u8, null), mapVaxisKeyToByte(Key{ .codepoint = 0x2603 }));
 }
 
 test "collectConversationSwitchMatchOrder sorts newest conversations first" {
