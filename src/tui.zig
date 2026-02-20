@@ -444,7 +444,11 @@ pub fn run(
     }
     app.selected_backend = selectedUiBackendKind();
     app.ensureCurrentConversationVisibleInStrip();
-    try runInteractiveLoop(&app);
+    while (!app.should_exit and !app.restart_interactive_loop) {
+        try runInteractiveLoop(&app);
+        if (!app.restart_interactive_loop or app.should_exit) break;
+        app.restart_interactive_loop = false;
+    }
 }
 
 fn selectedUiBackendKind() UiBackendKind {
@@ -485,6 +489,8 @@ fn runInteractiveAnsiLoop(app: *App) !void {
             try app.handleByte(byte_buf[0]);
         }
 
+        if (app.restart_interactive_loop) break;
+
         if (app.suspend_requested) {
             try suspendForJobControl(&raw_mode, app);
             continue;
@@ -520,7 +526,7 @@ fn runInteractiveVaxisLoop(app: *App) !void {
         try vx.queryTerminal(tty.writer(), 100 * std.time.ns_per_ms);
         try app.render();
 
-        while (!app.should_exit) {
+        while (!app.should_exit and !app.restart_interactive_loop) {
             switch (loop.nextEvent()) {
                 .winsize => {
                     try app.render();
@@ -532,6 +538,7 @@ fn runInteractiveVaxisLoop(app: *App) !void {
                         continue;
                     }
                     try app.handleByte(mapped_key);
+                    if (app.restart_interactive_loop) return;
                     if (!app.should_exit) {
                         try app.render();
                     }
@@ -634,6 +641,8 @@ pub fn runTaskPromptOutcomeWithObserver(
     startup_options: StartupOptions,
     run_observer: ?RunTaskObserver,
 ) !RunTaskOutcome {
+    // Headless run mode stays backend-neutral by design. It bypasses interactive
+    // terminal backends (ANSI/libvaxis) and should remain stable for automation.
     const trimmed_prompt = std.mem.trim(u8, prompt, " \t\r\n");
     if (trimmed_prompt.len == 0) {
         return .{
@@ -736,6 +745,7 @@ const App = struct {
     stream_started_ms: i64 = 0,
     stream_task: StreamTask = .idle,
     suspend_requested: bool = false,
+    restart_interactive_loop: bool = false,
     headless: bool = false,
     auto_compact_enabled: bool = true,
     auto_compact_percent_left: i64 = AUTO_COMPACT_PERCENT_LEFT_THRESHOLD,
@@ -3207,8 +3217,8 @@ const App = struct {
                         return;
                     }
                     self.selected_backend = .ansi;
-                    self.should_exit = true;
-                    try self.setNotice("Switching UI backend to ansi (restart zolt)");
+                    self.restart_interactive_loop = true;
+                    try self.setNotice("Switching UI backend to ansi");
                     return;
                 }
 
@@ -3222,8 +3232,8 @@ const App = struct {
                         return;
                     }
                     self.selected_backend = .vaxis;
-                    self.should_exit = true;
-                    try self.setNotice("Switching UI backend to vaxis (restart zolt)");
+                    self.restart_interactive_loop = true;
+                    try self.setNotice("Switching UI backend to vaxis");
                     return;
                 }
 

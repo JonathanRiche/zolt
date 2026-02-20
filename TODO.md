@@ -15,7 +15,7 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
   - [ ] chat viewport + scrolling
   - [ ] model/command/file/skills pickers
   - [ ] markdown line styling parity
-- [ ] keep non-interactive `zolt run` path independent of vaxis backend
+- [x] keep non-interactive `zolt run` path independent of vaxis backend (headless path bypasses interactive backend loops)
 - [x] add A/B toggle command (`/ui backend ansi|vaxis`) for runtime testing when vaxis is enabled
 - [x] add regression tests for parsing/key behavior that should remain backend-agnostic
 - [ ] add perf/startup checks for Linux/macOS and document fallback behavior in README
