@@ -41,6 +41,13 @@ const RunTaskJsonContext = struct {
     compact_count: ?u64 = null,
 };
 
+const RunTaskJsonError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+    source: []const u8,
+};
+
 const CliListModelsOptions = struct {
     provider_id: ?[]const u8 = null,
     search_query: ?[]const u8 = null,
@@ -280,7 +287,7 @@ fn runSinglePromptTask(
             defer collector.deinit();
 
             const usage_before = app_state.currentConversationConst().total_token_usage;
-            const assistant_text = try tui.runTaskPromptWithObserver(
+            var outcome = try tui.runTaskPromptOutcomeWithObserver(
                 allocator,
                 paths,
                 app_state,
@@ -292,18 +299,25 @@ fn runSinglePromptTask(
                     .context = &collector,
                 },
             );
-            defer allocator.free(assistant_text);
+            defer outcome.deinit(allocator);
             const usage_after = app_state.currentConversationConst().total_token_usage;
             const usage_delta = tokenUsageDelta(usage_before, usage_after);
             const usage = runTaskJsonUsageFromTokenUsage(usage_delta);
             const context = runTaskJsonContextFromConversation(app_state.currentConversationConst());
+            const json_error = if (outcome.error_info) |err_info| RunTaskJsonError{
+                .code = err_info.code,
+                .message = err_info.message,
+                .retryable = err_info.retryable,
+                .source = err_info.source,
+            } else null;
             try writeRunTaskJsonOutputToStdout(
                 allocator,
                 app_state,
                 prompt,
-                assistant_text,
+                outcome.response,
                 usage,
                 context,
+                json_error,
                 collector.events.items,
             );
         },
@@ -450,9 +464,10 @@ fn writeRunTaskJsonOutputToStdout(
     response: []const u8,
     usage: RunTaskJsonUsage,
     context: RunTaskJsonContext,
+    run_error: ?RunTaskJsonError,
     events: []const RunTaskCapturedEvent,
 ) !void {
-    const payload = try buildRunTaskJsonPayloadAlloc(allocator, app_state, prompt, response, usage, context, events);
+    const payload = try buildRunTaskJsonPayloadAlloc(allocator, app_state, prompt, response, usage, context, run_error, events);
     defer allocator.free(payload);
     try writeRunTaskOutputToStdout(payload);
 }
@@ -464,6 +479,7 @@ fn buildRunTaskJsonPayloadAlloc(
     response: []const u8,
     usage: RunTaskJsonUsage,
     context: RunTaskJsonContext,
+    run_error: ?RunTaskJsonError,
     events: []const RunTaskCapturedEvent,
 ) ![]u8 {
     var payload_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -499,6 +515,21 @@ fn buildRunTaskJsonPayloadAlloc(
     try jw.write(context.context_left_percent);
     try jw.objectField("compact_count");
     try jw.write(context.compact_count);
+    try jw.objectField("error");
+    if (run_error) |error_info| {
+        try jw.beginObject();
+        try jw.objectField("code");
+        try jw.write(error_info.code);
+        try jw.objectField("message");
+        try jw.write(error_info.message);
+        try jw.objectField("retryable");
+        try jw.write(error_info.retryable);
+        try jw.objectField("source");
+        try jw.write(error_info.source);
+        try jw.endObject();
+    } else {
+        try jw.write(@as(?u8, null));
+    }
     try jw.objectField("events");
     try jw.beginArray();
     for (events) |event| {
@@ -539,7 +570,11 @@ fn runTaskJsonContextFromConversation(conversation: *const Conversation) RunTask
     if (conversation.model_context_window) |window| {
         if (optionalPositiveU64(window)) |window_tokens| {
             context_window_tokens = window_tokens;
-            const percent = conversation.total_token_usage.percentOfContextWindowRemaining(window);
+            const usage_for_percent = if (!conversation.last_token_usage.isZero())
+                conversation.last_token_usage
+            else
+                conversation.total_token_usage;
+            const percent = usage_for_percent.percentOfContextWindowRemaining(window);
             context_left_percent = @as(u64, @intCast(std.math.clamp(percent, @as(i64, 0), @as(i64, 100))));
         }
     }
@@ -1459,6 +1494,28 @@ test "runTaskJsonContextFromConversation maps session health fields" {
     try std.testing.expectEqual(@as(?u64, 1), context.compact_count);
 }
 
+test "runTaskJsonContextFromConversation prefers latest usage for context percent" {
+    const allocator = std.testing.allocator;
+    var app_state = try AppState.init(allocator);
+    defer app_state.deinit(allocator);
+
+    app_state.currentConversation().model_context_window = 400_000;
+    app_state.currentConversation().total_token_usage = .{
+        .input_tokens = 1_000_000,
+        .output_tokens = 1_000,
+        .total_tokens = 1_001_000,
+    };
+    app_state.currentConversation().last_token_usage = .{
+        .input_tokens = 120,
+        .output_tokens = 30,
+        .total_tokens = 150,
+    };
+
+    const context = runTaskJsonContextFromConversation(app_state.currentConversationConst());
+    try std.testing.expectEqual(@as(?u64, 400_000), context.context_window_tokens);
+    try std.testing.expectEqual(@as(?u64, 99), context.context_left_percent);
+}
+
 test "runTaskJsonContextFromConversation returns null for unknown context window" {
     const allocator = std.testing.allocator;
     var app_state = try AppState.init(allocator);
@@ -1498,6 +1555,7 @@ test "buildRunTaskJsonPayloadAlloc includes usage and context for normal respons
         "hello",
         usage,
         context,
+        null,
         &.{},
     );
     defer allocator.free(payload);
@@ -1539,6 +1597,7 @@ test "buildRunTaskJsonPayloadAlloc includes usage and context for normal respons
         .integer => |value| value,
         else => return error.TestUnexpectedResult,
     });
+    try std.testing.expect(root.get("error").? == .null);
 }
 
 test "buildRunTaskJsonPayloadAlloc includes usage and context for provider-error style response" {
@@ -1567,9 +1626,15 @@ test "buildRunTaskJsonPayloadAlloc includes usage and context for provider-error
         allocator,
         &app_state,
         "hi",
-        "[local] Request failed.",
+        "[local] Request failed (bad_request): detail",
         usage,
         context,
+        .{
+            .code = "bad_request",
+            .message = "status=bad_request body={\"error\":{\"message\":\"detail\"}}",
+            .retryable = false,
+            .source = "provider",
+        },
         &.{},
     );
     defer allocator.free(payload);
@@ -1604,6 +1669,11 @@ test "buildRunTaskJsonPayloadAlloc includes usage and context for provider-error
     const context_window_tokens = root.get("context_window_tokens") orelse return error.TestUnexpectedResult;
     const context_left_percent = root.get("context_left_percent") orelse return error.TestUnexpectedResult;
     const compact_count = root.get("compact_count") orelse return error.TestUnexpectedResult;
+    const error_value = root.get("error") orelse return error.TestUnexpectedResult;
+    const error_object = switch (error_value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
     try std.testing.expectEqual(@as(i64, 400_000), switch (context_window_tokens) {
         .integer => |value| value,
         else => return error.TestUnexpectedResult,
@@ -1614,6 +1684,18 @@ test "buildRunTaskJsonPayloadAlloc includes usage and context for provider-error
     });
     try std.testing.expectEqual(@as(i64, 0), switch (compact_count) {
         .integer => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqualStrings("bad_request", switch (error_object.get("code").?) {
+        .string => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqualStrings("provider", switch (error_object.get("source").?) {
+        .string => |value| value,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(false, switch (error_object.get("retryable").?) {
+        .bool => |value| value,
         else => return error.TestUnexpectedResult,
     });
 }
@@ -1633,6 +1715,7 @@ test "buildRunTaskJsonPayloadAlloc emits null usage/context fields when unknown"
         "hello",
         usage,
         context,
+        null,
         &.{},
     );
     defer allocator.free(payload);
@@ -1658,6 +1741,7 @@ test "buildRunTaskJsonPayloadAlloc emits null usage/context fields when unknown"
         .integer => |value| value,
         else => return error.TestUnexpectedResult,
     });
+    try std.testing.expect(root.get("error").? == .null);
 }
 
 test {

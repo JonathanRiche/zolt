@@ -71,6 +71,29 @@ pub const RunTaskObserver = struct {
     context: ?*anyopaque = null,
 };
 
+pub const RunTaskErrorInfo = struct {
+    code: []u8,
+    message: []u8,
+    retryable: bool,
+    source: []u8,
+
+    pub fn deinit(self: *RunTaskErrorInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.code);
+        allocator.free(self.message);
+        allocator.free(self.source);
+    }
+};
+
+pub const RunTaskOutcome = struct {
+    response: []u8,
+    error_info: ?RunTaskErrorInfo = null,
+
+    pub fn deinit(self: *RunTaskOutcome, allocator: std.mem.Allocator) void {
+        allocator.free(self.response);
+        if (self.error_info) |*err_info| err_info.deinit(allocator);
+    }
+};
+
 const StreamTask = enum {
     idle,
     thinking,
@@ -204,6 +227,14 @@ const SessionDrainResult = struct {
     stdout: []u8,
     stderr: []u8,
     output_limited: bool = false,
+};
+
+const StreamFailureInfo = struct {
+    code: []u8,
+    message: []u8,
+    retryable: bool,
+    context_related: bool,
+    source: []u8,
 };
 
 const SkillScope = enum {
@@ -471,7 +502,17 @@ pub fn runTaskPrompt(
     prompt: []const u8,
     startup_options: StartupOptions,
 ) ![]u8 {
-    return runTaskPromptWithObserver(allocator, paths, app_state, catalog, prompt, startup_options, null);
+    var outcome = try runTaskPromptOutcomeWithObserver(
+        allocator,
+        paths,
+        app_state,
+        catalog,
+        prompt,
+        startup_options,
+        null,
+    );
+    defer if (outcome.error_info) |*err_info| err_info.deinit(allocator);
+    return outcome.response;
 }
 
 pub fn runTaskPromptWithObserver(
@@ -483,8 +524,35 @@ pub fn runTaskPromptWithObserver(
     startup_options: StartupOptions,
     run_observer: ?RunTaskObserver,
 ) ![]u8 {
+    var outcome = try runTaskPromptOutcomeWithObserver(
+        allocator,
+        paths,
+        app_state,
+        catalog,
+        prompt,
+        startup_options,
+        run_observer,
+    );
+    defer if (outcome.error_info) |*err_info| err_info.deinit(allocator);
+    return outcome.response;
+}
+
+pub fn runTaskPromptOutcomeWithObserver(
+    allocator: std.mem.Allocator,
+    paths: *const Paths,
+    app_state: *AppState,
+    catalog: *models.Catalog,
+    prompt: []const u8,
+    startup_options: StartupOptions,
+    run_observer: ?RunTaskObserver,
+) !RunTaskOutcome {
     const trimmed_prompt = std.mem.trim(u8, prompt, " \t\r\n");
-    if (trimmed_prompt.len == 0) return allocator.dupe(u8, "");
+    if (trimmed_prompt.len == 0) {
+        return .{
+            .response = try allocator.dupe(u8, ""),
+            .error_info = null,
+        };
+    }
 
     var app: App = .{
         .allocator = allocator,
@@ -508,7 +576,19 @@ pub fn runTaskPromptWithObserver(
     const final = try app.latestAssistantResponseAlloc();
     errdefer allocator.free(final);
     try app.emitRunTaskEvent(.{ .final = final });
-    return final;
+    var outcome: RunTaskOutcome = .{
+        .response = final,
+        .error_info = null,
+    };
+    if (app.last_run_error) |err_info| {
+        outcome.error_info = .{
+            .code = try allocator.dupe(u8, err_info.code),
+            .message = try allocator.dupe(u8, err_info.message),
+            .retryable = err_info.retryable,
+            .source = try allocator.dupe(u8, err_info.source),
+        };
+    }
+    return outcome;
 }
 
 fn suspendForJobControl(raw_mode: *RawMode, app: *App) !void {
@@ -614,6 +694,9 @@ const App = struct {
     openai_auth_mode: OpenAiAuthMode = .auto,
     agents_context_initialized: bool = false,
     agents_context_payload: ?[]u8 = null,
+    last_run_error: ?RunTaskErrorInfo = null,
+    last_successful_tool_call: ?[]u8 = null,
+    last_successful_tool_result_summary: ?[]u8 = null,
     run_observer: ?RunTaskObserver = null,
 
     notice: []u8,
@@ -630,6 +713,9 @@ const App = struct {
         for (self.skills.items) |*skill| skill.deinit(self.allocator);
         self.skills.deinit(self.allocator);
         if (self.agents_context_payload) |payload| self.allocator.free(payload);
+        if (self.last_run_error) |*err_info| err_info.deinit(self.allocator);
+        if (self.last_successful_tool_call) |value| self.allocator.free(value);
+        if (self.last_successful_tool_result_summary) |value| self.allocator.free(value);
         self.allocator.free(self.notice);
     }
 
@@ -943,6 +1029,8 @@ const App = struct {
         defer if (inject_result.payload) |payload| self.allocator.free(payload);
         const skill_inject_result = try self.buildSkillInjectionPayload(prompt);
         defer if (skill_inject_result.payload) |payload| self.allocator.free(payload);
+        self.clearLastRunError();
+        self.clearLastSuccessfulTool();
 
         const provider_id = self.app_state.selected_provider_id;
         const model_id = self.app_state.selected_model_id;
@@ -994,14 +1082,18 @@ const App = struct {
 
         if (maybe_auth == null) {
             if (std.mem.eql(u8, provider_id, "openai")) {
-                try self.setLastAssistantMessage("[local] Missing OpenAI auth (API key or Codex subscription token).");
+                const message = "[local] Missing OpenAI auth (API key or Codex subscription token).";
+                try self.setLastAssistantMessage(message);
                 try self.setNotice("Set OPENAI_API_KEY, or login with Codex/OpenCode OAuth (CODEX_HOME/auth.json, ~/.codex/auth.json, or ~/.local/share/opencode/auth.json). Optional: ZOLT_OPENAI_AUTH=codex.");
+                try self.setLastRunError("missing_openai_auth", message, false, "local");
             } else {
-                try self.setLastAssistantMessage("[local] Missing API key for selected provider.");
+                const message = "[local] Missing API key for selected provider.";
+                try self.setLastAssistantMessage(message);
                 try self.setNoticeFmt("Set env var for provider {s} and retry. Example: {s}", .{
                     provider_id,
                     firstEnvVarForProvider(self, provider_id) orelse "<PROVIDER>_API_KEY",
                 });
+                try self.setLastRunError("missing_api_key", message, false, "local");
             }
             try self.app_state.saveToPath(self.allocator, self.paths.state_path);
             return;
@@ -1053,8 +1145,21 @@ const App = struct {
             );
         }
 
+        const ToolLoopGuardReason = enum {
+            none,
+            repeated_tool_call,
+            max_iterations,
+        };
+        var guard_reason: ToolLoopGuardReason = .none;
+        var executed_any_tool = false;
         var step: usize = 0;
-        while (step < TOOL_MAX_STEPS) : (step += 1) {
+        var seen_tool_signatures: std.ArrayList([]u8) = .empty;
+        defer {
+            for (seen_tool_signatures.items) |signature| self.allocator.free(signature);
+            seen_tool_signatures.deinit(self.allocator);
+        }
+
+        tool_loop: while (step < TOOL_MAX_STEPS) : (step += 1) {
             const success = try self.streamAssistantOnce(provider_id, model_id, auth, true);
             if (!success) break;
 
@@ -1075,9 +1180,21 @@ const App = struct {
                     const tool_result = try self.runReadToolCommand(read_command_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool(tool_note, tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNoticeFmt("Ran READ command: {s}", .{read_command_owned});
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "READ",
+                        read_command_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
                 .list_dir => |list_dir_payload| {
                     self.stream_task = .running_list_dir;
@@ -1091,9 +1208,21 @@ const App = struct {
                     const tool_result = try self.runListDirToolPayload(payload_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] LIST_DIR", tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran LIST_DIR tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "LIST_DIR",
+                        payload_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
                 .read_file => |read_file_payload| {
                     self.stream_task = .running_read_file;
@@ -1107,9 +1236,21 @@ const App = struct {
                     const tool_result = try self.runReadFileToolPayload(payload_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] READ_FILE", tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran READ_FILE tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "READ_FILE",
+                        payload_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
                 .grep_files => |grep_payload| {
                     self.stream_task = .running_grep_files;
@@ -1123,9 +1264,21 @@ const App = struct {
                     const tool_result = try self.runGrepFilesToolPayload(payload_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] GREP_FILES", tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran GREP_FILES tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "GREP_FILES",
+                        payload_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
                 .project_search => |project_search_payload| {
                     self.stream_task = .running_project_search;
@@ -1139,9 +1292,21 @@ const App = struct {
                     const tool_result = try self.runProjectSearchToolPayload(payload_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] PROJECT_SEARCH", tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran PROJECT_SEARCH tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "PROJECT_SEARCH",
+                        payload_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
                 .apply_patch => |patch_text| {
                     self.stream_task = .running_apply_patch;
@@ -1155,9 +1320,21 @@ const App = struct {
                     const tool_result = try self.runApplyPatchToolPatch(patch_text_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] APPLY_PATCH", tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran APPLY_PATCH tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "APPLY_PATCH",
+                        patch_text_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
                 .exec_command => |exec_payload| {
                     self.stream_task = .running_exec_command;
@@ -1171,9 +1348,21 @@ const App = struct {
                     const tool_result = try self.runExecCommandToolPayload(exec_payload_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] EXEC_COMMAND", tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran EXEC_COMMAND tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "EXEC_COMMAND",
+                        exec_payload_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
                 .write_stdin => |write_payload| {
                     self.stream_task = .running_write_stdin;
@@ -1187,9 +1376,21 @@ const App = struct {
                     const tool_result = try self.runWriteStdinToolPayload(write_payload_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] WRITE_STDIN", tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran WRITE_STDIN tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "WRITE_STDIN",
+                        write_payload_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
                 .web_search => |web_search_payload| {
                     self.stream_task = .running_web_search;
@@ -1203,9 +1404,21 @@ const App = struct {
                     const tool_result = try self.runWebSearchToolPayload(web_search_payload_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] WEB_SEARCH", tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran WEB_SEARCH tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "WEB_SEARCH",
+                        web_search_payload_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
                 .view_image => |view_image_payload| {
                     self.stream_task = .running_view_image;
@@ -1219,9 +1432,21 @@ const App = struct {
                     const tool_result = try self.runViewImageToolPayload(view_image_payload_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] VIEW_IMAGE", tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran VIEW_IMAGE tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "VIEW_IMAGE",
+                        view_image_payload_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
                 .skill => |skill_payload| {
                     self.stream_task = .running_skill;
@@ -1235,9 +1460,21 @@ const App = struct {
                     const tool_result = try self.runSkillToolPayload(skill_payload_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
+                    try self.recordSuccessfulTool("[tool] SKILL", tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran SKILL tool");
+                    executed_any_tool = true;
+                    if (try didRepeatToolExecution(
+                        self.allocator,
+                        &seen_tool_signatures,
+                        "SKILL",
+                        skill_payload_owned,
+                        tool_result,
+                    )) {
+                        guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
                 },
             }
             self.stream_task = .thinking;
@@ -1245,19 +1482,43 @@ const App = struct {
         }
 
         const conversation_after_loop = self.app_state.currentConversationConst();
-        if (conversation_after_loop.messages.items.len > 0) {
+        const last_is_tool_marker = if (conversation_after_loop.messages.items.len > 0) blk: {
             const last_message = conversation_after_loop.messages.items[conversation_after_loop.messages.items.len - 1];
-            if (parseAssistantToolCall(last_message.content) != null and !self.stream_was_interrupted) {
-                if (step == TOOL_MAX_STEPS) {
-                    try self.app_state.appendMessage(self.allocator, .system, "[tool-result]\nTool step limit reached. Stop calling tools and answer the user directly.");
-                } else {
-                    try self.app_state.appendMessage(self.allocator, .system, "[tool-result]\nTool output is already available. Stop calling tools and answer the user directly.");
-                }
-                try self.app_state.appendMessage(self.allocator, .assistant, "");
-                _ = try self.streamAssistantOnce(provider_id, model_id, auth, false);
-            }
+            break :blk parseAssistantToolCall(last_message.content) != null;
+        } else false;
+
+        if (guard_reason == .none and step == TOOL_MAX_STEPS and last_is_tool_marker and !self.stream_was_interrupted) {
+            guard_reason = .max_iterations;
         }
 
+        if (!self.stream_was_interrupted and provider_client.lastProviderErrorDetail() == null and executed_any_tool) {
+            const force_summary_instruction = switch (guard_reason) {
+                .none => "[tool-result]\nTool execution completed. Provide a final user-facing answer now. Do not call more tools.",
+                .repeated_tool_call => "[tool-result]\nA repeated tool-call loop was detected. Stop calling tools and provide a final user-facing answer now.",
+                .max_iterations => "[tool-result]\nTool iteration limit was reached. Stop calling tools and provide a final user-facing answer now.",
+            };
+            try self.app_state.appendMessage(self.allocator, .system, force_summary_instruction);
+            try self.app_state.appendMessage(self.allocator, .assistant, "");
+            _ = try self.streamAssistantOnce(provider_id, model_id, auth, false);
+        }
+
+        if (!self.stream_was_interrupted and provider_client.lastProviderErrorDetail() == null) {
+            switch (guard_reason) {
+                .none => try self.ensureLastAssistantUserFacing(),
+                .repeated_tool_call => {
+                    const fallback = try self.buildToolFallbackSummaryAlloc("repeated_tool_call");
+                    defer self.allocator.free(fallback);
+                    try self.setLastAssistantMessage(fallback);
+                    try self.setNotice("Stopped repeated tool loop; synthesized fallback summary.");
+                },
+                .max_iterations => {
+                    const fallback = try self.buildToolFallbackSummaryAlloc("max_tool_iterations");
+                    defer self.allocator.free(fallback);
+                    try self.setLastAssistantMessage(fallback);
+                    try self.setNotice("Tool step limit reached; synthesized fallback summary.");
+                },
+            }
+        }
         if (!self.stream_was_interrupted and provider_client.lastProviderErrorDetail() == null) {
             try self.setNoticeFmt("Completed response from {s}/{s}", .{ provider_id, model_id });
         }
@@ -1579,46 +1840,94 @@ const App = struct {
         try self.setNoticeFmt("Streaming from {s}/{s}...", .{ provider_id, model_id });
         try self.render();
 
-        provider_client.streamChat(self.allocator, request, .{
-            .on_token = onStreamToken,
-            .on_usage = onStreamUsage,
-            .context = self,
-        }) catch |err| {
-            if (err == error.StreamInterrupted) {
-                self.stream_was_interrupted = true;
-                if (self.stream_stop_for_suspend) {
-                    try self.setNotice("Suspending... use fg to resume");
-                } else {
-                    try self.appendInterruptedMessage();
-                    try self.setNotice("Streaming interrupted (Esc Esc)");
+        var attempt: usize = 0;
+        var auth_for_retry = auth;
+        while (true) {
+            provider_client.streamChat(self.allocator, request, .{
+                .on_token = onStreamToken,
+                .on_usage = onStreamUsage,
+                .context = self,
+            }) catch |err| {
+                if (err == error.StreamInterrupted) {
+                    self.stream_was_interrupted = true;
+                    if (self.stream_stop_for_suspend) {
+                        try self.setNotice("Suspending... use fg to resume");
+                    } else {
+                        try self.appendInterruptedMessage();
+                        try self.setNotice("Streaming interrupted (Esc Esc)");
+                    }
+                    try self.app_state.saveToPath(self.allocator, self.paths.state_path);
+                    return false;
                 }
-                try self.app_state.saveToPath(self.allocator, self.paths.state_path);
-                return false;
-            }
 
-            const provider_detail = provider_client.lastProviderErrorDetail();
-            if (provider_detail) |detail| {
-                try self.setNoticeFmt("Provider request failed: {s}", .{detail});
-            } else {
-                try self.setNoticeFmt("Provider request failed: {s}", .{@errorName(err)});
-            }
-            const conversation = self.app_state.currentConversationConst();
-            const needs_paragraph_break = if (conversation.messages.items.len == 0) false else blk: {
-                const last = conversation.messages.items[conversation.messages.items.len - 1];
-                break :blk last.content.len > 0;
-            };
-            if (provider_detail) |detail| {
-                const failure_line = try std.fmt.allocPrint(self.allocator, "[local] Request failed ({s}).", .{detail});
+                const provider_detail = provider_client.lastProviderErrorDetail();
+                const failure = try classifyStreamFailureAlloc(self.allocator, err, provider_detail);
+                defer {
+                    self.allocator.free(failure.code);
+                    self.allocator.free(failure.message);
+                    self.allocator.free(failure.source);
+                }
+
+                if (shouldRetryStreamFailure(failure, attempt)) {
+                    if (failure.context_related and self.auto_compact_enabled) {
+                        _ = self.compactCurrentConversation(
+                            provider_id,
+                            model_id,
+                            &auth_for_retry,
+                            .automatic,
+                            autoCompactPercentLeft(self.app_state.currentConversationConst()),
+                        ) catch false;
+                    }
+                    attempt += 1;
+                    try self.setNoticeFmt("Retrying request once (reason:{s})...", .{failure.code});
+                    try self.render();
+                    continue;
+                }
+
+                var failure_message = try self.allocator.dupe(u8, failure.message);
+                defer self.allocator.free(failure_message);
+                if (self.last_successful_tool_call) |tool_call| {
+                    const tool_summary = self.last_successful_tool_result_summary orelse "(no summary)";
+                    const enriched_failure_message = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}; after successful {s} ({s})",
+                        .{ failure.message, tool_call, tool_summary },
+                    );
+                    self.allocator.free(failure_message);
+                    failure_message = enriched_failure_message;
+
+                    const tool_context_note = try std.fmt.allocPrint(
+                        self.allocator,
+                        "[tool-failure-context] last_successful_tool_call:{s} result:{s}",
+                        .{ tool_call, tool_summary },
+                    );
+                    defer self.allocator.free(tool_context_note);
+                    try self.emitRunTaskEvent(.{ .tool_result = tool_context_note });
+                }
+
+                try self.setNoticeFmt("Provider request failed: {s}", .{failure_message});
+                try self.setLastRunError(failure.code, failure_message, failure.retryable, failure.source);
+
+                const conversation = self.app_state.currentConversationConst();
+                const needs_paragraph_break = if (conversation.messages.items.len == 0) false else blk: {
+                    const last = conversation.messages.items[conversation.messages.items.len - 1];
+                    break :blk last.content.len > 0;
+                };
+                const failure_line = try std.fmt.allocPrint(
+                    self.allocator,
+                    "[local] Request failed ({s}): {s}.",
+                    .{ failure.code, failure_message },
+                );
                 defer self.allocator.free(failure_line);
                 try self.appendToLastAssistantMessage(if (needs_paragraph_break) "\n\n" else "");
                 try self.appendToLastAssistantMessage(failure_line);
-            } else {
-                try self.appendToLastAssistantMessage(if (needs_paragraph_break) "\n\n[local] Request failed." else "[local] Request failed.");
-            }
-            try self.app_state.saveToPath(self.allocator, self.paths.state_path);
-            return false;
-        };
-        return true;
+                try self.app_state.saveToPath(self.allocator, self.paths.state_path);
+                return false;
+            };
+
+            self.clearLastRunError();
+            return true;
+        }
     }
 
     fn appendInterruptedMessage(self: *App) !void {
@@ -3160,6 +3469,69 @@ const App = struct {
         try self.setNoticeOwned(text);
     }
 
+    fn clearLastRunError(self: *App) void {
+        if (self.last_run_error) |*err_info| err_info.deinit(self.allocator);
+        self.last_run_error = null;
+    }
+
+    fn setLastRunError(
+        self: *App,
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+        source: []const u8,
+    ) !void {
+        self.clearLastRunError();
+        self.last_run_error = .{
+            .code = try self.allocator.dupe(u8, code),
+            .message = try self.allocator.dupe(u8, message),
+            .retryable = retryable,
+            .source = try self.allocator.dupe(u8, source),
+        };
+    }
+
+    fn clearLastSuccessfulTool(self: *App) void {
+        if (self.last_successful_tool_call) |value| self.allocator.free(value);
+        self.last_successful_tool_call = null;
+        if (self.last_successful_tool_result_summary) |value| self.allocator.free(value);
+        self.last_successful_tool_result_summary = null;
+    }
+
+    fn recordSuccessfulTool(self: *App, tool_call: []const u8, tool_result: []const u8) !void {
+        self.clearLastSuccessfulTool();
+        self.last_successful_tool_call = try self.allocator.dupe(u8, tool_call);
+        self.last_successful_tool_result_summary = try summarizeToolResultAlloc(self.allocator, tool_result);
+    }
+
+    fn buildToolFallbackSummaryAlloc(self: *App, reason: []const u8) ![]u8 {
+        return buildToolFallbackSummaryFromLastToolAlloc(
+            self.allocator,
+            self.last_successful_tool_call,
+            self.last_successful_tool_result_summary,
+            reason,
+        );
+    }
+
+    fn ensureLastAssistantUserFacing(self: *App) !void {
+        const conversation = self.app_state.currentConversationConst();
+        if (conversation.messages.items.len == 0) return;
+        const last = conversation.messages.items[conversation.messages.items.len - 1];
+        if (last.role != .assistant) return;
+
+        const sanitized = try sanitizeFinalUserFacingResponseAlloc(
+            self.allocator,
+            last.content,
+            self.last_successful_tool_call,
+            self.last_successful_tool_result_summary,
+            "finalize",
+        );
+        defer self.allocator.free(sanitized);
+
+        if (!std.mem.eql(u8, sanitized, last.content)) {
+            try self.setLastAssistantMessage(sanitized);
+        }
+    }
+
     fn latestAssistantResponseAlloc(self: *App) ![]u8 {
         const conversation = self.app_state.currentConversationConst();
 
@@ -3175,25 +3547,8 @@ const App = struct {
             return self.allocator.dupe(u8, message.content);
         }
 
-        // Fallback to latest non-empty assistant text.
-        index = conversation.messages.items.len;
-        while (index > 0) {
-            index -= 1;
-            const message = conversation.messages.items[index];
-            if (message.role != .assistant) continue;
-            if (std.mem.trim(u8, message.content, " \t\r\n").len == 0) continue;
-            return self.allocator.dupe(u8, message.content);
-        }
-
-        // Last-resort fallback (may be empty tool placeholder on interrupted flows).
-        index = conversation.messages.items.len;
-        while (index > 0) {
-            index -= 1;
-            const message = conversation.messages.items[index];
-            if (message.role != .assistant) continue;
-            return self.allocator.dupe(u8, message.content);
-        }
-        return self.allocator.dupe(u8, "");
+        // No valid assistant text: synthesize a user-facing fallback from latest tool result.
+        return self.buildToolFallbackSummaryAlloc("no_user_facing_response");
     }
 
     fn render(self: *App) !void {
@@ -8104,6 +8459,120 @@ fn looksBinary(content: []const u8) bool {
     return control_count * 10 > sample_len;
 }
 
+fn summarizeToolResultAlloc(allocator: std.mem.Allocator, tool_result: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, tool_result, " \t\r\n");
+    if (trimmed.len == 0) return allocator.dupe(u8, "(no output)");
+
+    if (findNamedLineValue(trimmed, "state:")) |state| {
+        return std.fmt.allocPrint(allocator, "state:{s}", .{state});
+    }
+    if (findNamedLineValue(trimmed, "error:")) |err_text| {
+        return std.fmt.allocPrint(allocator, "error:{s}", .{err_text});
+    }
+    if (findNamedLineValue(trimmed, "status:")) |status| {
+        return std.fmt.allocPrint(allocator, "status:{s}", .{status});
+    }
+
+    if (firstNonEmptyLine(trimmed)) |line| {
+        const max_len: usize = 120;
+        if (line.len <= max_len) return allocator.dupe(u8, line);
+        return std.fmt.allocPrint(allocator, "{s}...", .{line[0..max_len]});
+    }
+    return allocator.dupe(u8, "(no output)");
+}
+
+fn isToolMarkerLikeResponse(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return true;
+    return parseAssistantToolCall(trimmed) != null;
+}
+
+fn displayToolNameAlloc(allocator: std.mem.Allocator, tool_call: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, tool_call, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "[tool]")) {
+        const rest = std.mem.trimLeft(u8, trimmed["[tool]".len..], " \t");
+        if (rest.len > 0) return allocator.dupe(u8, rest);
+    }
+    return allocator.dupe(u8, trimmed);
+}
+
+fn buildToolFallbackSummaryFromLastToolAlloc(
+    allocator: std.mem.Allocator,
+    last_tool_call: ?[]const u8,
+    last_tool_summary: ?[]const u8,
+    reason: []const u8,
+) ![]u8 {
+    if (last_tool_call) |tool_call| {
+        const display_tool = try displayToolNameAlloc(allocator, tool_call);
+        defer allocator.free(display_tool);
+        const summary = last_tool_summary orelse "(no result summary)";
+        return std.fmt.allocPrint(
+            allocator,
+            "I completed `{s}`. Last tool result: {s}. I stopped further tool calls ({s}) and this is the best available outcome.",
+            .{ display_tool, summary, reason },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "I could not produce a final model summary after tool execution ({s}), and no tool result summary is available.",
+        .{reason},
+    );
+}
+
+fn sanitizeFinalUserFacingResponseAlloc(
+    allocator: std.mem.Allocator,
+    candidate: []const u8,
+    last_tool_call: ?[]const u8,
+    last_tool_summary: ?[]const u8,
+    reason: []const u8,
+) ![]u8 {
+    if (!isToolMarkerLikeResponse(candidate)) return allocator.dupe(u8, candidate);
+    return buildToolFallbackSummaryFromLastToolAlloc(allocator, last_tool_call, last_tool_summary, reason);
+}
+
+fn findNamedLineValue(text: []const u8, prefix: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        return std.mem.trim(u8, line[prefix.len..], " \t");
+    }
+    return null;
+}
+
+fn firstNonEmptyLine(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
+        if (line.len == 0) continue;
+        return line;
+    }
+    return null;
+}
+
+fn didRepeatToolExecution(
+    allocator: std.mem.Allocator,
+    seen_signatures: *std.ArrayList([]u8),
+    tool_name: []const u8,
+    args: []const u8,
+    result: []const u8,
+) !bool {
+    const signature = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n--args--\n{s}\n--result--\n{s}",
+        .{ tool_name, args, result },
+    );
+
+    for (seen_signatures.items) |existing| {
+        if (std.mem.eql(u8, existing, signature)) {
+            allocator.free(signature);
+            return true;
+        }
+    }
+    try seen_signatures.append(allocator, signature);
+    return false;
+}
+
 fn isAllowedReadCommand(argv: []const []const u8) bool {
     if (argv.len == 0) return false;
     const command = argv[0];
@@ -8153,6 +8622,86 @@ fn isAllowedReadGitCommand(args: []const []const u8) bool {
         if (std.mem.eql(u8, subcommand, allowed)) return true;
     }
     return false;
+}
+
+fn classifyStreamFailureAlloc(
+    allocator: std.mem.Allocator,
+    err: anyerror,
+    provider_detail: ?[]const u8,
+) !StreamFailureInfo {
+    if (provider_detail) |detail| {
+        const status_tag = statusTagFromProviderDetail(detail);
+        const context_related = isContextRelatedProviderDetail(detail);
+        const retryable = isRetryableStatusTag(status_tag) or context_related;
+        const code = status_tag orelse @errorName(err);
+        return .{
+            .code = try allocator.dupe(u8, code),
+            .message = try allocator.dupe(u8, detail),
+            .retryable = retryable,
+            .context_related = context_related,
+            .source = try allocator.dupe(u8, "provider"),
+        };
+    }
+
+    const err_name = @errorName(err);
+    const retryable = isRetryableLocalError(err_name);
+    const context_related = isContextRelatedErrorText(err_name);
+    return .{
+        .code = try allocator.dupe(u8, err_name),
+        .message = try allocator.dupe(u8, err_name),
+        .retryable = retryable or context_related,
+        .context_related = context_related,
+        .source = try allocator.dupe(u8, "local"),
+    };
+}
+
+fn shouldRetryStreamFailure(info: StreamFailureInfo, attempt: usize) bool {
+    if (attempt > 0) return false;
+    return info.retryable;
+}
+
+fn statusTagFromProviderDetail(detail: []const u8) ?[]const u8 {
+    const status_prefix = "status=";
+    const start_index = std.mem.indexOf(u8, detail, status_prefix) orelse return null;
+    const value_start = start_index + status_prefix.len;
+    if (value_start >= detail.len) return null;
+    var end = value_start;
+    while (end < detail.len and detail[end] != ' ' and detail[end] != ')' and detail[end] != ',' and detail[end] != '\n') : (end += 1) {}
+    if (end == value_start) return null;
+    return detail[value_start..end];
+}
+
+fn isRetryableStatusTag(status_tag: ?[]const u8) bool {
+    const tag = status_tag orelse return false;
+    return std.mem.eql(u8, tag, "too_many_requests") or
+        std.mem.eql(u8, tag, "request_timeout") or
+        std.mem.eql(u8, tag, "conflict") or
+        std.mem.eql(u8, tag, "bad_gateway") or
+        std.mem.eql(u8, tag, "service_unavailable") or
+        std.mem.eql(u8, tag, "gateway_timeout");
+}
+
+fn isRetryableLocalError(err_name: []const u8) bool {
+    return containsAsciiIgnoreCase(err_name, "TimedOut") or
+        containsAsciiIgnoreCase(err_name, "Connection") or
+        containsAsciiIgnoreCase(err_name, "Network") or
+        containsAsciiIgnoreCase(err_name, "BrokenPipe") or
+        containsAsciiIgnoreCase(err_name, "WouldBlock");
+}
+
+fn isContextRelatedProviderDetail(detail: []const u8) bool {
+    return isContextRelatedErrorText(detail) or
+        containsAsciiIgnoreCase(detail, "maximum context length") or
+        containsAsciiIgnoreCase(detail, "context window") or
+        containsAsciiIgnoreCase(detail, "too many tokens") or
+        containsAsciiIgnoreCase(detail, "prompt is too long");
+}
+
+fn isContextRelatedErrorText(text: []const u8) bool {
+    return containsAsciiIgnoreCase(text, "context") and
+        (containsAsciiIgnoreCase(text, "length") or
+            containsAsciiIgnoreCase(text, "window") or
+            containsAsciiIgnoreCase(text, "token"));
 }
 
 fn statusToChildTerm(status: u32) std.process.Child.Term {
@@ -8614,6 +9163,90 @@ test "isAllowedReadCommand rejects non-allowlisted and unsafe forms" {
     try std.testing.expect(!isAllowedReadCommand(&.{ "git", "-c", "core.editor=vim", "status" }));
     try std.testing.expect(!isAllowedReadCommand(&.{ "git", "commit", "-m", "x" }));
     try std.testing.expect(!isAllowedReadCommand(&.{ "git", "push" }));
+}
+
+test "classifyStreamFailureAlloc parses provider status and retry flags" {
+    const allocator = std.testing.allocator;
+    const failure = try classifyStreamFailureAlloc(
+        allocator,
+        error.ProviderRequestFailed,
+        "status=too_many_requests body={\"error\":{\"message\":\"rate limit\"}}",
+    );
+    defer {
+        allocator.free(failure.code);
+        allocator.free(failure.message);
+        allocator.free(failure.source);
+    }
+
+    try std.testing.expectEqualStrings("too_many_requests", failure.code);
+    try std.testing.expect(failure.retryable);
+    try std.testing.expectEqualStrings("provider", failure.source);
+}
+
+test "summarizeToolResultAlloc prioritizes state and error lines" {
+    const allocator = std.testing.allocator;
+    const summary = try summarizeToolResultAlloc(
+        allocator,
+        "[exec-result]\nsession_id: 1\nstate: exited:0\nstdout:\n(no output)\n",
+    );
+    defer allocator.free(summary);
+    try std.testing.expectEqualStrings("state:exited:0", summary);
+
+    const error_summary = try summarizeToolResultAlloc(allocator, "[read-result]\nerror: command not allowed\n");
+    defer allocator.free(error_summary);
+    try std.testing.expectEqualStrings("error:command not allowed", error_summary);
+}
+
+test "single tool call success yields final natural language" {
+    const allocator = std.testing.allocator;
+    const final_text = try sanitizeFinalUserFacingResponseAlloc(
+        allocator,
+        "Created `.volt/tasks/daily.md` with the requested check-in note.",
+        "[tool] EXEC_COMMAND",
+        "state:exited:0",
+        "finalize",
+    );
+    defer allocator.free(final_text);
+
+    try std.testing.expectEqualStrings(
+        "Created `.volt/tasks/daily.md` with the requested check-in note.",
+        final_text,
+    );
+}
+
+test "repeated tool call loop breaks and uses fallback summary" {
+    const allocator = std.testing.allocator;
+    var seen: std.ArrayList([]u8) = .empty;
+    defer {
+        for (seen.items) |entry| allocator.free(entry);
+        seen.deinit(allocator);
+    }
+
+    try std.testing.expect(!(try didRepeatToolExecution(
+        allocator,
+        &seen,
+        "EXEC_COMMAND",
+        "{\"cmd\":\"ls\"}",
+        "[exec-result]\nstate: exited:0\n",
+    )));
+    try std.testing.expect(try didRepeatToolExecution(
+        allocator,
+        &seen,
+        "EXEC_COMMAND",
+        "{\"cmd\":\"ls\"}",
+        "[exec-result]\nstate: exited:0\n",
+    ));
+
+    const fallback = try buildToolFallbackSummaryFromLastToolAlloc(
+        allocator,
+        "[tool] EXEC_COMMAND",
+        "state:exited:0",
+        "repeated_tool_call",
+    );
+    defer allocator.free(fallback);
+
+    try std.testing.expect(std.mem.indexOf(u8, fallback, "stopped further tool calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fallback, "[tool]") == null);
 }
 
 test "codeFenceLanguageToken extracts language from fence line" {

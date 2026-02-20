@@ -115,6 +115,9 @@ Notes:
   - `usage.prompt_tokens` (`number|null`)
   - `usage.completion_tokens` (`number|null`)
   - `usage.total_tokens` (`number|null`)
+- `json` output also includes `error`:
+  - `null` on success
+  - object on failure with `code`, `message`, `retryable`, `source`
 - Existing top-level fields remain unchanged: `provider`, `model`, `session_id`, `prompt`, `response`, `events`.
 - `usage` is normalized across providers (`input_tokens`/`output_tokens` map to `prompt_tokens`/`completion_tokens`).
 - Tool loop is enabled in run mode (`READ`, `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`, `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH`, `VIEW_IMAGE`, `SKILL`).
