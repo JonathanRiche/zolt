@@ -18,6 +18,8 @@ const Role = @import("state.zig").Role;
 const TokenUsage = @import("state.zig").TokenUsage;
 const Keybindings = keybindings.Keybindings;
 
+const vaxis = @import("vaxis");
+
 const Mode = enum {
     normal,
     insert,
@@ -132,6 +134,11 @@ const TerminalMetrics = struct {
 const UiBackendKind = enum {
     ansi,
     vaxis,
+};
+
+const VaxisRenderContext = struct {
+    vx: *anyopaque,
+    tty: *anyopaque,
 };
 
 fn uiBackendLabel(kind: UiBackendKind) []const u8 {
@@ -516,7 +523,6 @@ fn runInteractiveAnsiLoop(app: *App) !void {
 
 fn runInteractiveVaxisLoop(app: *App) !void {
     if (comptime build_options.enable_vaxis_backend) {
-        const vaxis = @import("vaxis");
         const VaxisEvent = union(enum) {
             key_press: vaxis.Key,
             winsize: vaxis.Winsize,
@@ -528,6 +534,11 @@ fn runInteractiveVaxisLoop(app: *App) !void {
 
         var vx = try vaxis.init(app.allocator, .{});
         defer vx.deinit(app.allocator, tty.writer());
+        app.vaxis_render_context = .{
+            .vx = @ptrCast(&vx),
+            .tty = @ptrCast(&tty),
+        };
+        defer app.vaxis_render_context = null;
 
         var loop: vaxis.Loop(VaxisEvent) = .{ .tty = &tty, .vaxis = &vx };
         try loop.init();
@@ -536,6 +547,7 @@ fn runInteractiveVaxisLoop(app: *App) !void {
 
         try vx.enterAltScreen(tty.writer());
         try vx.queryTerminal(tty.writer(), 100 * std.time.ns_per_ms);
+        try syncInitialVaxisSizeAndRender(app, &vx, &tty);
 
         while (!app.should_exit and !app.restart_interactive_loop) {
             switch (loop.nextEvent()) {
@@ -560,6 +572,27 @@ fn runInteractiveVaxisLoop(app: *App) !void {
         return;
     }
     unreachable;
+}
+
+fn syncInitialVaxisSizeAndRender(app: *App, vx: anytype, tty: anytype) !void {
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos or builtin.os.tag == .freebsd or builtin.os.tag == .netbsd or builtin.os.tag == .openbsd) {
+        var ws: std.posix.winsize = .{
+            .row = 0,
+            .col = 0,
+            .xpixel = 0,
+            .ypixel = 0,
+        };
+        const rc = std.posix.system.ioctl(std.fs.File.stdout().handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+        if (std.posix.errno(rc) == .SUCCESS and ws.col > 0 and ws.row > 0) {
+            try vx.resize(app.allocator, tty.writer(), .{
+                .rows = ws.row,
+                .cols = ws.col,
+                .x_pixel = ws.xpixel,
+                .y_pixel = ws.ypixel,
+            });
+        }
+    }
+    try renderVaxisFrame(vx, tty, app);
 }
 
 fn mapVaxisKeyToByte(key: anytype) ?u8 {
@@ -669,7 +702,6 @@ fn buildComfyHeaderMetaLineAlloc(
 fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
     if (self.headless) return;
 
-    const vaxis = @import("vaxis");
     const width: usize = @intCast(vx.screen.width);
     const lines: usize = @intCast(vx.screen.height);
     if (width == 0 or lines == 0) return;
@@ -843,6 +875,9 @@ fn renderVaxisFrame(vx: anytype, tty: anytype, self: *App) !void {
 
     const frame = try frame_writer.toOwnedSlice();
     defer self.allocator.free(frame);
+
+    // Avoid ghosted/shifted cells in tmux panes by forcing a full redraw.
+    vx.queueRefresh();
 
     var win = vx.window();
     win.clear();
@@ -1111,6 +1146,7 @@ const App = struct {
     should_exit: bool = false,
     is_streaming: bool = false,
     selected_backend: UiBackendKind = .ansi,
+    vaxis_render_context: ?VaxisRenderContext = null,
 
     input_buffer: std.ArrayList(u8) = .empty,
     input_cursor: usize = 0,
@@ -4072,6 +4108,15 @@ const App = struct {
 
     fn render(self: *App) !void {
         if (self.headless) return;
+        if (self.selected_backend == .vaxis) {
+            if (comptime build_options.enable_vaxis_backend) {
+                if (self.vaxis_render_context) |ctx| {
+                    const vx: *vaxis.Vaxis = @ptrCast(@alignCast(ctx.vx));
+                    const tty: *vaxis.Tty = @ptrCast(@alignCast(ctx.tty));
+                    return renderVaxisFrame(vx, tty, self);
+                }
+            }
+        }
 
         var screen_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer screen_writer.deinit();
