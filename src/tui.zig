@@ -426,7 +426,13 @@ const TOOL_SYSTEM_PROMPT =
     "</REQUEST_USER_INPUT>\n" ++
     "Use one to three questions. Each question should include two to four mutually exclusive options.\n" ++
     "Available skill names/descriptions are provided in [skills-context] messages.\n" ++
-    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], [view-image-result], [skill-result], [update-plan-result], or [request-user-input-result], continue the answer normally.";
+    "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], [view-image-result], [skill-result], [update-plan-result], or [request-user-input-result], continue the answer normally.\n" ++
+    "Do not end with intent-only text like \"I'll do that now\". If work remains, make the next tool call immediately.";
+const TOOL_CONTINUE_REMINDER =
+    "[tool-result]\n" ++
+    "Continue the task now. If more work remains, call the next tool immediately. " ++
+    "Do not stop with intent-only text.";
+const TOOL_CONTINUE_MAX_ATTEMPTS: u8 = 2;
 
 const VIEW_IMAGE_VISION_PROMPT =
     "Describe this image for a coding assistant. Focus on visible UI/text/code, layout, key errors/warnings, and actionable observations. Keep it concise.";
@@ -1646,6 +1652,7 @@ const App = struct {
         var guard_reason: ToolLoopGuardReason = .none;
         var executed_any_tool = false;
         var step: usize = 0;
+        var tool_continue_attempts: u8 = 0;
         var seen_tool_signatures: std.ArrayList([]u8) = .empty;
         defer {
             for (seen_tool_signatures.items) |signature| self.allocator.free(signature);
@@ -1656,8 +1663,23 @@ const App = struct {
             const success = try self.streamAssistantOnce(provider_id, model_id, auth, true);
             if (!success) break;
 
-            const assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
-            const tool_call = parseAssistantToolCall(assistant_message.content) orelse break;
+            var assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
+            var maybe_tool_call = parseAssistantToolCall(assistant_message.content);
+            while (maybe_tool_call == null and
+                executed_any_tool and
+                tool_continue_attempts < TOOL_CONTINUE_MAX_ATTEMPTS and
+                assistantTextNeedsToolContinuation(assistant_message.content))
+            {
+                tool_continue_attempts += 1;
+                try self.app_state.appendMessage(self.allocator, .system, TOOL_CONTINUE_REMINDER);
+                try self.app_state.appendMessage(self.allocator, .assistant, "");
+                const follow_success = try self.streamAssistantOnce(provider_id, model_id, auth, true);
+                if (!follow_success) break :tool_loop;
+                assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
+                maybe_tool_call = parseAssistantToolCall(assistant_message.content);
+            }
+
+            const tool_call = maybe_tool_call orelse break;
             switch (tool_call) {
                 .read => |read_command| {
                     self.stream_task = .running_read;
@@ -2026,12 +2048,23 @@ const App = struct {
             const last_message = conversation_after_loop.messages.items[conversation_after_loop.messages.items.len - 1];
             break :blk parseAssistantToolCall(last_message.content) != null;
         } else false;
+        const last_assistant_needs_forced_summary = if (conversation_after_loop.messages.items.len > 0) blk: {
+            const last_message = conversation_after_loop.messages.items[conversation_after_loop.messages.items.len - 1];
+            if (last_message.role != .assistant) break :blk false;
+            break :blk assistantTextNeedsForcedSummary(last_message.content);
+        } else false;
 
         if (guard_reason == .none and step == TOOL_MAX_STEPS and last_is_tool_marker and !self.stream_was_interrupted) {
             guard_reason = .max_iterations;
         }
 
-        if (!self.stream_was_interrupted and provider_client.lastProviderErrorDetail() == null and executed_any_tool) {
+        if (!self.stream_was_interrupted and
+            provider_client.lastProviderErrorDetail() == null and
+            executed_any_tool and
+            ((guard_reason == .none and last_assistant_needs_forced_summary) or
+                guard_reason == .repeated_tool_call or
+                guard_reason == .max_iterations))
+        {
             const force_summary_instruction = switch (guard_reason) {
                 .none => "[tool-result]\nTool execution completed. Provide a final user-facing answer now. Do not call more tools.",
                 .repeated_tool_call => "[tool-result]\nA repeated tool-call loop was detected. Stop calling tools and provide a final user-facing answer now.",
@@ -2040,6 +2073,14 @@ const App = struct {
             try self.app_state.appendMessage(self.allocator, .system, force_summary_instruction);
             try self.app_state.appendMessage(self.allocator, .assistant, "");
             _ = try self.streamAssistantOnce(provider_id, model_id, auth, false);
+
+            const post_force = self.app_state.currentConversationConst();
+            if (post_force.messages.items.len > 0) {
+                const last_message = post_force.messages.items[post_force.messages.items.len - 1];
+                if (last_message.role == .assistant and !assistantTextNeedsForcedSummary(last_message.content)) {
+                    guard_reason = .none;
+                }
+            }
         }
 
         if (!self.stream_was_interrupted and provider_client.lastProviderErrorDetail() == null) {
@@ -5848,6 +5889,15 @@ const DiffRenderState = struct {
 };
 
 fn diffRenderColorForLine(state: *DiffRenderState, line: []const u8, palette: Palette) []const u8 {
+    return diffRenderColorForLineWithMode(state, line, palette, true);
+}
+
+fn diffRenderColorForLineWithMode(
+    state: *DiffRenderState,
+    line: []const u8,
+    palette: Palette,
+    allow_unfenced_diff: bool,
+) []const u8 {
     const trimmed_leading = std.mem.trimLeft(u8, line, " \t");
     if (isCodeFenceLine(trimmed_leading)) {
         if (state.in_fenced_block) {
@@ -5869,6 +5919,7 @@ fn diffRenderColorForLine(state: *DiffRenderState, line: []const u8, palette: Pa
         return palette.accent;
     }
 
+    if (!allow_unfenced_diff) return "";
     return diffLineColor(trimmed_leading, palette);
 }
 
@@ -6246,11 +6297,12 @@ fn writeWrappedPrefixedDiff(
     var line_count: usize = 0;
     var first_line = true;
     var diff_state: DiffRenderState = .{};
+    const allow_unfenced_diff = !hasExplicitDiffFence(text);
 
     var paragraphs = std.mem.splitScalar(u8, text, '\n');
     while (paragraphs.next()) |paragraph| {
         const para = std.mem.trimRight(u8, paragraph, " ");
-        const content_color = diffRenderColorForLine(&diff_state, para, palette);
+        const content_color = diffRenderColorForLineWithMode(&diff_state, para, palette, allow_unfenced_diff);
 
         if (para.len == 0) {
             const prefix = if (first_line) first_prefix else next_prefix;
@@ -6289,6 +6341,13 @@ fn writeWrappedPrefixedDiff(
     }
 
     return line_count;
+}
+
+fn hasExplicitDiffFence(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "```diff") != null or
+        std.mem.indexOf(u8, text, "```patch") != null or
+        std.mem.indexOf(u8, text, "```udiff") != null or
+        std.mem.indexOf(u8, text, "```gitdiff") != null;
 }
 
 fn formatTokenCount(allocator: std.mem.Allocator, raw_count: i64) ![]u8 {
@@ -6687,6 +6746,23 @@ const AssistantToolCall = union(enum) {
 };
 
 fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (parseAssistantToolCallExact(trimmed)) |tool_call| {
+        return tool_call;
+    }
+
+    if (findEmbeddedToolCallStart(trimmed)) |start| {
+        if (start > 0) {
+            return parseAssistantToolCallExact(trimmed[start..]);
+        }
+    }
+
+    return null;
+}
+
+fn parseAssistantToolCallExact(text: []const u8) ?AssistantToolCall {
     if (parseListDirToolPayload(text)) |payload| {
         return .{ .list_dir = payload };
     }
@@ -6721,10 +6797,72 @@ fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
         return .{ .request_user_input = payload };
     }
     if (parseReadToolCommand(text)) |command| {
+        if (parseListDirToolPayload(command)) |payload| {
+            return .{ .list_dir = payload };
+        }
+        if (parseReadFileToolPayload(command)) |payload| {
+            return .{ .read_file = payload };
+        }
+        if (parseGrepFilesToolPayload(command)) |payload| {
+            return .{ .grep_files = payload };
+        }
+        if (parseProjectSearchToolPayload(command)) |payload| {
+            return .{ .project_search = payload };
+        }
         return .{ .read = command };
     }
     if (parseApplyPatchToolPayload(text)) |patch_text| {
         return .{ .apply_patch = patch_text };
+    }
+    return null;
+}
+
+fn findEmbeddedToolCallStart(text: []const u8) ?usize {
+    const prefixes = [_][]const u8{
+        "<LIST_DIR>",
+        "<READ_FILE>",
+        "<GREP_FILES>",
+        "<PROJECT_SEARCH>",
+        "<READ>",
+        "<EXEC_COMMAND>",
+        "<WRITE_STDIN>",
+        "<WEB_SEARCH>",
+        "<VIEW_IMAGE>",
+        "<SKILL>",
+        "<UPDATE_PLAN>",
+        "<REQUEST_USER_INPUT>",
+        "<APPLY_PATCH>",
+        "[tool]",
+        "*** Begin Patch",
+        "```list_dir",
+        "```read_file",
+        "```grep_files",
+        "```project_search",
+        "```read",
+        "```exec_command",
+        "```write_stdin",
+        "```web_search",
+        "```view_image",
+        "```skill",
+        "```update_plan",
+        "```request_user_input",
+        "```apply_patch",
+    };
+
+    var line_start: usize = 0;
+    while (line_start < text.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line = text[line_start..line_end];
+        const line_trimmed_left = std.mem.trimLeft(u8, line, " \t");
+        const leading_whitespace = line.len - line_trimmed_left.len;
+        for (prefixes) |prefix| {
+            if (std.mem.startsWith(u8, line_trimmed_left, prefix)) {
+                return line_start + leading_whitespace;
+            }
+        }
+
+        if (line_end == text.len) break;
+        line_start = line_end + 1;
     }
     return null;
 }
@@ -6816,22 +6954,22 @@ fn parseReadToolCommand(text: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, trimmed, "<READ>")) {
         const rest = trimmed["<READ>".len..];
         const close_index = std.mem.indexOf(u8, rest, "</READ>") orelse return null;
-        return std.mem.trim(u8, rest[0..close_index], " \t\r\n");
+        return finalizeReadToolCommand(rest[0..close_index]);
     }
 
     if (std.mem.startsWith(u8, trimmed, "READ:")) {
-        return std.mem.trimLeft(u8, trimmed["READ:".len..], " \t");
+        return finalizeReadToolCommand(trimmed["READ:".len..]);
     }
 
     if (std.mem.startsWith(u8, trimmed, "READ ")) {
-        return std.mem.trimLeft(u8, trimmed["READ".len..], " \t");
+        return finalizeReadToolCommand(trimmed["READ".len..]);
     }
 
     if (std.mem.startsWith(u8, trimmed, "```read")) {
         const first_newline = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
         const body = trimmed[first_newline + 1 ..];
         const close_index = std.mem.indexOf(u8, body, "```") orelse return null;
-        return std.mem.trim(u8, body[0..close_index], " \t\r\n");
+        return finalizeReadToolCommand(body[0..close_index]);
     }
 
     // Accept codex-style inline marker output:
@@ -6839,12 +6977,46 @@ fn parseReadToolCommand(text: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, trimmed, "[tool]")) {
         const after_marker = std.mem.trimLeft(u8, trimmed["[tool]".len..], " \t");
         if (after_marker.len >= 4 and std.mem.startsWith(u8, after_marker, "READ")) {
-            const command = std.mem.trimLeft(u8, after_marker["READ".len..], " \t:");
-            if (command.len > 0) return command;
+            const command = after_marker["READ".len..];
+            return finalizeReadToolCommand(command);
         }
     }
 
     return null;
+}
+
+fn finalizeReadToolCommand(command: []const u8) ?[]const u8 {
+    var trimmed = std.mem.trim(u8, command, " \t\r\n:");
+    if (trimmed.len == 0) return null;
+    trimmed = trimReadCommandTrailingNarration(trimmed);
+    if (trimmed.len == 0) return null;
+    return unwrapSingleAngleBracketReadCommand(trimmed);
+}
+
+fn trimReadCommandTrailingNarration(command: []const u8) []const u8 {
+    if (command.len == 0) return command;
+
+    // Structured payloads can legitimately span multiple lines.
+    if (std.mem.startsWith(u8, command, "<LIST_DIR>") or
+        std.mem.startsWith(u8, command, "<READ_FILE>") or
+        std.mem.startsWith(u8, command, "<GREP_FILES>") or
+        std.mem.startsWith(u8, command, "<PROJECT_SEARCH>"))
+    {
+        return command;
+    }
+
+    const newline = std.mem.indexOfScalar(u8, command, '\n') orelse return command;
+    return std.mem.trim(u8, command[0..newline], " \t\r");
+}
+
+fn unwrapSingleAngleBracketReadCommand(command: []const u8) []const u8 {
+    if (command.len < 3) return command;
+    if (command[0] != '<' or command[command.len - 1] != '>') return command;
+
+    const inner = std.mem.trim(u8, command[1 .. command.len - 1], " \t");
+    if (inner.len == 0) return command;
+    if (std.mem.indexOfAny(u8, inner, "<>\r\n") != null) return command;
+    return inner;
 }
 
 fn parseExecCommandToolPayload(text: []const u8) ?[]const u8 {
@@ -9393,6 +9565,50 @@ fn sanitizeFinalUserFacingResponseAlloc(
     return buildToolFallbackSummaryFromLastToolAlloc(allocator, last_tool_call, last_tool_summary, reason);
 }
 
+fn assistantTextNeedsForcedSummary(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return true;
+    return parseAssistantToolCall(trimmed) != null;
+}
+
+fn assistantTextNeedsToolContinuation(text: []const u8) bool {
+    return assistantTextNeedsForcedSummary(text) or assistantTextLooksDeferredAction(text);
+}
+
+fn assistantTextLooksDeferredAction(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (parseAssistantToolCall(trimmed) != null) return false;
+
+    var lower_buf: [512]u8 = undefined;
+    const sample = if (trimmed.len <= lower_buf.len) trimmed else trimmed[0..lower_buf.len];
+    for (sample, 0..) |ch, index| {
+        lower_buf[index] = std.ascii.toLower(ch);
+    }
+    const lower = lower_buf[0..sample.len];
+
+    const intent_markers = [_][]const u8{
+        "proceeding now",
+        "proceeding with",
+        "i'll proceed",
+        "i will proceed",
+        "i'll do that",
+        "i will do that",
+        "i'll add",
+        "i will add",
+        "i can wire",
+        "i can patch",
+        "i'm ready to",
+        "i am ready to",
+        "next i'll",
+        "next i will",
+    };
+    for (intent_markers) |marker| {
+        if (std.mem.indexOf(u8, lower, marker) != null) return true;
+    }
+    return false;
+}
+
 fn findNamedLineValue(text: []const u8, prefix: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw_line| {
@@ -9643,6 +9859,12 @@ test "parseReadToolCommand extracts command formats" {
     try std.testing.expectEqualStrings("ls -la", parseReadToolCommand("READ: ls -la").?);
     try std.testing.expectEqualStrings("cat src/main.zig", parseReadToolCommand("READ cat src/main.zig").?);
     try std.testing.expectEqualStrings("grep -n foo src/tui.zig", parseReadToolCommand("```read\ngrep -n foo src/tui.zig\n```").?);
+    try std.testing.expectEqualStrings("ls src", parseReadToolCommand("[tool] READ <ls src>").?);
+    try std.testing.expectEqualStrings("cat src/main.zig", parseReadToolCommand("[tool] READ <cat src/main.zig>").?);
+    try std.testing.expectEqualStrings(
+        "git status --short",
+        parseReadToolCommand("[tool] READ git status --short\nI will inspect this next.").?,
+    );
     try std.testing.expect(parseReadToolCommand("normal assistant text") == null);
 }
 
@@ -10098,6 +10320,27 @@ test "summarizeToolResultAlloc prioritizes state and error lines" {
     try std.testing.expectEqualStrings("error:command not allowed", error_summary);
 }
 
+test "assistantTextNeedsForcedSummary matches tool-like or empty outputs only" {
+    try std.testing.expect(assistantTextNeedsForcedSummary(""));
+    try std.testing.expect(assistantTextNeedsForcedSummary("   \n\t"));
+    try std.testing.expect(assistantTextNeedsForcedSummary("[tool] READ git status -sb"));
+    try std.testing.expect(!assistantTextNeedsForcedSummary("Repository is clean and synced."));
+}
+
+test "assistantTextLooksDeferredAction detects intent-only continuations" {
+    try std.testing.expect(assistantTextLooksDeferredAction("I'm ready to patch this now and will proceed."));
+    try std.testing.expect(assistantTextLooksDeferredAction("Great - I'll do that next."));
+    try std.testing.expect(!assistantTextLooksDeferredAction("I added Ctrl+T and updated keybindings."));
+    try std.testing.expect(!assistantTextLooksDeferredAction("[tool] READ git status --short"));
+}
+
+test "assistantTextNeedsToolContinuation includes empty tool markers and deferred intent" {
+    try std.testing.expect(assistantTextNeedsToolContinuation(""));
+    try std.testing.expect(assistantTextNeedsToolContinuation("[tool] READ git status --short"));
+    try std.testing.expect(assistantTextNeedsToolContinuation("I am ready to add this now."));
+    try std.testing.expect(!assistantTextNeedsToolContinuation("Implemented Ctrl+T and wired request options."));
+}
+
 test "single tool call success yields final natural language" {
     const allocator = std.testing.allocator;
     const final_text = try sanitizeFinalUserFacingResponseAlloc(
@@ -10176,6 +10419,21 @@ test "diffRenderColorForLine tracks fenced diff and code blocks" {
     _ = diffRenderColorForLine(&state, "```", palette);
 }
 
+test "diffRenderColorForLineWithMode disables unfenced list marker coloring" {
+    const palette = paletteForTheme(.codex);
+    var state: DiffRenderState = .{};
+
+    try std.testing.expectEqualStrings("", diffRenderColorForLineWithMode(&state, "- list item", palette, false));
+    try std.testing.expectEqualStrings(palette.diff_remove, diffRenderColorForLineWithMode(&state, "-removed", palette, true));
+}
+
+test "hasExplicitDiffFence detects known diff fence tags" {
+    try std.testing.expect(hasExplicitDiffFence("```diff\n+foo\n```"));
+    try std.testing.expect(hasExplicitDiffFence("```patch\n*** Begin Patch\n```"));
+    try std.testing.expect(!hasExplicitDiffFence("```zig\nconst x = 1;\n```"));
+    try std.testing.expect(!hasExplicitDiffFence("plain markdown list\n- item"));
+}
+
 test "parseAssistantToolCall detects discovery/edit/exec/web/image/skill/update/request tools" {
     const read_tool = parseAssistantToolCall("<READ>ls</READ>").?;
     switch (read_tool) {
@@ -10186,6 +10444,14 @@ test "parseAssistantToolCall detects discovery/edit/exec/web/image/skill/update/
     const list_dir_call = parseAssistantToolCall("<LIST_DIR>{\"path\":\"src\"}</LIST_DIR>").?;
     switch (list_dir_call) {
         .list_dir => |payload| try std.testing.expectEqualStrings("{\"path\":\"src\"}", payload),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const nested_list_dir_call = parseAssistantToolCall(
+        "[tool] READ <LIST_DIR>\n{\"path\":\"src\",\"recursive\":false}\n</LIST_DIR>",
+    ).?;
+    switch (nested_list_dir_call) {
+        .list_dir => |payload| try std.testing.expectEqualStrings("{\"path\":\"src\",\"recursive\":false}", payload),
         else => return error.TestUnexpectedResult,
     }
 
@@ -10267,6 +10533,12 @@ test "parseAssistantToolCall detects discovery/edit/exec/web/image/skill/update/
     const bracket_read_call = parseAssistantToolCall("[tool] READ git log --oneline -n 5").?;
     switch (bracket_read_call) {
         .read => |command| try std.testing.expectEqualStrings("git log --oneline -n 5", command),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const prefixed_read_call = parseAssistantToolCall("I'll inspect this first.\n<READ>ls src</READ>").?;
+    switch (prefixed_read_call) {
+        .read => |command| try std.testing.expectEqualStrings("ls src", command),
         else => return error.TestUnexpectedResult,
     }
 }
