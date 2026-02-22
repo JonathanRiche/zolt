@@ -17,6 +17,7 @@ const Message = @import("state.zig").Message;
 const Role = @import("state.zig").Role;
 const TokenUsage = @import("state.zig").TokenUsage;
 const Keybindings = keybindings.Keybindings;
+const log = std.log.scoped(.tui);
 
 const vaxis = @import("vaxis");
 
@@ -353,6 +354,12 @@ const COMPACT_KEEP_RECENT_MESSAGES: usize = 8;
 const COMPACT_MIN_SOURCE_MESSAGES: usize = 4;
 const COMPACT_LOCAL_FALLBACK_MAX_LINES: usize = 8;
 const COMPACT_LOCAL_FALLBACK_PREVIEW_CHARS: usize = 200;
+const REPEATED_TOOL_GUARD_OCCURRENCES: usize = 3;
+const ToolLoopGuardReason = enum {
+    none,
+    repeated_tool_call,
+    max_iterations,
+};
 const COMPACT_SUMMARY_SYSTEM_PROMPT =
     "You are compacting chat history for a coding assistant.\n" ++
     "Produce a concise summary preserving user goals, constraints, decisions, unresolved questions, and pending tasks.\n" ++
@@ -427,6 +434,7 @@ const TOOL_SYSTEM_PROMPT =
     "Use one to three questions. Each question should include two to four mutually exclusive options.\n" ++
     "Available skill names/descriptions are provided in [skills-context] messages.\n" ++
     "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], [view-image-result], [skill-result], [update-plan-result], or [request-user-input-result], continue the answer normally.\n" ++
+    "If a [read-result] reports `error: output exceeds READ limit`, immediately rerun READ with narrower scope (path/glob or head/sed).\n" ++
     "Do not end with intent-only text like \"I'll do that now\". If work remains, make the next tool call immediately.";
 const TOOL_CONTINUE_REMINDER =
     "[tool-result]\n" ++
@@ -1598,6 +1606,11 @@ const App = struct {
             return;
         }
         const auth = maybe_auth.?;
+        const conversation_id = self.app_state.currentConversationConst().id;
+        log.info(
+            "turn start conv={s} provider={s}/{s} prompt_bytes={d}",
+            .{ conversation_id, provider_id, model_id, prompt.len },
+        );
 
         self.is_streaming = true;
         self.stream_was_interrupted = false;
@@ -1644,11 +1657,6 @@ const App = struct {
             );
         }
 
-        const ToolLoopGuardReason = enum {
-            none,
-            repeated_tool_call,
-            max_iterations,
-        };
         var guard_reason: ToolLoopGuardReason = .none;
         var executed_any_tool = false;
         var step: usize = 0;
@@ -1660,8 +1668,18 @@ const App = struct {
         }
 
         tool_loop: while (step < TOOL_MAX_STEPS) : (step += 1) {
+            log.info(
+                "tool-loop step conv={s} step={d}/{d} executed_any_tool={any}",
+                .{ conversation_id, step + 1, TOOL_MAX_STEPS, executed_any_tool },
+            );
             const success = try self.streamAssistantOnce(provider_id, model_id, auth, true);
-            if (!success) break;
+            if (!success) {
+                log.info(
+                    "tool-loop stream-stop conv={s} step={d} interrupted={any} provider_error={any}",
+                    .{ conversation_id, step + 1, self.stream_was_interrupted, provider_client.lastProviderErrorDetail() != null },
+                );
+                break;
+            }
 
             var assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
             var maybe_tool_call = parseAssistantToolCall(assistant_message.content);
@@ -1670,16 +1688,41 @@ const App = struct {
                 tool_continue_attempts < TOOL_CONTINUE_MAX_ATTEMPTS and
                 assistantTextNeedsToolContinuation(assistant_message.content))
             {
+                const needs_forced_summary = assistantTextNeedsForcedSummary(assistant_message.content);
+                const looks_deferred = assistantTextLooksDeferredAction(assistant_message.content);
                 tool_continue_attempts += 1;
+                log.warn(
+                    "tool-loop continue-nudge conv={s} step={d} attempt={d}/{d} reason={s}",
+                    .{
+                        conversation_id,
+                        step + 1,
+                        tool_continue_attempts,
+                        TOOL_CONTINUE_MAX_ATTEMPTS,
+                        if (needs_forced_summary and looks_deferred) "forced+deferred" else if (needs_forced_summary) "forced_summary" else "deferred_action",
+                    },
+                );
                 try self.app_state.appendMessage(self.allocator, .system, TOOL_CONTINUE_REMINDER);
                 try self.app_state.appendMessage(self.allocator, .assistant, "");
                 const follow_success = try self.streamAssistantOnce(provider_id, model_id, auth, true);
-                if (!follow_success) break :tool_loop;
+                if (!follow_success) {
+                    log.info(
+                        "tool-loop continue-nudge-stop conv={s} step={d} interrupted={any} provider_error={any}",
+                        .{ conversation_id, step + 1, self.stream_was_interrupted, provider_client.lastProviderErrorDetail() != null },
+                    );
+                    break :tool_loop;
+                }
                 assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
                 maybe_tool_call = parseAssistantToolCall(assistant_message.content);
             }
 
-            const tool_call = maybe_tool_call orelse break;
+            const tool_call = maybe_tool_call orelse {
+                const trimmed = std.mem.trim(u8, assistant_message.content, " \t\r\n");
+                log.info(
+                    "tool-loop no-tool-response conv={s} step={d} assistant_bytes={d}",
+                    .{ conversation_id, step + 1, trimmed.len },
+                );
+                break;
+            };
             switch (tool_call) {
                 .read => |read_command| {
                     self.stream_task = .running_read;
@@ -2057,6 +2100,20 @@ const App = struct {
         if (guard_reason == .none and step == TOOL_MAX_STEPS and last_is_tool_marker and !self.stream_was_interrupted) {
             guard_reason = .max_iterations;
         }
+
+        log.info(
+            "tool-loop stop conv={s} steps={d} guard={s} executed_any_tool={any} continue_attempts={d} interrupted={any} provider_error={any} needs_forced_summary={any}",
+            .{
+                conversation_id,
+                step,
+                toolLoopGuardReasonLabel(guard_reason),
+                executed_any_tool,
+                tool_continue_attempts,
+                self.stream_was_interrupted,
+                provider_client.lastProviderErrorDetail() != null,
+                last_assistant_needs_forced_summary,
+            },
+        );
 
         if (!self.stream_was_interrupted and
             provider_client.lastProviderErrorDetail() == null and
@@ -9629,6 +9686,14 @@ fn firstNonEmptyLine(text: []const u8) ?[]const u8 {
     return null;
 }
 
+fn toolLoopGuardReasonLabel(reason: ToolLoopGuardReason) []const u8 {
+    return switch (reason) {
+        .none => "none",
+        .repeated_tool_call => "repeated_tool_call",
+        .max_iterations => "max_iterations",
+    };
+}
+
 fn didRepeatToolExecution(
     allocator: std.mem.Allocator,
     seen_signatures: *std.ArrayList([]u8),
@@ -9642,14 +9707,14 @@ fn didRepeatToolExecution(
         .{ tool_name, args, result },
     );
 
+    var seen_count: usize = 0;
     for (seen_signatures.items) |existing| {
         if (std.mem.eql(u8, existing, signature)) {
-            allocator.free(signature);
-            return true;
+            seen_count += 1;
         }
     }
     try seen_signatures.append(allocator, signature);
-    return false;
+    return seen_count + 1 >= REPEATED_TOOL_GUARD_OCCURRENCES;
 }
 
 fn isAllowedReadCommand(argv: []const []const u8) bool {
@@ -10366,6 +10431,13 @@ test "repeated tool call loop breaks and uses fallback summary" {
         seen.deinit(allocator);
     }
 
+    try std.testing.expect(!(try didRepeatToolExecution(
+        allocator,
+        &seen,
+        "EXEC_COMMAND",
+        "{\"cmd\":\"ls\"}",
+        "[exec-result]\nstate: exited:0\n",
+    )));
     try std.testing.expect(!(try didRepeatToolExecution(
         allocator,
         &seen,

@@ -35,6 +35,9 @@ pub fn run(app: anytype, command_text: []const u8) ![]u8 {
         .cwd = ".",
         .max_output_bytes = common.READ_TOOL_MAX_OUTPUT_BYTES,
     }) catch |err| {
+        if (err == error.StdoutStreamTooLong or err == error.StderrStreamTooLong) {
+            return formatReadToolOverflowErrorAlloc(app.allocator, command_text, argv.items[0]);
+        }
         return std.fmt.allocPrint(
             app.allocator,
             "[read-result]\ncommand: {s}\nerror: {s}",
@@ -74,6 +77,29 @@ pub fn run(app: anytype, command_text: []const u8) ![]u8 {
     return output.toOwnedSlice();
 }
 
+fn formatReadToolOverflowErrorAlloc(
+    allocator: std.mem.Allocator,
+    command_text: []const u8,
+    command_name: []const u8,
+) ![]u8 {
+    const hint = overflowHintForCommand(command_name);
+    return std.fmt.allocPrint(
+        allocator,
+        "[read-result]\ncommand: {s}\nerror: output exceeds READ limit ({d} bytes)\nhint: {s}",
+        .{ command_text, common.READ_TOOL_MAX_OUTPUT_BYTES, hint },
+    );
+}
+
+fn overflowHintForCommand(command_name: []const u8) []const u8 {
+    if (std.mem.eql(u8, command_name, "rg") or std.mem.eql(u8, command_name, "grep")) {
+        return "narrow the search path/glob and rerun READ (example: `rg -n \"pattern\" src/tui.zig`).";
+    }
+    if (std.mem.eql(u8, command_name, "cat")) {
+        return "read a smaller slice with head/tail/sed (example: `sed -n '1,200p' <file>`).";
+    }
+    return "rerun READ with a narrower command (smaller path/scope) to keep output short.";
+}
+
 fn isAllowedReadCommand(argv: []const []const u8) bool {
     if (argv.len == 0) return false;
     const command = argv[0];
@@ -95,4 +121,21 @@ fn isAllowedReadGitCommand(args: []const []const u8) bool {
     const allowlist = [_][]const u8{ "status", "diff", "show", "log", "rev-parse", "ls-files" };
     for (allowlist) |allowed| if (std.mem.eql(u8, subcommand, allowed)) return true;
     return false;
+}
+
+test "overflowHintForCommand prefers rg specific guidance" {
+    try std.testing.expectEqualStrings(
+        "narrow the search path/glob and rerun READ (example: `rg -n \"pattern\" src/tui.zig`).",
+        overflowHintForCommand("rg"),
+    );
+}
+
+test "formatReadToolOverflowErrorAlloc includes limit and hint" {
+    const allocator = std.testing.allocator;
+    const message = try formatReadToolOverflowErrorAlloc(allocator, "rg -n foo src", "rg");
+    defer allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "output exceeds READ limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "24576 bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "hint: narrow the search path/glob") != null);
 }
