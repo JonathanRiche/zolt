@@ -1,4 +1,4 @@
-//! Path discovery and filesystem locations for zig-ai.
+//! Path discovery and filesystem locations for zolt.
 
 const std = @import("std");
 const SCOPE_DIR_NAME = "workspaces";
@@ -17,10 +17,10 @@ pub const Paths = struct {
         const cache_home = try xdgHome(allocator, "XDG_CACHE_HOME", ".cache");
         defer allocator.free(cache_home);
 
-        const data_dir = try std.fs.path.join(allocator, &.{ data_home, "zig-ai" });
+        const data_dir = try std.fs.path.join(allocator, &.{ data_home, "zolt" });
         errdefer allocator.free(data_dir);
 
-        const cache_dir = try std.fs.path.join(allocator, &.{ cache_home, "zig-ai" });
+        const cache_dir = try std.fs.path.join(allocator, &.{ cache_home, "zolt" });
         errdefer allocator.free(cache_dir);
 
         const scope_root = try resolveWorkspaceScopeRoot(allocator);
@@ -51,7 +51,7 @@ pub const Paths = struct {
         const scope_root = try resolveWorkspaceScopeRoot(allocator);
         defer allocator.free(scope_root);
 
-        const base_dir = try std.fs.path.join(allocator, &.{ scope_root, ".zig-ai" });
+        const base_dir = try std.fs.path.join(allocator, &.{ scope_root, ".zolt" });
         defer allocator.free(base_dir);
 
         const data_dir = try std.fs.path.join(allocator, &.{ base_dir, "data" });

@@ -139,7 +139,7 @@ fn mainImpl() !void {
 
     paths.ensureDirs() catch |err| switch (err) {
         error.AccessDenied, error.PermissionDenied => {
-            std.log.warn("cannot use XDG dirs ({s}), falling back to workspace-local .zig-ai", .{@errorName(err)});
+            std.log.warn("cannot use XDG dirs ({s}), falling back to workspace-local .zolt", .{@errorName(err)});
             paths.deinit(allocator);
             paths = try Paths.initWorkspaceFallback(allocator);
             try paths.ensureDirs();
@@ -148,7 +148,7 @@ fn mainImpl() !void {
     };
     probePathsWritable(allocator, &paths) catch |err| switch (err) {
         error.AccessDenied, error.PermissionDenied => {
-            std.log.warn("XDG path is not writable ({s}), using workspace-local .zig-ai", .{@errorName(err)});
+            std.log.warn("XDG path is not writable ({s}), using workspace-local .zolt", .{@errorName(err)});
             paths.deinit(allocator);
             paths = try Paths.initWorkspaceFallback(allocator);
             try paths.ensureDirs();

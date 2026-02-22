@@ -405,22 +405,20 @@ Quoted paths are supported for spaces:
 
 Default XDG paths:
 
-- state: `~/.local/share/zig-ai/workspaces/<scope>.json`
-- models cache: `~/.cache/zig-ai/models.json`
-- runtime log: `~/.local/share/zig-ai/logs/runtime.log`
-- crash report log: `~/.local/share/zig-ai/logs/crash.log`
-
-Note: the storage directory name is currently `zig-ai` (legacy) even though the binary/app name is `zolt`.
+- state: `~/.local/share/zolt/workspaces/<scope>.json`
+- models cache: `~/.cache/zolt/models.json`
+- runtime log: `~/.local/share/zolt/logs/runtime.log`
+- crash report log: `~/.local/share/zolt/logs/crash.log`
 
 `<scope>` is derived from your git root when available (or current directory otherwise),
 so conversations are automatically scoped per project/workspace.
 
 If XDG paths are unavailable/unwritable, Zolt falls back to:
 
-- `<workspace-root>/.zig-ai/data/workspaces/<scope>.json`
-- `<workspace-root>/.zig-ai/cache/models.json`
-- `<workspace-root>/.zig-ai/data/logs/runtime.log`
-- `<workspace-root>/.zig-ai/data/logs/crash.log`
+- `<workspace-root>/.zolt/data/workspaces/<scope>.json`
+- `<workspace-root>/.zolt/cache/models.json`
+- `<workspace-root>/.zolt/data/logs/runtime.log`
+- `<workspace-root>/.zolt/data/logs/crash.log`
 
 Logging verbosity defaults to `info`. Set `ZOLT_LOG_LEVEL` to `debug`, `info`, `warn`, or `err` to control runtime log volume.
 When a log exceeds 2 MiB, Zolt rotates it to `runtime.log.1` / `crash.log.1` and starts a fresh file.
