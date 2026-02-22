@@ -13,6 +13,9 @@ const tui = @import("tui.zig");
 const APP_VERSION = "0.1.0-dev";
 const RUNTIME_LOG_FILE_NAME = "runtime.log";
 const CRASH_LOG_FILE_NAME = "crash.log";
+const LOG_ROTATED_SUFFIX = ".1";
+const RUNTIME_LOG_ROTATE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const CRASH_LOG_ROTATE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 const RuntimeLogState = struct {
     mutex: std.Thread.Mutex = .{},
@@ -1461,7 +1464,7 @@ fn appendRuntimeBootstrapLine() void {
     if (runtime_log_state.runtime_log_path_len == 0) return;
     const path = runtime_log_state.runtime_log_path[0..runtime_log_state.runtime_log_path_len];
 
-    var file = openAppendFileForPath(path) catch return;
+    var file = openAppendFileForPath(path, RUNTIME_LOG_ROTATE_MAX_BYTES) catch return;
     defer file.close();
 
     var write_buffer: [1024]u8 = undefined;
@@ -1516,7 +1519,7 @@ fn appendRuntimeLogLineToFile(
     if (runtime_log_state.runtime_log_path_len == 0) return;
     const path = runtime_log_state.runtime_log_path[0..runtime_log_state.runtime_log_path_len];
 
-    var file = openAppendFileForPath(path) catch return;
+    var file = openAppendFileForPath(path, RUNTIME_LOG_ROTATE_MAX_BYTES) catch return;
     defer file.close();
 
     var write_buffer: [4096]u8 = undefined;
@@ -1540,7 +1543,7 @@ fn writePanicReport(msg: []const u8, first_trace_addr: ?usize) void {
     if (runtime_log_state.crash_log_path_len == 0) return;
     const path = runtime_log_state.crash_log_path[0..runtime_log_state.crash_log_path_len];
 
-    var file = openAppendFileForPath(path) catch return;
+    var file = openAppendFileForPath(path, CRASH_LOG_ROTATE_MAX_BYTES) catch return;
     defer file.close();
 
     var write_buffer: [4096]u8 = undefined;
@@ -1561,7 +1564,7 @@ fn writeUnhandledErrorReport(err: anyerror) void {
     if (runtime_log_state.crash_log_path_len == 0) return;
     const path = runtime_log_state.crash_log_path[0..runtime_log_state.crash_log_path_len];
 
-    var file = openAppendFileForPath(path) catch return;
+    var file = openAppendFileForPath(path, CRASH_LOG_ROTATE_MAX_BYTES) catch return;
     defer file.close();
 
     var write_buffer: [4096]u8 = undefined;
@@ -1585,7 +1588,9 @@ fn writeStderrWarning(comptime format: []const u8, args: anytype) void {
     nosuspend stderr_writer.interface.print(format, args) catch {};
 }
 
-fn openAppendFileForPath(path: []const u8) !std.fs.File {
+fn openAppendFileForPath(path: []const u8, max_bytes_before_rotate: u64) !std.fs.File {
+    rotateLogFileIfNeeded(path, max_bytes_before_rotate);
+
     var file = openFileForPath(path, .{ .mode = .write_only }) catch |err| switch (err) {
         error.FileNotFound => try createFileForPath(path, .{ .truncate = false }),
         else => return err,
@@ -1594,6 +1599,23 @@ fn openAppendFileForPath(path: []const u8) !std.fs.File {
 
     try file.seekFromEnd(0);
     return file;
+}
+
+fn rotateLogFileIfNeeded(path: []const u8, max_bytes_before_rotate: u64) void {
+    const stat = statFileForPath(path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return,
+    };
+    if (stat.size < max_bytes_before_rotate) return;
+
+    var rotated_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const rotated_path = std.fmt.bufPrint(&rotated_path_buffer, "{s}{s}", .{ path, LOG_ROTATED_SUFFIX }) catch return;
+
+    deleteFileForPath(rotated_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return,
+    };
+    renameFileForPath(path, rotated_path) catch {};
 }
 
 fn createFileForPath(path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
@@ -1608,6 +1630,17 @@ fn openFileForPath(path: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File 
         return std.fs.openFileAbsolute(path, flags);
     }
     return std.fs.cwd().openFile(path, flags);
+}
+
+fn statFileForPath(path: []const u8) !std.fs.File.Stat {
+    return std.fs.cwd().statFile(path);
+}
+
+fn renameFileForPath(old_path: []const u8, new_path: []const u8) !void {
+    if (std.fs.path.isAbsolute(old_path) and std.fs.path.isAbsolute(new_path)) {
+        return std.fs.renameAbsolute(old_path, new_path);
+    }
+    return std.fs.cwd().rename(old_path, new_path);
 }
 
 fn deleteFileForPath(path: []const u8) !void {
@@ -1663,6 +1696,34 @@ test "appendRuntimeLogLineToFile writes log records" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, content, 1, "100 [info] (default) first 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, content, 1, "101 [warning] (default) second"));
+}
+
+test "rotateLogFileIfNeeded rotates to .1 when size exceeds threshold" {
+    const allocator = std.testing.allocator;
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const abs_dir = try temp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs_dir);
+
+    const log_path = try std.fs.path.join(allocator, &.{ abs_dir, "runtime.log" });
+    defer allocator.free(log_path);
+
+    const rotated_path = try std.fs.path.join(allocator, &.{ abs_dir, "runtime.log.1" });
+    defer allocator.free(rotated_path);
+
+    var file = try std.fs.createFileAbsolute(log_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("12345678901234567890");
+
+    rotateLogFileIfNeeded(log_path, 8);
+
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(log_path, .{}));
+
+    var rotated_file = try std.fs.openFileAbsolute(rotated_path, .{});
+    defer rotated_file.close();
+    const rotated_stat = try rotated_file.stat();
+    try std.testing.expect(rotated_stat.size >= 20);
 }
 
 test "parseCliAction recognizes help aliases" {

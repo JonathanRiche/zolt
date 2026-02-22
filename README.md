@@ -40,6 +40,7 @@ It is intentionally lightweight but keeps the UX patterns that matter for daily 
   - `READ` (allowlisted shell read commands)
   - `LIST_DIR`, `READ_FILE`, `GREP_FILES`, `PROJECT_SEARCH`
   - `APPLY_PATCH`, `EXEC_COMMAND`, `WRITE_STDIN`, `WEB_SEARCH` (DuckDuckGo default, Exa optional), `VIEW_IMAGE`, `SKILL`, `UPDATE_PLAN`, `REQUEST_USER_INPUT` (non-blocking inline)
+- Runtime/crash logging with `/logs` command and size-based log rotation (`*.log.1`)
 
 ## Requirements
 
@@ -312,6 +313,7 @@ Picker triggers:
 - `/model [id]`
 - `/models [refresh]`
 - `/files [refresh]`
+- `/logs [runtime|crash]` (show log paths and file size/status)
 - `/skills [name|refresh]` (list, inspect, or reload discovered skills)
 - `/new [title]`
 - `/sessions [id]` (no id opens conversation picker)
@@ -421,6 +423,7 @@ If XDG paths are unavailable/unwritable, Zolt falls back to:
 - `<workspace-root>/.zig-ai/data/logs/crash.log`
 
 Logging verbosity defaults to `info`. Set `ZOLT_LOG_LEVEL` to `debug`, `info`, `warn`, or `err` to control runtime log volume.
+When a log exceeds 2 MiB, Zolt rotates it to `runtime.log.1` / `crash.log.1` and starts a fresh file.
 
 ## Development
 

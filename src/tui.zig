@@ -3504,6 +3504,48 @@ const App = struct {
             return;
         }
 
+        if (std.mem.eql(u8, command, "logs")) {
+            const action = parts.next();
+            if (parts.next() != null) {
+                try self.setNotice("Usage: /logs [runtime|crash]");
+                return;
+            }
+
+            if (action == null) {
+                const runtime_path = try self.logFilePathAlloc("runtime.log");
+                defer self.allocator.free(runtime_path);
+                const crash_path = try self.logFilePathAlloc("crash.log");
+                defer self.allocator.free(crash_path);
+                try self.setNoticeFmt("Logs: runtime {s} | crash {s}", .{ runtime_path, crash_path });
+                return;
+            }
+
+            const is_runtime = std.mem.eql(u8, action.?, "runtime");
+            const is_crash = std.mem.eql(u8, action.?, "crash");
+            if (!is_runtime and !is_crash) {
+                try self.setNotice("Usage: /logs [runtime|crash]");
+                return;
+            }
+
+            const label = if (is_runtime) "runtime" else "crash";
+            const path = try self.logFilePathAlloc(if (is_runtime) "runtime.log" else "crash.log");
+            defer self.allocator.free(path);
+
+            const stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => {
+                    try self.setNoticeFmt("failed to read {s} log path ({s}): {s}", .{ label, path, @errorName(err) });
+                    return;
+                },
+            };
+            if (stat) |file_stat| {
+                try self.setNoticeFmt("{s} log: {s} ({d} bytes)", .{ label, path, file_stat.size });
+            } else {
+                try self.setNoticeFmt("{s} log: {s} (not created yet)", .{ label, path });
+            }
+            return;
+        }
+
         if (std.mem.eql(u8, command, "skills")) {
             const action = parts.next();
             if (action != null and std.mem.eql(u8, action.?, "refresh")) {
@@ -3705,6 +3747,10 @@ const App = struct {
         }
 
         try self.setNoticeFmt("Unknown command: /{s}", .{command});
+    }
+
+    fn logFilePathAlloc(self: *App, file_name: []const u8) ![]u8 {
+        return std.fs.path.join(self.allocator, &.{ self.paths.data_dir, "logs", file_name });
     }
 
     pub fn resolveApiKey(self: *App, provider_id: []const u8) !?[]u8 {
@@ -5091,6 +5137,9 @@ const App = struct {
             .refresh_file_index => {
                 try self.handleCommand("/files refresh");
             },
+            .open_logs => {
+                try self.handleCommand("/logs");
+            },
             .toggle_ui_density => {
                 if (self.compact_mode) {
                     try self.handleCommand("/ui comfy");
@@ -6331,6 +6380,7 @@ const QuickActionId = enum {
     compact_session,
     refresh_models_cache,
     refresh_file_index,
+    open_logs,
     toggle_ui_density,
     toggle_theme,
     show_help,
@@ -6360,6 +6410,7 @@ const BUILTIN_COMMANDS = [_]BuiltinCommandEntry{
     .{ .name = "model", .description = "pick or set model id" },
     .{ .name = "models", .description = "list models cache / refresh" },
     .{ .name = "files", .description = "show file index / refresh" },
+    .{ .name = "logs", .description = "show runtime/crash log file paths" },
     .{ .name = "skills", .description = "list skill catalog / refresh / inspect" },
     .{ .name = "compact", .description = "compact conversation / auto [on|off]" },
     .{ .name = "new", .description = "create conversation" },
@@ -6380,6 +6431,7 @@ const QUICK_ACTIONS = [_]QuickActionEntry{
     .{ .id = .compact_session, .label = "Compact session", .description = "run /compact now", .keywords = "compact context summarize" },
     .{ .id = .refresh_models_cache, .label = "Refresh models cache", .description = "run /models refresh", .keywords = "models cache reload" },
     .{ .id = .refresh_file_index, .label = "Refresh file index", .description = "run /files refresh", .keywords = "files index rg" },
+    .{ .id = .open_logs, .label = "Open logs", .description = "show runtime/crash log paths", .keywords = "logs crash runtime" },
     .{ .id = .toggle_ui_density, .label = "Toggle UI density", .description = "switch compact/comfy UI", .keywords = "compact comfy ui" },
     .{ .id = .toggle_theme, .label = "Toggle theme", .description = "cycle codex/plain/forest", .keywords = "theme colors" },
     .{ .id = .show_help, .label = "Show help", .description = "open command palette", .keywords = "help commands palette" },
