@@ -1683,13 +1683,12 @@ const App = struct {
 
             var assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
             var maybe_tool_call = parseAssistantToolCall(assistant_message.content);
-            while (maybe_tool_call == null and
-                executed_any_tool and
-                tool_continue_attempts < TOOL_CONTINUE_MAX_ATTEMPTS and
-                assistantTextNeedsToolContinuation(assistant_message.content))
-            {
+            while (maybe_tool_call == null and tool_continue_attempts < TOOL_CONTINUE_MAX_ATTEMPTS) {
                 const needs_forced_summary = assistantTextNeedsForcedSummary(assistant_message.content);
                 const looks_deferred = assistantTextLooksDeferredAction(assistant_message.content);
+                const should_continue =
+                    if (executed_any_tool) assistantTextNeedsToolContinuation(assistant_message.content) else looks_deferred;
+                if (!should_continue) break;
                 tool_continue_attempts += 1;
                 log.warn(
                     "tool-loop continue-nudge conv={s} step={d} attempt={d}/{d} reason={s}",
@@ -1698,7 +1697,14 @@ const App = struct {
                         step + 1,
                         tool_continue_attempts,
                         TOOL_CONTINUE_MAX_ATTEMPTS,
-                        if (needs_forced_summary and looks_deferred) "forced+deferred" else if (needs_forced_summary) "forced_summary" else "deferred_action",
+                        if (!executed_any_tool and looks_deferred)
+                            "deferred_action_pre_tool"
+                        else if (needs_forced_summary and looks_deferred)
+                            "forced+deferred"
+                        else if (needs_forced_summary)
+                            "forced_summary"
+                        else
+                            "deferred_action",
                     },
                 );
                 try self.app_state.appendMessage(self.allocator, .system, TOOL_CONTINUE_REMINDER);
@@ -9647,12 +9653,21 @@ fn assistantTextLooksDeferredAction(text: []const u8) bool {
     const intent_markers = [_][]const u8{
         "proceeding now",
         "proceeding with",
+        "proceed with",
         "i'll proceed",
         "i will proceed",
         "i'll do that",
         "i will do that",
         "i'll add",
         "i will add",
+        "i'll check",
+        "i will check",
+        "i'll inspect",
+        "i will inspect",
+        "i need to inspect",
+        "i need to check",
+        "let me inspect",
+        "let me check",
         "i can wire",
         "i can patch",
         "i'm ready to",
@@ -10395,6 +10410,8 @@ test "assistantTextNeedsForcedSummary matches tool-like or empty outputs only" {
 test "assistantTextLooksDeferredAction detects intent-only continuations" {
     try std.testing.expect(assistantTextLooksDeferredAction("I'm ready to patch this now and will proceed."));
     try std.testing.expect(assistantTextLooksDeferredAction("Great - I'll do that next."));
+    try std.testing.expect(assistantTextLooksDeferredAction("Got it - I'll proceed with narrower file-by-file edits next."));
+    try std.testing.expect(assistantTextLooksDeferredAction("To do this cleanly, I need to inspect the keybinding code first."));
     try std.testing.expect(!assistantTextLooksDeferredAction("I added Ctrl+T and updated keybindings."));
     try std.testing.expect(!assistantTextLooksDeferredAction("[tool] READ git status --short"));
 }
