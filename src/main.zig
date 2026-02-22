@@ -11,6 +11,26 @@ const Conversation = @import("state.zig").Conversation;
 const TokenUsage = @import("state.zig").TokenUsage;
 const tui = @import("tui.zig");
 const APP_VERSION = "0.1.0-dev";
+const RUNTIME_LOG_FILE_NAME = "runtime.log";
+const CRASH_LOG_FILE_NAME = "crash.log";
+
+const RuntimeLogState = struct {
+    mutex: std.Thread.Mutex = .{},
+    minimum_level: std.log.Level = .info,
+    runtime_log_path: [std.fs.max_path_bytes]u8 = undefined,
+    runtime_log_path_len: usize = 0,
+    crash_log_path: [std.fs.max_path_bytes]u8 = undefined,
+    crash_log_path_len: usize = 0,
+};
+
+var runtime_log_state: RuntimeLogState = .{};
+
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = runtimeLogFn,
+};
+
+pub const panic = std.debug.FullPanic(runtimePanicHandler);
 
 const CliRunOptions = struct {
     session_id: ?[]const u8 = null,
@@ -67,6 +87,13 @@ const CliAction = union(enum) {
 };
 
 pub fn main() !void {
+    mainImpl() catch |err| {
+        writeUnhandledErrorReport(err);
+        return err;
+    };
+}
+
+fn mainImpl() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
@@ -127,6 +154,8 @@ pub fn main() !void {
         else => return err,
     };
     defer paths.deinit(allocator);
+
+    initRuntimeLogging(allocator, &paths);
 
     var config = app_config.loadOptionalFromPath(allocator, paths.config_path) catch |err| blk: {
         std.log.warn("failed to load config ({s}): {s}", .{ paths.config_path, @errorName(err) });
@@ -1344,6 +1373,229 @@ fn probePathsWritable(allocator: std.mem.Allocator, paths: *const Paths) !void {
     try deleteFileForPath(probe_models);
 }
 
+fn initRuntimeLogging(allocator: std.mem.Allocator, paths: *const Paths) void {
+    const minimum_level = resolveRuntimeLogLevelFromEnv(allocator);
+
+    const logs_dir = std.fs.path.join(allocator, &.{ paths.data_dir, "logs" }) catch {
+        writeStderrWarning("warning: failed to initialize runtime logging (log dir alloc failed)\n", .{});
+        return;
+    };
+    defer allocator.free(logs_dir);
+
+    std.fs.cwd().makePath(logs_dir) catch |err| {
+        writeStderrWarning(
+            "warning: failed to initialize runtime logging (cannot create {s}: {s})\n",
+            .{ logs_dir, @errorName(err) },
+        );
+        return;
+    };
+
+    const runtime_log_path = std.fs.path.join(allocator, &.{ logs_dir, RUNTIME_LOG_FILE_NAME }) catch {
+        writeStderrWarning("warning: failed to initialize runtime logging (runtime path alloc failed)\n", .{});
+        return;
+    };
+    defer allocator.free(runtime_log_path);
+
+    const crash_log_path = std.fs.path.join(allocator, &.{ logs_dir, CRASH_LOG_FILE_NAME }) catch {
+        writeStderrWarning("warning: failed to initialize runtime logging (crash path alloc failed)\n", .{});
+        return;
+    };
+    defer allocator.free(crash_log_path);
+
+    if (!setRuntimeLogPaths(runtime_log_path, crash_log_path, minimum_level)) {
+        writeStderrWarning("warning: failed to initialize runtime logging (path too long)\n", .{});
+        return;
+    }
+
+    appendRuntimeBootstrapLine();
+}
+
+fn setRuntimeLogPaths(runtime_log_path: []const u8, crash_log_path: []const u8, minimum_level: std.log.Level) bool {
+    if (runtime_log_path.len == 0 or runtime_log_path.len >= std.fs.max_path_bytes) return false;
+    if (crash_log_path.len == 0 or crash_log_path.len >= std.fs.max_path_bytes) return false;
+
+    runtime_log_state.mutex.lock();
+    defer runtime_log_state.mutex.unlock();
+
+    runtime_log_state.minimum_level = minimum_level;
+    @memcpy(runtime_log_state.runtime_log_path[0..runtime_log_path.len], runtime_log_path);
+    runtime_log_state.runtime_log_path_len = runtime_log_path.len;
+
+    @memcpy(runtime_log_state.crash_log_path[0..crash_log_path.len], crash_log_path);
+    runtime_log_state.crash_log_path_len = crash_log_path.len;
+    return true;
+}
+
+fn resolveRuntimeLogLevelFromEnv(allocator: std.mem.Allocator) std.log.Level {
+    const raw = std.process.getEnvVarOwned(allocator, "ZOLT_LOG_LEVEL") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return .info,
+        else => return .info,
+    };
+    defer allocator.free(raw);
+
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (parseRuntimeLogLevel(value)) |level| return level;
+
+    writeStderrWarning("warning: invalid ZOLT_LOG_LEVEL `{s}`; using info\n", .{value});
+    return .info;
+}
+
+fn parseRuntimeLogLevel(value: []const u8) ?std.log.Level {
+    if (std.ascii.eqlIgnoreCase(value, "debug")) return .debug;
+    if (std.ascii.eqlIgnoreCase(value, "info")) return .info;
+    if (std.ascii.eqlIgnoreCase(value, "warn") or std.ascii.eqlIgnoreCase(value, "warning")) return .warn;
+    if (std.ascii.eqlIgnoreCase(value, "err") or std.ascii.eqlIgnoreCase(value, "error")) return .err;
+    return null;
+}
+
+fn shouldEmitRuntimeLog(level: std.log.Level) bool {
+    runtime_log_state.mutex.lock();
+    defer runtime_log_state.mutex.unlock();
+    return @intFromEnum(level) <= @intFromEnum(runtime_log_state.minimum_level);
+}
+
+fn appendRuntimeBootstrapLine() void {
+    if (!runtime_log_state.mutex.tryLock()) return;
+    defer runtime_log_state.mutex.unlock();
+
+    if (runtime_log_state.runtime_log_path_len == 0) return;
+    const path = runtime_log_state.runtime_log_path[0..runtime_log_state.runtime_log_path_len];
+
+    var file = openAppendFileForPath(path) catch return;
+    defer file.close();
+
+    var write_buffer: [1024]u8 = undefined;
+    var writer = file.writerStreaming(&write_buffer);
+    defer writer.interface.flush() catch {};
+
+    const now_ms = std.time.milliTimestamp();
+    nosuspend writer.interface.print(
+        "{d} [info] (bootstrap) runtime logging initialized (version={s}, zig={s})\n",
+        .{ now_ms, APP_VERSION, builtin.zig_version_string },
+    ) catch {};
+}
+
+fn runtimeLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (!shouldEmitRuntimeLog(level)) return;
+
+    const now_ms = std.time.milliTimestamp();
+    const level_tag = comptime level.asText();
+    const scope_tag = @tagName(scope);
+
+    {
+        std.debug.lockStdErr();
+        defer std.debug.unlockStdErr();
+
+        var stderr_buffer: [2048]u8 = undefined;
+        var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+        defer stderr_writer.interface.flush() catch {};
+
+        nosuspend stderr_writer.interface.print("{d} [{s}] ({s}) ", .{ now_ms, level_tag, scope_tag }) catch {};
+        nosuspend stderr_writer.interface.print(format, args) catch {};
+        nosuspend stderr_writer.interface.writeByte('\n') catch {};
+    }
+
+    appendRuntimeLogLineToFile(now_ms, level, scope, format, args);
+}
+
+fn appendRuntimeLogLineToFile(
+    timestamp_ms: i64,
+    comptime level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (!runtime_log_state.mutex.tryLock()) return;
+    defer runtime_log_state.mutex.unlock();
+
+    if (runtime_log_state.runtime_log_path_len == 0) return;
+    const path = runtime_log_state.runtime_log_path[0..runtime_log_state.runtime_log_path_len];
+
+    var file = openAppendFileForPath(path) catch return;
+    defer file.close();
+
+    var write_buffer: [4096]u8 = undefined;
+    var writer = file.writerStreaming(&write_buffer);
+    defer writer.interface.flush() catch {};
+
+    nosuspend writer.interface.print("{d} [{s}] ({s}) ", .{ timestamp_ms, comptime level.asText(), @tagName(scope) }) catch {};
+    nosuspend writer.interface.print(format, args) catch {};
+    nosuspend writer.interface.writeByte('\n') catch {};
+}
+
+fn runtimePanicHandler(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    writePanicReport(msg, first_trace_addr);
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
+fn writePanicReport(msg: []const u8, first_trace_addr: ?usize) void {
+    if (!runtime_log_state.mutex.tryLock()) return;
+    defer runtime_log_state.mutex.unlock();
+
+    if (runtime_log_state.crash_log_path_len == 0) return;
+    const path = runtime_log_state.crash_log_path[0..runtime_log_state.crash_log_path_len];
+
+    var file = openAppendFileForPath(path) catch return;
+    defer file.close();
+
+    var write_buffer: [4096]u8 = undefined;
+    var writer = file.writerStreaming(&write_buffer);
+    defer writer.interface.flush() catch {};
+
+    const now_ms = std.time.milliTimestamp();
+    nosuspend writer.interface.print("{d} panic: {s}\n", .{ now_ms, msg }) catch {};
+    nosuspend writer.interface.print("{d} stack_trace:\n", .{now_ms}) catch {};
+    std.debug.dumpCurrentStackTraceToWriter(first_trace_addr, &writer.interface) catch {};
+    nosuspend writer.interface.writeByte('\n') catch {};
+}
+
+fn writeUnhandledErrorReport(err: anyerror) void {
+    if (!runtime_log_state.mutex.tryLock()) return;
+    defer runtime_log_state.mutex.unlock();
+
+    if (runtime_log_state.crash_log_path_len == 0) return;
+    const path = runtime_log_state.crash_log_path[0..runtime_log_state.crash_log_path_len];
+
+    var file = openAppendFileForPath(path) catch return;
+    defer file.close();
+
+    var write_buffer: [4096]u8 = undefined;
+    var writer = file.writerStreaming(&write_buffer);
+    defer writer.interface.flush() catch {};
+
+    const now_ms = std.time.milliTimestamp();
+    nosuspend writer.interface.print("{d} unhandled_error: {s}\n", .{ now_ms, @errorName(err) }) catch {};
+    nosuspend writer.interface.print("{d} stack_trace:\n", .{now_ms}) catch {};
+    std.debug.dumpCurrentStackTraceToWriter(null, &writer.interface) catch {};
+    nosuspend writer.interface.writeByte('\n') catch {};
+}
+
+fn writeStderrWarning(comptime format: []const u8, args: anytype) void {
+    std.debug.lockStdErr();
+    defer std.debug.unlockStdErr();
+
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    defer stderr_writer.interface.flush() catch {};
+    nosuspend stderr_writer.interface.print(format, args) catch {};
+}
+
+fn openAppendFileForPath(path: []const u8) !std.fs.File {
+    var file = openFileForPath(path, .{ .mode = .write_only }) catch |err| switch (err) {
+        error.FileNotFound => try createFileForPath(path, .{ .truncate = false }),
+        else => return err,
+    };
+    errdefer file.close();
+
+    try file.seekFromEnd(0);
+    return file;
+}
+
 fn createFileForPath(path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
     if (std.fs.path.isAbsolute(path)) {
         return std.fs.createFileAbsolute(path, flags);
@@ -1351,11 +1603,66 @@ fn createFileForPath(path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.F
     return std.fs.cwd().createFile(path, flags);
 }
 
+fn openFileForPath(path: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.openFileAbsolute(path, flags);
+    }
+    return std.fs.cwd().openFile(path, flags);
+}
+
 fn deleteFileForPath(path: []const u8) !void {
     if (std.fs.path.isAbsolute(path)) {
         return std.fs.deleteFileAbsolute(path);
     }
     return std.fs.cwd().deleteFile(path);
+}
+
+test "parseRuntimeLogLevel accepts expected aliases" {
+    try std.testing.expectEqual(std.log.Level.debug, parseRuntimeLogLevel("debug").?);
+    try std.testing.expectEqual(std.log.Level.info, parseRuntimeLogLevel("INFO").?);
+    try std.testing.expectEqual(std.log.Level.warn, parseRuntimeLogLevel("warning").?);
+    try std.testing.expectEqual(std.log.Level.err, parseRuntimeLogLevel("ERR").?);
+}
+
+test "parseRuntimeLogLevel rejects unknown values" {
+    try std.testing.expect(parseRuntimeLogLevel("trace") == null);
+    try std.testing.expect(parseRuntimeLogLevel("") == null);
+}
+
+test "appendRuntimeLogLineToFile writes log records" {
+    const allocator = std.testing.allocator;
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const abs_dir = try temp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs_dir);
+
+    const runtime_path = try std.fs.path.join(allocator, &.{ abs_dir, "runtime.log" });
+    defer allocator.free(runtime_path);
+
+    const crash_path = try std.fs.path.join(allocator, &.{ abs_dir, "crash.log" });
+    defer allocator.free(crash_path);
+
+    try std.testing.expect(setRuntimeLogPaths(runtime_path, crash_path, .debug));
+
+    appendRuntimeLogLineToFile(100, .info, .default, "first {d}", .{1});
+    appendRuntimeLogLineToFile(101, .warn, .default, "second", .{});
+
+    var file = try std.fs.openFileAbsolute(runtime_path, .{});
+    defer file.close();
+
+    var read_buffer: [512]u8 = undefined;
+    var reader = file.reader(&read_buffer);
+
+    var content_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer content_writer.deinit();
+    _ = try reader.interface.streamRemaining(&content_writer.writer);
+
+    const content = try content_writer.toOwnedSlice();
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, content, 1, "100 [info] (default) first 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, content, 1, "101 [warning] (default) second"));
 }
 
 test "parseCliAction recognizes help aliases" {

@@ -81,7 +81,7 @@ Inspired by Codex default/builtin tools that we should evaluate for Zolt.
 - [ ] versioned config schema + migration strategy
 - [ ] add README section for testing providers without keys / mock mode
 - [ ] consider allocator choice for release builds (e.g., GPA vs DebugAllocator)
-- [ ] add optional verbose logging or crash report log file path
+- [x] add optional verbose logging or crash report log file path
 - [ ] document state file schema/location for users who want to inspect/backup
 - [ ] add deterministic test harness for tool invocations / golden outputs
 - [x] document keybindings and customization in README

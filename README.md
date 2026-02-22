@@ -405,6 +405,8 @@ Default XDG paths:
 
 - state: `~/.local/share/zig-ai/workspaces/<scope>.json`
 - models cache: `~/.cache/zig-ai/models.json`
+- runtime log: `~/.local/share/zig-ai/logs/runtime.log`
+- crash report log: `~/.local/share/zig-ai/logs/crash.log`
 
 Note: the storage directory name is currently `zig-ai` (legacy) even though the binary/app name is `zolt`.
 
@@ -415,6 +417,10 @@ If XDG paths are unavailable/unwritable, Zolt falls back to:
 
 - `<workspace-root>/.zig-ai/data/workspaces/<scope>.json`
 - `<workspace-root>/.zig-ai/cache/models.json`
+- `<workspace-root>/.zig-ai/data/logs/runtime.log`
+- `<workspace-root>/.zig-ai/data/logs/crash.log`
+
+Logging verbosity defaults to `info`. Set `ZOLT_LOG_LEVEL` to `debug`, `info`, `warn`, or `err` to control runtime log volume.
 
 ## Development
 
