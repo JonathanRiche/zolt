@@ -379,6 +379,8 @@ const TOOL_SYSTEM_PROMPT =
     "Allowed commands: rg, grep, ls, cat, find, head, tail, sed, wc, stat, pwd, and limited git read-only commands.\n" ++
     "For git via READ, only these subcommands are allowed: status, diff, show, log, rev-parse, ls-files.\n" ++
     "Do not claim you lack repository/file access unless a tool call fails.\n" ++
+    "When the user asks you to implement/fix/patch/change code, your FIRST response must be exactly one repository-inspection tool call (READ/LIST_DIR/READ_FILE/GREP_FILES/PROJECT_SEARCH) with no narrative text.\n" ++
+    "Do not provide generic implementation advice before inspecting this repository.\n" ++
     "If the user asks what changed/what they did/updates/history, inspect with READ first (for example: git status, git diff, git log --oneline -n 20).\n" ++
     "Prefer these structured discovery tools when possible:\n" ++
     "<LIST_DIR>\n" ++
@@ -445,6 +447,12 @@ const TOOL_CONTINUE_EVIDENCE_REMINDER =
     "Your prior response claimed implementation/change completion, but no edit-capable tool has run yet. " ++
     "Continue by making the required edits, or explicitly state that no code changes were made. " ++
     "Respond with exactly one tool call next (no narrative).";
+const TOOL_CONTINUE_INITIAL_INSPECTION_REMINDER =
+    "[tool-result]\n" ++
+    "The user asked for implementation/debugging work. Your next response must be exactly one repository-inspection tool call (READ/LIST_DIR/READ_FILE/GREP_FILES/PROJECT_SEARCH), with no narrative text.";
+const TOOL_CONTINUE_EMPTY_RESPONSE_REMINDER =
+    "[tool-result]\n" ++
+    "Your last response was empty. Continue by calling the next tool now. If unsure, inspect with LIST_DIR on src or READ ls src.";
 const TOOL_CONTINUE_MAX_ATTEMPTS: u8 = 2;
 
 const VIEW_IMAGE_VISION_PROMPT =
@@ -1665,6 +1673,7 @@ const App = struct {
         var guard_reason: ToolLoopGuardReason = .none;
         var executed_any_tool = false;
         var executed_mutating_tool = false;
+        const expects_initial_repo_tool = userPromptNeedsInitialRepoInspection(prompt);
         var step: usize = 0;
         var tool_continue_attempts: u8 = 0;
         var seen_tool_signatures: std.ArrayList([]u8) = .empty;
@@ -1690,14 +1699,22 @@ const App = struct {
             var assistant_message = self.app_state.currentConversationConst().messages.items[self.app_state.currentConversationConst().messages.items.len - 1];
             var maybe_tool_call = parseAssistantToolCall(assistant_message.content);
             while (maybe_tool_call == null and tool_continue_attempts < TOOL_CONTINUE_MAX_ATTEMPTS) {
+                const trimmed_assistant = std.mem.trim(u8, assistant_message.content, " \t\r\n");
+                const is_empty_response = trimmed_assistant.len == 0;
                 const needs_forced_summary = assistantTextNeedsForcedSummary(assistant_message.content);
                 const looks_deferred = assistantTextLooksDeferredAction(assistant_message.content);
                 const claims_unverified_changes =
                     executed_any_tool and
                     !executed_mutating_tool and
                     assistantTextClaimsMutationWithoutEvidence(assistant_message.content);
+                const needs_initial_repo_tool = !executed_any_tool and expects_initial_repo_tool;
                 const should_continue =
-                    if (executed_any_tool) assistantTextNeedsToolContinuation(assistant_message.content) or claims_unverified_changes else looks_deferred;
+                    if (is_empty_response)
+                        true
+                    else if (executed_any_tool)
+                        assistantTextNeedsToolContinuation(assistant_message.content) or claims_unverified_changes
+                    else
+                        looks_deferred or needs_initial_repo_tool;
                 if (!should_continue) break;
                 tool_continue_attempts += 1;
                 log.warn(
@@ -1707,7 +1724,11 @@ const App = struct {
                         step + 1,
                         tool_continue_attempts,
                         TOOL_CONTINUE_MAX_ATTEMPTS,
-                        if (claims_unverified_changes)
+                        if (is_empty_response)
+                            "empty_response"
+                        else if (needs_initial_repo_tool and !looks_deferred)
+                            "expected_initial_repo_tool"
+                        else if (claims_unverified_changes)
                             "claimed_changes_without_edit_tool"
                         else if (!executed_any_tool and looks_deferred)
                             "deferred_action_pre_tool"
@@ -1722,7 +1743,16 @@ const App = struct {
                 try self.app_state.appendMessage(
                     self.allocator,
                     .system,
-                    if (claims_unverified_changes) TOOL_CONTINUE_EVIDENCE_REMINDER else TOOL_CONTINUE_REMINDER,
+                    if (is_empty_response and needs_initial_repo_tool)
+                        TOOL_CONTINUE_INITIAL_INSPECTION_REMINDER
+                    else if (is_empty_response)
+                        TOOL_CONTINUE_EMPTY_RESPONSE_REMINDER
+                    else if (needs_initial_repo_tool and !looks_deferred)
+                        TOOL_CONTINUE_INITIAL_INSPECTION_REMINDER
+                    else if (claims_unverified_changes)
+                        TOOL_CONTINUE_EVIDENCE_REMINDER
+                    else
+                        TOOL_CONTINUE_REMINDER,
                 );
                 try self.app_state.appendMessage(self.allocator, .assistant, "");
                 const follow_success = try self.streamAssistantOnce(provider_id, model_id, auth, true);
@@ -9671,6 +9701,55 @@ fn sanitizeFinalUserFacingResponseAlloc(
     return allocator.dupe(u8, candidate);
 }
 
+fn userPromptNeedsInitialRepoInspection(prompt: []const u8) bool {
+    const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
+    if (trimmed.len == 0) return false;
+
+    var lower_buf: [1024]u8 = undefined;
+    const sample = if (trimmed.len <= lower_buf.len) trimmed else trimmed[0..lower_buf.len];
+    for (sample, 0..) |ch, index| {
+        lower_buf[index] = std.ascii.toLower(ch);
+    }
+    const lower = lower_buf[0..sample.len];
+
+    const analysis_only_markers = [_][]const u8{
+        "what would it take",
+        "how would you",
+        "can you explain",
+        "explain how",
+        "what do you think",
+        "are you done",
+        "did you patch",
+        "did you implement",
+        "did you read",
+    };
+    for (analysis_only_markers) |marker| {
+        if (std.mem.indexOf(u8, lower, marker) != null) return false;
+    }
+
+    const implementation_markers = [_][]const u8{
+        "implement",
+        "fix",
+        "patch",
+        "edit",
+        "modify",
+        "change",
+        "add ",
+        "wire",
+        "refactor",
+        "debug",
+        "investigate",
+        "look into",
+        "just do it",
+        "do it",
+        "go ahead",
+    };
+    for (implementation_markers) |marker| {
+        if (std.mem.indexOf(u8, lower, marker) != null) return true;
+    }
+    return false;
+}
+
 fn assistantTextClaimsMutationWithoutEvidence(text: []const u8) bool {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return false;
@@ -10519,6 +10598,18 @@ test "assistantTextNeedsForcedSummary matches tool-like or empty outputs only" {
     try std.testing.expect(assistantTextNeedsForcedSummary("   \n\t"));
     try std.testing.expect(assistantTextNeedsForcedSummary("[tool] READ git status -sb"));
     try std.testing.expect(!assistantTextNeedsForcedSummary("Repository is clean and synced."));
+}
+
+test "userPromptNeedsInitialRepoInspection detects implementation requests" {
+    try std.testing.expect(userPromptNeedsInitialRepoInspection("Please implement Ctrl+T thinking level toggle."));
+    try std.testing.expect(userPromptNeedsInitialRepoInspection("can you fix the tui crash on startup?"));
+    try std.testing.expect(userPromptNeedsInitialRepoInspection("just do it and patch the keybinding"));
+    try std.testing.expect(userPromptNeedsInitialRepoInspection("do it"));
+    try std.testing.expect(userPromptNeedsInitialRepoInspection("go ahead"));
+    try std.testing.expect(!userPromptNeedsInitialRepoInspection("what would it take to implement ctrl+t?"));
+    try std.testing.expect(!userPromptNeedsInitialRepoInspection("can you explain how model selection works?"));
+    try std.testing.expect(!userPromptNeedsInitialRepoInspection("are you done?"));
+    try std.testing.expect(!userPromptNeedsInitialRepoInspection("did you patch it?"));
 }
 
 test "assistantTextLooksDeferredAction detects intent-only continuations" {
