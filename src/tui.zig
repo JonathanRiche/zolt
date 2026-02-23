@@ -439,11 +439,12 @@ const TOOL_SYSTEM_PROMPT =
 const TOOL_CONTINUE_REMINDER =
     "[tool-result]\n" ++
     "Continue the task now. If more work remains, call the next tool immediately. " ++
-    "Do not stop with intent-only text.";
+    "Do not stop with intent-only text. Respond with exactly one tool call next (no narrative).";
 const TOOL_CONTINUE_EVIDENCE_REMINDER =
     "[tool-result]\n" ++
     "Your prior response claimed implementation/change completion, but no edit-capable tool has run yet. " ++
-    "Continue by making the required edits, or explicitly state that no code changes were made.";
+    "Continue by making the required edits, or explicitly state that no code changes were made. " ++
+    "Respond with exactly one tool call next (no narrative).";
 const TOOL_CONTINUE_MAX_ATTEMPTS: u8 = 2;
 
 const VIEW_IMAGE_VISION_PROMPT =
@@ -9687,13 +9688,22 @@ fn assistantTextClaimsMutationWithoutEvidence(text: []const u8) bool {
         "didn't implement",
         "have not implemented",
         "haven't implemented",
+        "have not implemented yet",
+        "haven't implemented yet",
         "not implemented",
+        "not implemented yet",
         "unimplemented",
         "no changes",
         "did not change",
         "didn't change",
         "unable to implement",
         "couldn't implement",
+        "haven't edited files yet",
+        "have not edited files yet",
+        "haven't actually edited files yet",
+        "no edit tool call has been made",
+        "can't truthfully claim",
+        "cannot truthfully claim",
     };
     for (negative_markers) |marker| {
         if (std.mem.indexOf(u8, lower, marker) != null) return false;
@@ -9759,6 +9769,12 @@ fn assistantTextLooksDeferredAction(text: []const u8) bool {
         "let me check",
         "i can wire",
         "i can patch",
+        "i'll patch",
+        "i will patch",
+        "i'll do it",
+        "i will do it",
+        "if you want, i'll",
+        "if you want i will",
         "i'm ready to",
         "i am ready to",
         "next i'll",
@@ -10501,6 +10517,7 @@ test "assistantTextLooksDeferredAction detects intent-only continuations" {
     try std.testing.expect(assistantTextLooksDeferredAction("Great - I'll do that next."));
     try std.testing.expect(assistantTextLooksDeferredAction("Got it - I'll proceed with narrower file-by-file edits next."));
     try std.testing.expect(assistantTextLooksDeferredAction("To do this cleanly, I need to inspect the keybinding code first."));
+    try std.testing.expect(assistantTextLooksDeferredAction("If you want, I'll do it now: I'll patch the keybinding path."));
     try std.testing.expect(!assistantTextLooksDeferredAction("I added Ctrl+T and updated keybindings."));
     try std.testing.expect(!assistantTextLooksDeferredAction("[tool] READ git status --short"));
 }
@@ -10516,6 +10533,9 @@ test "assistantTextClaimsMutationWithoutEvidence detects unverified completion c
     try std.testing.expect(assistantTextClaimsMutationWithoutEvidence("Implemented. Here's what I changed."));
     try std.testing.expect(assistantTextClaimsMutationWithoutEvidence("Files touched: src/keybindings.zig"));
     try std.testing.expect(!assistantTextClaimsMutationWithoutEvidence("I have not implemented this yet."));
+    try std.testing.expect(!assistantTextClaimsMutationWithoutEvidence(
+        "I haven't actually edited files yet (no edit tool call has been made), so I can't truthfully claim it's implemented yet.",
+    ));
     try std.testing.expect(!assistantTextClaimsMutationWithoutEvidence("[tool] APPLY_PATCH"));
 }
 
