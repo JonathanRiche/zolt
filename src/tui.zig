@@ -9769,10 +9769,19 @@ fn assistantTextLooksDeferredAction(text: []const u8) bool {
         "let me check",
         "i can wire",
         "i can patch",
+        "i can implement",
         "i'll patch",
         "i will patch",
+        "i'll implement",
+        "i will implement",
+        "i'll look into",
+        "i will look into",
         "i'll do it",
         "i will do it",
+        "i'll quickly inspect",
+        "i will quickly inspect",
+        "i'll quickly check",
+        "i will quickly check",
         "if you want, i'll",
         "if you want i will",
         "i'm ready to",
@@ -10518,6 +10527,9 @@ test "assistantTextLooksDeferredAction detects intent-only continuations" {
     try std.testing.expect(assistantTextLooksDeferredAction("Got it - I'll proceed with narrower file-by-file edits next."));
     try std.testing.expect(assistantTextLooksDeferredAction("To do this cleanly, I need to inspect the keybinding code first."));
     try std.testing.expect(assistantTextLooksDeferredAction("If you want, I'll do it now: I'll patch the keybinding path."));
+    try std.testing.expect(assistantTextLooksDeferredAction(
+        "Got it — I can implement Ctrl+T. I'll quickly inspect the repo and then patch it.",
+    ));
     try std.testing.expect(!assistantTextLooksDeferredAction("I added Ctrl+T and updated keybindings."));
     try std.testing.expect(!assistantTextLooksDeferredAction("[tool] READ git status --short"));
 }
