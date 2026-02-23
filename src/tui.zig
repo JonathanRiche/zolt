@@ -440,6 +440,10 @@ const TOOL_CONTINUE_REMINDER =
     "[tool-result]\n" ++
     "Continue the task now. If more work remains, call the next tool immediately. " ++
     "Do not stop with intent-only text.";
+const TOOL_CONTINUE_EVIDENCE_REMINDER =
+    "[tool-result]\n" ++
+    "Your prior response claimed implementation/change completion, but no edit-capable tool has run yet. " ++
+    "Continue by making the required edits, or explicitly state that no code changes were made.";
 const TOOL_CONTINUE_MAX_ATTEMPTS: u8 = 2;
 
 const VIEW_IMAGE_VISION_PROMPT =
@@ -1659,6 +1663,7 @@ const App = struct {
 
         var guard_reason: ToolLoopGuardReason = .none;
         var executed_any_tool = false;
+        var executed_mutating_tool = false;
         var step: usize = 0;
         var tool_continue_attempts: u8 = 0;
         var seen_tool_signatures: std.ArrayList([]u8) = .empty;
@@ -1686,8 +1691,12 @@ const App = struct {
             while (maybe_tool_call == null and tool_continue_attempts < TOOL_CONTINUE_MAX_ATTEMPTS) {
                 const needs_forced_summary = assistantTextNeedsForcedSummary(assistant_message.content);
                 const looks_deferred = assistantTextLooksDeferredAction(assistant_message.content);
+                const claims_unverified_changes =
+                    executed_any_tool and
+                    !executed_mutating_tool and
+                    assistantTextClaimsMutationWithoutEvidence(assistant_message.content);
                 const should_continue =
-                    if (executed_any_tool) assistantTextNeedsToolContinuation(assistant_message.content) else looks_deferred;
+                    if (executed_any_tool) assistantTextNeedsToolContinuation(assistant_message.content) or claims_unverified_changes else looks_deferred;
                 if (!should_continue) break;
                 tool_continue_attempts += 1;
                 log.warn(
@@ -1697,7 +1706,9 @@ const App = struct {
                         step + 1,
                         tool_continue_attempts,
                         TOOL_CONTINUE_MAX_ATTEMPTS,
-                        if (!executed_any_tool and looks_deferred)
+                        if (claims_unverified_changes)
+                            "claimed_changes_without_edit_tool"
+                        else if (!executed_any_tool and looks_deferred)
                             "deferred_action_pre_tool"
                         else if (needs_forced_summary and looks_deferred)
                             "forced+deferred"
@@ -1707,7 +1718,11 @@ const App = struct {
                             "deferred_action",
                     },
                 );
-                try self.app_state.appendMessage(self.allocator, .system, TOOL_CONTINUE_REMINDER);
+                try self.app_state.appendMessage(
+                    self.allocator,
+                    .system,
+                    if (claims_unverified_changes) TOOL_CONTINUE_EVIDENCE_REMINDER else TOOL_CONTINUE_REMINDER,
+                );
                 try self.app_state.appendMessage(self.allocator, .assistant, "");
                 const follow_success = try self.streamAssistantOnce(provider_id, model_id, auth, true);
                 if (!follow_success) {
@@ -1889,6 +1904,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran APPLY_PATCH tool");
                     executed_any_tool = true;
+                    executed_mutating_tool = true;
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -1917,6 +1933,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran EXEC_COMMAND tool");
                     executed_any_tool = true;
+                    executed_mutating_tool = true;
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -1945,6 +1962,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran WRITE_STDIN tool");
                     executed_any_tool = true;
+                    executed_mutating_tool = true;
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -2102,22 +2120,30 @@ const App = struct {
             if (last_message.role != .assistant) break :blk false;
             break :blk assistantTextNeedsForcedSummary(last_message.content);
         } else false;
+        const last_assistant_claims_unverified_mutation = if (conversation_after_loop.messages.items.len > 0) blk: {
+            const last_message = conversation_after_loop.messages.items[conversation_after_loop.messages.items.len - 1];
+            if (last_message.role != .assistant) break :blk false;
+            if (!executed_any_tool or executed_mutating_tool) break :blk false;
+            break :blk assistantTextClaimsMutationWithoutEvidence(last_message.content);
+        } else false;
 
         if (guard_reason == .none and step == TOOL_MAX_STEPS and last_is_tool_marker and !self.stream_was_interrupted) {
             guard_reason = .max_iterations;
         }
 
         log.info(
-            "tool-loop stop conv={s} steps={d} guard={s} executed_any_tool={any} continue_attempts={d} interrupted={any} provider_error={any} needs_forced_summary={any}",
+            "tool-loop stop conv={s} steps={d} guard={s} executed_any_tool={any} mutating_tool={any} continue_attempts={d} interrupted={any} provider_error={any} needs_forced_summary={any} unverified_change_claim={any}",
             .{
                 conversation_id,
                 step,
                 toolLoopGuardReasonLabel(guard_reason),
                 executed_any_tool,
+                executed_mutating_tool,
                 tool_continue_attempts,
                 self.stream_was_interrupted,
                 provider_client.lastProviderErrorDetail() != null,
                 last_assistant_needs_forced_summary,
+                last_assistant_claims_unverified_mutation,
             },
         );
 
@@ -2148,7 +2174,7 @@ const App = struct {
 
         if (!self.stream_was_interrupted and provider_client.lastProviderErrorDetail() == null) {
             switch (guard_reason) {
-                .none => try self.ensureLastAssistantUserFacing(),
+                .none => try self.ensureLastAssistantUserFacing(executed_any_tool, executed_mutating_tool),
                 .repeated_tool_call => {
                     const fallback = try self.buildToolFallbackSummaryAlloc("repeated_tool_call");
                     defer self.allocator.free(fallback);
@@ -4217,7 +4243,7 @@ const App = struct {
         );
     }
 
-    fn ensureLastAssistantUserFacing(self: *App) !void {
+    fn ensureLastAssistantUserFacing(self: *App, executed_any_tool: bool, executed_mutating_tool: bool) !void {
         const conversation = self.app_state.currentConversationConst();
         if (conversation.messages.items.len == 0) return;
         const last = conversation.messages.items[conversation.messages.items.len - 1];
@@ -4229,6 +4255,8 @@ const App = struct {
             self.last_successful_tool_call,
             self.last_successful_tool_result_summary,
             "finalize",
+            executed_any_tool,
+            executed_mutating_tool,
         );
         defer self.allocator.free(sanitized);
 
@@ -9623,9 +9651,71 @@ fn sanitizeFinalUserFacingResponseAlloc(
     last_tool_call: ?[]const u8,
     last_tool_summary: ?[]const u8,
     reason: []const u8,
+    executed_any_tool: bool,
+    executed_mutating_tool: bool,
 ) ![]u8 {
-    if (!isToolMarkerLikeResponse(candidate)) return allocator.dupe(u8, candidate);
-    return buildToolFallbackSummaryFromLastToolAlloc(allocator, last_tool_call, last_tool_summary, reason);
+    if (isToolMarkerLikeResponse(candidate)) {
+        return buildToolFallbackSummaryFromLastToolAlloc(allocator, last_tool_call, last_tool_summary, reason);
+    }
+    if (executed_any_tool and
+        !executed_mutating_tool and
+        assistantTextClaimsMutationWithoutEvidence(candidate))
+    {
+        return buildToolFallbackSummaryFromLastToolAlloc(
+            allocator,
+            last_tool_call,
+            last_tool_summary,
+            "claimed_changes_without_edit_tool",
+        );
+    }
+    return allocator.dupe(u8, candidate);
+}
+
+fn assistantTextClaimsMutationWithoutEvidence(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (parseAssistantToolCall(trimmed) != null) return false;
+
+    var lower_buf: [1024]u8 = undefined;
+    const sample = if (trimmed.len <= lower_buf.len) trimmed else trimmed[0..lower_buf.len];
+    for (sample, 0..) |ch, index| {
+        lower_buf[index] = std.ascii.toLower(ch);
+    }
+    const lower = lower_buf[0..sample.len];
+
+    const negative_markers = [_][]const u8{
+        "did not implement",
+        "didn't implement",
+        "have not implemented",
+        "haven't implemented",
+        "not implemented",
+        "unimplemented",
+        "no changes",
+        "did not change",
+        "didn't change",
+        "unable to implement",
+        "couldn't implement",
+    };
+    for (negative_markers) |marker| {
+        if (std.mem.indexOf(u8, lower, marker) != null) return false;
+    }
+
+    const positive_markers = [_][]const u8{
+        "implemented",
+        "here's what i changed",
+        "what i changed",
+        "files touched",
+        "i added",
+        "i updated",
+        "i wired",
+        "what i wired",
+        "i patched",
+        "i modified",
+    };
+    for (positive_markers) |marker| {
+        if (std.mem.indexOf(u8, lower, marker) != null) return true;
+    }
+    return false;
 }
 
 fn assistantTextNeedsForcedSummary(text: []const u8) bool {
@@ -10423,6 +10513,13 @@ test "assistantTextNeedsToolContinuation includes empty tool markers and deferre
     try std.testing.expect(!assistantTextNeedsToolContinuation("Implemented Ctrl+T and wired request options."));
 }
 
+test "assistantTextClaimsMutationWithoutEvidence detects unverified completion claims" {
+    try std.testing.expect(assistantTextClaimsMutationWithoutEvidence("Implemented. Here's what I changed."));
+    try std.testing.expect(assistantTextClaimsMutationWithoutEvidence("Files touched: src/keybindings.zig"));
+    try std.testing.expect(!assistantTextClaimsMutationWithoutEvidence("I have not implemented this yet."));
+    try std.testing.expect(!assistantTextClaimsMutationWithoutEvidence("[tool] APPLY_PATCH"));
+}
+
 test "single tool call success yields final natural language" {
     const allocator = std.testing.allocator;
     const final_text = try sanitizeFinalUserFacingResponseAlloc(
@@ -10431,6 +10528,8 @@ test "single tool call success yields final natural language" {
         "[tool] EXEC_COMMAND",
         "state:exited:0",
         "finalize",
+        true,
+        true,
     );
     defer allocator.free(final_text);
 
@@ -10438,6 +10537,23 @@ test "single tool call success yields final natural language" {
         "Created `.volt/tasks/daily.md` with the requested check-in note.",
         final_text,
     );
+}
+
+test "sanitizeFinalUserFacingResponseAlloc rejects unverified implementation claim" {
+    const allocator = std.testing.allocator;
+    const final_text = try sanitizeFinalUserFacingResponseAlloc(
+        allocator,
+        "Implemented. Here's what I changed: ...",
+        "[tool] READ find src -maxdepth 3 -type f",
+        "term:exited:0",
+        "finalize",
+        true,
+        false,
+    );
+    defer allocator.free(final_text);
+
+    try std.testing.expect(std.mem.indexOf(u8, final_text, "claimed_changes_without_edit_tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_text, "Implemented. Here's what I changed") == null);
 }
 
 test "repeated tool call loop breaks and uses fallback summary" {
