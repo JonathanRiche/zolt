@@ -308,7 +308,7 @@ const ClipboardImageCapture = struct {
 const MODEL_PICKER_MAX_ROWS: usize = 8;
 const FILE_PICKER_MAX_ROWS: usize = 8;
 const COMMAND_PICKER_MAX_ROWS: usize = 8;
-const TOOL_MAX_STEPS: usize = 4;
+const TOOL_MAX_STEPS: usize = 8;
 const READ_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
 const APPLY_PATCH_TOOL_MAX_PATCH_BYTES: usize = 256 * 1024;
 const APPLY_PATCH_PREVIEW_MAX_LINES: usize = 120;
@@ -2150,12 +2150,11 @@ const App = struct {
         if (!self.stream_was_interrupted and
             provider_client.lastProviderErrorDetail() == null and
             executed_any_tool and
-            ((guard_reason == .none and last_assistant_needs_forced_summary) or
-                guard_reason == .repeated_tool_call or
+            (guard_reason == .repeated_tool_call or
                 guard_reason == .max_iterations))
         {
             const force_summary_instruction = switch (guard_reason) {
-                .none => "[tool-result]\nTool execution completed. Provide a final user-facing answer now. Do not call more tools.",
+                .none => unreachable,
                 .repeated_tool_call => "[tool-result]\nA repeated tool-call loop was detected. Stop calling tools and provide a final user-facing answer now.",
                 .max_iterations => "[tool-result]\nTool iteration limit was reached. Stop calling tools and provide a final user-facing answer now.",
             };
