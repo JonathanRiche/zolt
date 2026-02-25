@@ -309,6 +309,8 @@ const MODEL_PICKER_MAX_ROWS: usize = 8;
 const FILE_PICKER_MAX_ROWS: usize = 8;
 const COMMAND_PICKER_MAX_ROWS: usize = 8;
 const TOOL_MAX_STEPS: usize = 8;
+const TOOL_INSPECTION_MAX_STEPS: usize = 5;
+const TOOL_EXECUTION_MAX_STEPS: usize = 3;
 const READ_TOOL_MAX_OUTPUT_BYTES: usize = 24 * 1024;
 const APPLY_PATCH_TOOL_MAX_PATCH_BYTES: usize = 256 * 1024;
 const APPLY_PATCH_PREVIEW_MAX_LINES: usize = 120;
@@ -359,6 +361,7 @@ const ToolLoopGuardReason = enum {
     none,
     repeated_tool_call,
     max_iterations,
+    budget_exhausted,
 };
 const COMPACT_SUMMARY_SYSTEM_PROMPT =
     "You are compacting chat history for a coding assistant.\n" ++
@@ -453,6 +456,9 @@ const TOOL_CONTINUE_INITIAL_INSPECTION_REMINDER =
 const TOOL_CONTINUE_EMPTY_RESPONSE_REMINDER =
     "[tool-result]\n" ++
     "Your last response was empty. Continue by calling the next tool now. If unsure, inspect with LIST_DIR on src or READ ls src.";
+const TOOL_BUDGET_EXHAUSTED_CONTINUATION_REMINDER =
+    "[tool-result]\n" ++
+    "Tool-call budget is exhausted for this turn. Provide either a final user-facing status update or exactly one next actionable tool call.";
 const TOOL_CONTINUE_MAX_ATTEMPTS: u8 = 2;
 
 const VIEW_IMAGE_VISION_PROMPT =
@@ -1673,6 +1679,10 @@ const App = struct {
         var guard_reason: ToolLoopGuardReason = .none;
         var executed_any_tool = false;
         var executed_mutating_tool = false;
+        var tool_budget: ToolLoopBudget = .{};
+        var needs_post_tool_continuation_pass = false;
+        var budget_exhausted_pending_tool: ?[]u8 = null;
+        defer if (budget_exhausted_pending_tool) |value| self.allocator.free(value);
         const expects_initial_repo_tool = userPromptNeedsInitialRepoInspection(prompt);
         var step: usize = 0;
         var tool_continue_attempts: u8 = 0;
@@ -1684,8 +1694,15 @@ const App = struct {
 
         tool_loop: while (step < TOOL_MAX_STEPS) : (step += 1) {
             log.info(
-                "tool-loop step conv={s} step={d}/{d} executed_any_tool={any}",
-                .{ conversation_id, step + 1, TOOL_MAX_STEPS, executed_any_tool },
+                "tool-loop step conv={s} step={d}/{d} executed_any_tool={any} budget(read={d},exec={d})",
+                .{
+                    conversation_id,
+                    step + 1,
+                    TOOL_MAX_STEPS,
+                    executed_any_tool,
+                    tool_budget.inspection_remaining,
+                    tool_budget.execution_remaining,
+                },
             );
             const success = try self.streamAssistantOnce(provider_id, model_id, auth, true);
             if (!success) {
@@ -1775,6 +1792,13 @@ const App = struct {
                 );
                 break;
             };
+            const budget_class = toolBudgetClass(tool_call);
+            if (!tool_budget.canConsume(budget_class)) {
+                guard_reason = .budget_exhausted;
+                if (budget_exhausted_pending_tool) |value| self.allocator.free(value);
+                budget_exhausted_pending_tool = try toolCallPreviewAlloc(self.allocator, tool_call);
+                break;
+            }
             switch (tool_call) {
                 .read => |read_command| {
                     self.stream_task = .running_read;
@@ -1795,6 +1819,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNoticeFmt("Ran READ command: {s}", .{read_command_owned});
                     executed_any_tool = true;
+                    tool_budget.consume(.inspection);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -1803,6 +1828,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -1823,6 +1853,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran LIST_DIR tool");
                     executed_any_tool = true;
+                    tool_budget.consume(.inspection);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -1831,6 +1862,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -1851,6 +1887,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran READ_FILE tool");
                     executed_any_tool = true;
+                    tool_budget.consume(.inspection);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -1859,6 +1896,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -1879,6 +1921,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran GREP_FILES tool");
                     executed_any_tool = true;
+                    tool_budget.consume(.inspection);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -1887,6 +1930,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -1907,6 +1955,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran PROJECT_SEARCH tool");
                     executed_any_tool = true;
+                    tool_budget.consume(.inspection);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -1915,6 +1964,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -1936,6 +1990,7 @@ const App = struct {
                     try self.setNotice("Ran APPLY_PATCH tool");
                     executed_any_tool = true;
                     executed_mutating_tool = true;
+                    tool_budget.consume(.execution);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -1944,6 +1999,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -1965,6 +2025,7 @@ const App = struct {
                     try self.setNotice("Ran EXEC_COMMAND tool");
                     executed_any_tool = true;
                     executed_mutating_tool = true;
+                    tool_budget.consume(.execution);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -1973,6 +2034,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -1994,6 +2060,7 @@ const App = struct {
                     try self.setNotice("Ran WRITE_STDIN tool");
                     executed_any_tool = true;
                     executed_mutating_tool = true;
+                    tool_budget.consume(.execution);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -2002,6 +2069,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -2022,6 +2094,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran WEB_SEARCH tool");
                     executed_any_tool = true;
+                    tool_budget.consume(.inspection);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -2030,6 +2103,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -2050,6 +2128,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran VIEW_IMAGE tool");
                     executed_any_tool = true;
+                    tool_budget.consume(.inspection);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -2058,6 +2137,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -2078,6 +2162,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran SKILL tool");
                     executed_any_tool = true;
+                    tool_budget.consume(.execution);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -2086,6 +2171,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -2106,6 +2196,7 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("Ran UPDATE_PLAN tool");
                     executed_any_tool = true;
+                    tool_budget.consume(.execution);
                     if (try didRepeatToolExecution(
                         self.allocator,
                         &seen_tool_signatures,
@@ -2114,6 +2205,11 @@ const App = struct {
                         tool_result,
                     )) {
                         guard_reason = .repeated_tool_call;
+                        break :tool_loop;
+                    }
+                    if (!tool_budget.hasAnyRemaining()) {
+                        guard_reason = .budget_exhausted;
+                        needs_post_tool_continuation_pass = true;
                         break :tool_loop;
                     }
                 },
@@ -2134,11 +2230,43 @@ const App = struct {
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNotice("REQUEST_USER_INPUT tool requested user choice");
                     executed_any_tool = true;
+                    tool_budget.consume(.execution);
                     break :tool_loop;
                 },
             }
             self.stream_task = .thinking;
             try self.render();
+        }
+
+        if (guard_reason == .budget_exhausted and
+            needs_post_tool_continuation_pass and
+            !self.stream_was_interrupted and
+            provider_client.lastProviderErrorDetail() == null)
+        {
+            try self.app_state.appendMessage(
+                self.allocator,
+                .system,
+                TOOL_BUDGET_EXHAUSTED_CONTINUATION_REMINDER,
+            );
+            try self.app_state.appendMessage(self.allocator, .assistant, "");
+            _ = try self.streamAssistantOnce(provider_id, model_id, auth, true);
+
+            const post_budget_pass = self.app_state.currentConversationConst();
+            if (post_budget_pass.messages.items.len > 0) {
+                const last_message = post_budget_pass.messages.items[post_budget_pass.messages.items.len - 1];
+                if (last_message.role == .assistant) {
+                    if (parseAssistantToolCall(last_message.content)) |pending_tool| {
+                        if (budget_exhausted_pending_tool) |value| self.allocator.free(value);
+                        budget_exhausted_pending_tool = try toolCallPreviewAlloc(self.allocator, pending_tool);
+                    } else if (!assistantTextNeedsForcedSummary(last_message.content) and
+                        !(executed_any_tool and
+                            !executed_mutating_tool and
+                            assistantTextClaimsMutationWithoutEvidence(last_message.content)))
+                    {
+                        guard_reason = .none;
+                    }
+                }
+            }
         }
 
         const conversation_after_loop = self.app_state.currentConversationConst();
@@ -2188,6 +2316,7 @@ const App = struct {
                 .none => unreachable,
                 .repeated_tool_call => "[tool-result]\nA repeated tool-call loop was detected. Stop calling tools and provide a final user-facing answer now.",
                 .max_iterations => "[tool-result]\nTool iteration limit was reached. Stop calling tools and provide a final user-facing answer now.",
+                .budget_exhausted => unreachable,
             };
             try self.app_state.appendMessage(self.allocator, .system, force_summary_instruction);
             try self.app_state.appendMessage(self.allocator, .assistant, "");
@@ -2216,6 +2345,12 @@ const App = struct {
                     defer self.allocator.free(fallback);
                     try self.setLastAssistantMessage(fallback);
                     try self.setNotice("Tool step limit reached; synthesized fallback summary.");
+                },
+                .budget_exhausted => {
+                    const fallback = try self.buildToolFallbackSummaryAlloc("tool_budget_exhausted");
+                    defer self.allocator.free(fallback);
+                    try self.setLastAssistantMessage(fallback);
+                    try self.setNotice("Tool budget exhausted; synthesized fallback summary.");
                 },
             }
         }
@@ -6866,6 +7001,85 @@ const AssistantToolCall = union(enum) {
     request_user_input: []const u8,
 };
 
+const ToolBudgetClass = enum {
+    inspection,
+    execution,
+};
+
+const ToolLoopBudget = struct {
+    inspection_remaining: usize = TOOL_INSPECTION_MAX_STEPS,
+    execution_remaining: usize = TOOL_EXECUTION_MAX_STEPS,
+
+    fn canConsume(self: ToolLoopBudget, class: ToolBudgetClass) bool {
+        return switch (class) {
+            .inspection => self.inspection_remaining > 0,
+            .execution => self.execution_remaining > 0,
+        };
+    }
+
+    fn consume(self: *ToolLoopBudget, class: ToolBudgetClass) void {
+        switch (class) {
+            .inspection => {
+                std.debug.assert(self.inspection_remaining > 0);
+                self.inspection_remaining -= 1;
+            },
+            .execution => {
+                std.debug.assert(self.execution_remaining > 0);
+                self.execution_remaining -= 1;
+            },
+        }
+    }
+
+    fn hasAnyRemaining(self: ToolLoopBudget) bool {
+        return self.inspection_remaining > 0 or self.execution_remaining > 0;
+    }
+};
+
+fn toolBudgetClass(tool_call: AssistantToolCall) ToolBudgetClass {
+    return switch (tool_call) {
+        .read,
+        .list_dir,
+        .read_file,
+        .grep_files,
+        .project_search,
+        .web_search,
+        .view_image,
+        => .inspection,
+        .apply_patch,
+        .exec_command,
+        .write_stdin,
+        .skill,
+        .update_plan,
+        .request_user_input,
+        => .execution,
+    };
+}
+
+fn toolCallShortLabel(tool_call: AssistantToolCall) []const u8 {
+    return switch (tool_call) {
+        .read => "READ",
+        .list_dir => "LIST_DIR",
+        .read_file => "READ_FILE",
+        .grep_files => "GREP_FILES",
+        .project_search => "PROJECT_SEARCH",
+        .apply_patch => "APPLY_PATCH",
+        .exec_command => "EXEC_COMMAND",
+        .write_stdin => "WRITE_STDIN",
+        .web_search => "WEB_SEARCH",
+        .view_image => "VIEW_IMAGE",
+        .skill => "SKILL",
+        .update_plan => "UPDATE_PLAN",
+        .request_user_input => "REQUEST_USER_INPUT",
+    };
+}
+
+fn toolCallPreviewAlloc(allocator: std.mem.Allocator, tool_call: AssistantToolCall) ![]u8 {
+    return switch (tool_call) {
+        .read => |command| std.fmt.allocPrint(allocator, "READ {s}", .{command}),
+        else => allocator.dupe(u8, toolCallShortLabel(tool_call)),
+    };
+}
+
 fn parseAssistantToolCall(text: []const u8) ?AssistantToolCall {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return null;
@@ -9899,6 +10113,7 @@ fn toolLoopGuardReasonLabel(reason: ToolLoopGuardReason) []const u8 {
         .none => "none",
         .repeated_tool_call => "repeated_tool_call",
         .max_iterations => "max_iterations",
+        .budget_exhausted => "budget_exhausted",
     };
 }
 
@@ -10718,6 +10933,32 @@ test "repeated tool call loop breaks and uses fallback summary" {
 
     try std.testing.expect(std.mem.indexOf(u8, fallback, "stopped further tool calls") != null);
     try std.testing.expect(std.mem.indexOf(u8, fallback, "[tool]") == null);
+}
+
+test "tool budget split preserves execution budget after inspection-heavy discovery" {
+    var budget: ToolLoopBudget = .{};
+    var i: usize = 0;
+    while (i < TOOL_INSPECTION_MAX_STEPS) : (i += 1) {
+        try std.testing.expect(budget.canConsume(.inspection));
+        budget.consume(.inspection);
+    }
+
+    try std.testing.expect(!budget.canConsume(.inspection));
+    try std.testing.expect(budget.canConsume(.execution));
+    try std.testing.expectEqual(@as(usize, TOOL_EXECUTION_MAX_STEPS), budget.execution_remaining);
+}
+
+test "last available tool step requires post-tool continuation pass" {
+    var budget: ToolLoopBudget = .{};
+
+    var i: usize = 0;
+    while (i < TOOL_INSPECTION_MAX_STEPS) : (i += 1) budget.consume(.inspection);
+    i = 0;
+    while (i < TOOL_EXECUTION_MAX_STEPS - 1) : (i += 1) budget.consume(.execution);
+
+    try std.testing.expect(budget.hasAnyRemaining());
+    budget.consume(.execution);
+    try std.testing.expect(!budget.hasAnyRemaining());
 }
 
 test "codeFenceLanguageToken extracts language from fence line" {
