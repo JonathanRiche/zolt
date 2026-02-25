@@ -2338,6 +2338,21 @@ const App = struct {
         if (guard_reason == .none and step == TOOL_MAX_STEPS and last_is_tool_marker and !self.stream_was_interrupted) {
             guard_reason = .max_iterations;
         }
+        if (shouldEscalateForcedSummaryAfterTool(
+            guard_reason,
+            executed_any_tool,
+            last_assistant_needs_forced_summary,
+            self.stream_was_interrupted,
+            provider_client.lastProviderErrorDetail() != null,
+        )) {
+            guard_reason = .budget_exhausted;
+            if (budget_exhausted_pending_tool == null) {
+                budget_exhausted_pending_tool = try self.allocator.dupe(
+                    u8,
+                    "final user-facing response after last tool result",
+                );
+            }
+        }
 
         log.info(
             "tool-loop stop conv={s} steps={d} guard={s} executed_any_tool={any} mutating_tool={any} continue_attempts={d} interrupted={any} provider_error={any} needs_forced_summary={any} unverified_change_claim={any}",
@@ -10256,6 +10271,20 @@ fn buildBudgetExhaustedMessageAlloc(
     );
 }
 
+fn shouldEscalateForcedSummaryAfterTool(
+    guard_reason: ToolLoopGuardReason,
+    executed_any_tool: bool,
+    last_assistant_needs_forced_summary: bool,
+    stream_was_interrupted: bool,
+    has_provider_error: bool,
+) bool {
+    return guard_reason == .none and
+        executed_any_tool and
+        last_assistant_needs_forced_summary and
+        !stream_was_interrupted and
+        !has_provider_error;
+}
+
 fn toolLoopGuardReasonLabel(reason: ToolLoopGuardReason) []const u8 {
     return switch (reason) {
         .none => "none",
@@ -11141,6 +11170,17 @@ test "budget exhausted message is explicit and does not claim completion" {
 
     try std.testing.expect(std.mem.indexOf(u8, message, "Loop budget exhausted before implementation") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "I completed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "I completed READ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "best available outcome") == null);
+}
+
+test "forced summary after tool escalates to budget exhausted path" {
+    try std.testing.expect(shouldEscalateForcedSummaryAfterTool(.none, true, true, false, false));
+    try std.testing.expect(!shouldEscalateForcedSummaryAfterTool(.none, false, true, false, false));
+    try std.testing.expect(!shouldEscalateForcedSummaryAfterTool(.none, true, false, false, false));
+    try std.testing.expect(!shouldEscalateForcedSummaryAfterTool(.max_iterations, true, true, false, false));
+    try std.testing.expect(!shouldEscalateForcedSummaryAfterTool(.none, true, true, true, false));
+    try std.testing.expect(!shouldEscalateForcedSummaryAfterTool(.none, true, true, false, true));
 }
 
 test "codeFenceLanguageToken extracts language from fence line" {
