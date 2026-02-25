@@ -439,7 +439,8 @@ const TOOL_SYSTEM_PROMPT =
     "Use one to three questions. Each question should include two to four mutually exclusive options.\n" ++
     "Available skill names/descriptions are provided in [skills-context] messages.\n" ++
     "After a system message that starts with [read-result], [list-dir-result], [read-file-result], [grep-files-result], [project-search-result], [apply-patch-result], [exec-result], [write-stdin-result], [web-search-result], [view-image-result], [skill-result], [update-plan-result], or [request-user-input-result], continue the answer normally.\n" ++
-    "If a [read-result] reports `error: output exceeds READ limit`, immediately rerun READ with narrower scope (path/glob or head/sed).\n" ++
+    "If a [read-result] reports `error: output exceeds READ limit`, immediately rerun READ with narrower scope (specific file path and/or line range via sed/head/tail).\n" ++
+    "After READ overflow, do not repeat the same broad command.\n" ++
     "Do not end with intent-only text like \"I'll do that now\". If work remains, make the next tool call immediately.";
 const TOOL_CONTINUE_REMINDER =
     "[tool-result]\n" ++
@@ -456,9 +457,13 @@ const TOOL_CONTINUE_INITIAL_INSPECTION_REMINDER =
 const TOOL_CONTINUE_EMPTY_RESPONSE_REMINDER =
     "[tool-result]\n" ++
     "Your last response was empty. Continue by calling the next tool now. If unsure, inspect with LIST_DIR on src or READ ls src.";
+const TOOL_READ_OVERFLOW_NARROW_REMINDER =
+    "[tool-result]\n" ++
+    "The previous READ overflowed. Your next READ must be narrower: target a specific file and/or line range (for example `sed -n '1,200p' src/tui.zig` or `rg -n \"pattern\" src/tui.zig`).";
 const TOOL_BUDGET_EXHAUSTED_CONTINUATION_REMINDER =
     "[tool-result]\n" ++
     "Tool-call budget is exhausted for this turn. Provide either a final user-facing status update or exactly one next actionable tool call.";
+const READ_OVERFLOW_BROAD_RETRY_MAX: u8 = 2;
 const TOOL_CONTINUE_MAX_ATTEMPTS: u8 = 2;
 
 const VIEW_IMAGE_VISION_PROMPT =
@@ -1683,6 +1688,9 @@ const App = struct {
         var needs_post_tool_continuation_pass = false;
         var budget_exhausted_pending_tool: ?[]u8 = null;
         defer if (budget_exhausted_pending_tool) |value| self.allocator.free(value);
+        var pending_read_overflow_command: ?[]u8 = null;
+        defer if (pending_read_overflow_command) |value| self.allocator.free(value);
+        var broad_read_overflow_retry_count: u8 = 0;
         const expects_initial_repo_tool = userPromptNeedsInitialRepoInspection(prompt);
         var step: usize = 0;
         var tool_continue_attempts: u8 = 0;
@@ -1811,11 +1819,52 @@ const App = struct {
                     try self.setLastAssistantMessage(tool_note);
                     try self.emitRunTaskEvent(.{ .tool_call = tool_note });
 
+                    if (pending_read_overflow_command) |previous_overflow_command| {
+                        if (!readCommandIsNarrowAfterOverflow(previous_overflow_command, read_command_owned)) {
+                            broad_read_overflow_retry_count +|= 1;
+                            const overflow_retry_result = try buildReadOverflowNarrowingResultAlloc(
+                                self.allocator,
+                                read_command_owned,
+                                previous_overflow_command,
+                            );
+                            defer self.allocator.free(overflow_retry_result);
+                            try self.emitRunTaskEvent(.{ .tool_result = overflow_retry_result });
+                            try self.app_state.appendMessage(self.allocator, .system, overflow_retry_result);
+                            try self.app_state.appendMessage(self.allocator, .system, TOOL_READ_OVERFLOW_NARROW_REMINDER);
+                            try self.app_state.appendMessage(self.allocator, .assistant, "");
+                            try self.setNotice("Blocked broad READ retry after overflow; request narrowed follow-up.");
+                            if (broad_read_overflow_retry_count >= READ_OVERFLOW_BROAD_RETRY_MAX) {
+                                guard_reason = .budget_exhausted;
+                                if (budget_exhausted_pending_tool) |value| self.allocator.free(value);
+                                budget_exhausted_pending_tool = try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "READ {s} (must narrow after overflow)",
+                                    .{read_command_owned},
+                                );
+                                break :tool_loop;
+                            }
+                            continue;
+                        }
+                    }
+
                     const tool_result = try self.runReadToolCommand(read_command_owned);
                     defer self.allocator.free(tool_result);
                     try self.emitRunTaskEvent(.{ .tool_result = tool_result });
                     try self.recordSuccessfulTool(tool_note, tool_result);
                     try self.app_state.appendMessage(self.allocator, .system, tool_result);
+                    if (isReadOverflowResult(tool_result)) {
+                        broad_read_overflow_retry_count = 0;
+                        if (pending_read_overflow_command) |value| self.allocator.free(value);
+                        pending_read_overflow_command = try self.allocator.dupe(
+                            u8,
+                            readResultCommand(tool_result) orelse read_command_owned,
+                        );
+                        try self.app_state.appendMessage(self.allocator, .system, TOOL_READ_OVERFLOW_NARROW_REMINDER);
+                    } else if (pending_read_overflow_command) |value| {
+                        broad_read_overflow_retry_count = 0;
+                        self.allocator.free(value);
+                        pending_read_overflow_command = null;
+                    }
                     try self.app_state.appendMessage(self.allocator, .assistant, "");
                     try self.setNoticeFmt("Ran READ command: {s}", .{read_command_owned});
                     executed_any_tool = true;
@@ -2347,15 +2396,25 @@ const App = struct {
                     try self.setNotice("Tool step limit reached; synthesized fallback summary.");
                 },
                 .budget_exhausted => {
-                    const fallback = try self.buildToolFallbackSummaryAlloc("tool_budget_exhausted");
-                    defer self.allocator.free(fallback);
-                    try self.setLastAssistantMessage(fallback);
-                    try self.setNotice("Tool budget exhausted; synthesized fallback summary.");
+                    const budget_message = try buildBudgetExhaustedMessageAlloc(
+                        self.allocator,
+                        executed_mutating_tool,
+                        budget_exhausted_pending_tool,
+                        self.last_successful_tool_call,
+                        self.last_successful_tool_result_summary,
+                    );
+                    defer self.allocator.free(budget_message);
+                    try self.setLastAssistantMessage(budget_message);
+                    try self.setNotice("Tool budget exhausted; emitted explicit continuation guidance.");
                 },
             }
         }
         if (!self.stream_was_interrupted and provider_client.lastProviderErrorDetail() == null) {
-            try self.setNoticeFmt("Completed response from {s}/{s}", .{ provider_id, model_id });
+            if (guard_reason == .budget_exhausted) {
+                try self.setNotice("Stopped after tool budget exhaustion.");
+            } else {
+                try self.setNoticeFmt("Completed response from {s}/{s}", .{ provider_id, model_id });
+            }
         }
         try self.app_state.saveToPath(self.allocator, self.paths.state_path);
     }
@@ -10108,6 +10167,95 @@ fn firstNonEmptyLine(text: []const u8) ?[]const u8 {
     return null;
 }
 
+fn isReadOverflowResult(tool_result: []const u8) bool {
+    return std.mem.indexOf(u8, tool_result, "error: output exceeds READ limit") != null;
+}
+
+fn readResultCommand(tool_result: []const u8) ?[]const u8 {
+    return findNamedLineValue(tool_result, "command:");
+}
+
+fn readCommandTargetsSpecificFile(command: []const u8) bool {
+    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n");
+    _ = tokens.next() orelse return false;
+    while (tokens.next()) |raw_token| {
+        const token = trimMatchingOuterQuotes(raw_token);
+        if (token.len == 0) continue;
+        if (token[0] == '-') continue;
+        if (std.mem.eql(u8, token, ".") or std.mem.eql(u8, token, "./") or std.mem.eql(u8, token, "..")) continue;
+        if (std.mem.indexOfScalar(u8, token, '/') != null) return true;
+        if (std.mem.endsWith(u8, token, ".zig") or
+            std.mem.endsWith(u8, token, ".md") or
+            std.mem.endsWith(u8, token, ".json") or
+            std.mem.endsWith(u8, token, ".txt") or
+            std.mem.endsWith(u8, token, ".toml"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn readCommandHasLineRangeSpecifier(command: []const u8) bool {
+    return std.mem.indexOf(u8, command, "sed -n") != null or
+        std.mem.indexOf(u8, command, "head ") != null or
+        std.mem.indexOf(u8, command, "tail ") != null;
+}
+
+fn readCommandIsNarrowAfterOverflow(previous_command: []const u8, next_command: []const u8) bool {
+    const previous_trimmed = std.mem.trim(u8, previous_command, " \t\r\n");
+    const next_trimmed = std.mem.trim(u8, next_command, " \t\r\n");
+    if (next_trimmed.len == 0) return false;
+    if (std.mem.eql(u8, previous_trimmed, next_trimmed)) return false;
+    if (readCommandHasLineRangeSpecifier(next_trimmed)) return true;
+    if (readCommandTargetsSpecificFile(next_trimmed)) return true;
+    return false;
+}
+
+fn buildReadOverflowNarrowingResultAlloc(
+    allocator: std.mem.Allocator,
+    command_text: []const u8,
+    previous_overflow_command: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "[read-result]\ncommand: {s}\nerror: previous READ overflow requires a narrower follow-up\nhint: prior overflow command was `{s}`; rerun READ on a specific file or line range (for example `sed -n '1,200p' src/tui.zig`).",
+        .{ command_text, previous_overflow_command },
+    );
+}
+
+fn buildBudgetExhaustedMessageAlloc(
+    allocator: std.mem.Allocator,
+    executed_mutating_tool: bool,
+    pending_tool_preview: ?[]const u8,
+    last_tool_call: ?[]const u8,
+    last_tool_summary: ?[]const u8,
+) ![]u8 {
+    const phase = if (executed_mutating_tool) "before completion" else "before implementation";
+    const last_summary = last_tool_summary orelse "(no tool result summary)";
+    if (pending_tool_preview) |pending| {
+        return std.fmt.allocPrint(
+            allocator,
+            "Loop budget exhausted {s}. Next actionable step was: `{s}`. Last tool result: {s}.",
+            .{ phase, pending, last_summary },
+        );
+    }
+    if (last_tool_call) |tool_call| {
+        const display_tool = try displayToolNameAlloc(allocator, tool_call);
+        defer allocator.free(display_tool);
+        return std.fmt.allocPrint(
+            allocator,
+            "Loop budget exhausted {s}. Last completed tool: `{s}` with result {s}.",
+            .{ phase, display_tool, last_summary },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "Loop budget exhausted {s} and no completed tool summary is available.",
+        .{phase},
+    );
+}
+
 fn toolLoopGuardReasonLabel(reason: ToolLoopGuardReason) []const u8 {
     return switch (reason) {
         .none => "none",
@@ -10959,6 +11107,40 @@ test "last available tool step requires post-tool continuation pass" {
     try std.testing.expect(budget.hasAnyRemaining());
     budget.consume(.execution);
     try std.testing.expect(!budget.hasAnyRemaining());
+}
+
+test "read overflow follow-up requires narrower command" {
+    try std.testing.expect(!readCommandIsNarrowAfterOverflow(
+        "rg -n \"thinking\" src",
+        "rg -n \"thinking\" src",
+    ));
+    try std.testing.expect(!readCommandIsNarrowAfterOverflow(
+        "rg -n \"thinking\" src",
+        "rg -n \"thinking\" .",
+    ));
+    try std.testing.expect(readCommandIsNarrowAfterOverflow(
+        "cat src/tui.zig",
+        "sed -n '1,200p' src/tui.zig",
+    ));
+    try std.testing.expect(readCommandIsNarrowAfterOverflow(
+        "rg -n \"thinking\" src",
+        "rg -n \"thinking\" src/tui.zig",
+    ));
+}
+
+test "budget exhausted message is explicit and does not claim completion" {
+    const allocator = std.testing.allocator;
+    const message = try buildBudgetExhaustedMessageAlloc(
+        allocator,
+        false,
+        "APPLY_PATCH",
+        "[tool] READ rg -n \"budget\" src",
+        "state:exited:0",
+    );
+    defer allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "Loop budget exhausted before implementation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "I completed") == null);
 }
 
 test "codeFenceLanguageToken extracts language from fence line" {
